@@ -36,14 +36,20 @@ run_with_spinner() {
 install_if_missing() {
     local pkg="$1"
     if ! dpkg -s "$pkg" &>/dev/null; then
-        run_with_spinner "📦  Устанавливаю $pkg..." bash -c "apt install -y $pkg >/dev/null 2>&1"
+        run_with_spinner "📦  Устанавливаю $pkg..." bash -c "sudo apt-get install -y -qq $pkg"
     fi
 }
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
-# Быстрое обновление системы
-run_with_spinner "🔄  Обновляю систему..." bash -c "apt update >/dev/null 2>&1 && apt list --upgradable >/dev/null 2>&1 && apt upgrade -y --only-upgrade >/dev/null 2>&1"
+# Быстрое обновление системы с автосоглашением
+run_with_spinner "🔄  Обновляю систему..." bash -c "
+    export DEBIAN_FRONTEND=noninteractive
+    sudo apt-get update -qq
+    sudo apt-get upgrade -y -qq
+    sudo apt-get dist-upgrade -y -qq
+    sudo apt-get autoremove -y -qq
+"
 
 # unattended-upgrades
 install_if_missing "unattended-upgrades"
@@ -60,16 +66,16 @@ done
 
 # === Автоматическое создание пользователя suser и отключение root ===
 if ! id -u suser &>/dev/null; then
-    run_with_spinner "👤  Создаю пользователя suser..." bash -c "useradd -m -s /bin/bash -G sudo suser"
+    run_with_spinner "👤  Создаю пользователя suser..." bash -c "sudo useradd -m -s /bin/bash -G sudo suser"
 fi
 
 # Настройка SSH
 SSH_CONFIG="/etc/ssh/sshd_config"
 run_with_spinner "🔐  Настройка SSH для безопасности..." bash -c "
-    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' $SSH_CONFIG
-    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' $SSH_CONFIG
-    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' $SSH_CONFIG
-    systemctl restart sshd
+    sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' $SSH_CONFIG
+    sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' $SSH_CONFIG
+    sudo sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' $SSH_CONFIG
+    sudo systemctl restart sshd
 "
 
 printf "\n✅  Готово! Сервер защищён и готов к работе.\n\n"
@@ -77,13 +83,3 @@ printf "\n✅  Готово! Сервер защищён и готов к раб
 # === Таймер перезагрузки 5 секунд с возможностью отмены по Enter ===
 echo "🔄  Перезагрузка через 5 секунд... (нажмите Enter чтобы отменить)"
 for i in $(seq 5 -1 1); do
-    printf "\r   %d " "$i"
-    read -t 1 -n 1 key
-    if [[ $key == "" ]]; then
-        echo -e "\n⏹  Перезагрузка отменена пользователем."
-        exit 0
-    fi
-done
-printf "\n"
-
-reboot
