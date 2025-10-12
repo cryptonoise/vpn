@@ -4,31 +4,17 @@ set -e
 # Очистка консоли
 printf "\033c"
 
-# === Спиннер ===
-run_with_spinner() {
+# === Выполнение команды с сообщением ===
+run() {
     local msg="$1"
     shift
-    local cmd=("$@")
-    local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-
-    printf "%-30s " "$msg"
-
-    "${cmd[@]}" >/dev/null 2>&1 &
-    local pid=$!
-    local i=0
-
-    while kill -0 "$pid" 2>/dev/null; do
-        printf "\r%-30s %s " "$msg" "${spin[$((i++ % ${#spin[@]}))]}"
-        sleep 0.1
-    done
-
-    wait "$pid"
+    printf "%-50s" "$msg"
+    "$@"
     local code=$?
-
     if [ $code -eq 0 ]; then
-        printf "\r%-30s ✅\n" "$msg"
+        printf " ✅\n"
     else
-        printf "\r%-30s ❌\n" "$msg"
+        printf " ❌\n"
     fi
 }
 
@@ -36,14 +22,14 @@ run_with_spinner() {
 install_if_missing() {
     local pkg="$1"
     if ! dpkg -s "$pkg" &>/dev/null; then
-        run_with_spinner "📦  Устанавливаю $pkg..." bash -c "DEBIAN_FRONTEND=noninteractive apt install -y $pkg >/dev/null 2>&1"
+        run "📦  Устанавливаю $pkg..." bash -c "DEBIAN_FRONTEND=noninteractive apt install -y $pkg >/dev/null 2>&1"
     fi
 }
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
 # Быстрое обновление системы без интерактивности
-run_with_spinner "🔄  Обновляю систему..." bash -c "
+run "🔄  Обновляю систему..." bash -c "
 DEBIAN_FRONTEND=noninteractive apt update >/dev/null 2>&1 &&
 DEBIAN_FRONTEND=noninteractive apt upgrade -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' >/dev/null 2>&1 &&
 DEBIAN_FRONTEND=noninteractive apt dist-upgrade -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' >/dev/null 2>&1 &&
@@ -65,12 +51,12 @@ done
 
 # === Автоматическое создание пользователя suser и отключение root ===
 if ! id -u suser &>/dev/null; then
-    run_with_spinner "👤  Создаю пользователя suser..." bash -c "useradd -m -s /bin/bash -G sudo suser"
+    run "👤  Создаю пользователя suser..." bash -c "useradd -m -s /bin/bash -G sudo suser"
 fi
 
 # Настройка SSH
 SSH_CONFIG="/etc/ssh/sshd_config"
-run_with_spinner "🔐  Настройка SSH для безопасности..." bash -c "
+run "🔐  Настройка SSH для безопасности..." bash -c "
     sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' $SSH_CONFIG
     sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' $SSH_CONFIG
     sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' $SSH_CONFIG
