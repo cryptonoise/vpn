@@ -2,28 +2,33 @@
 
 set -e
 
-# Функция: выполнить команду с инлайн-спиннером
+# Функция с надёжной анимацией
 run_with_spinner() {
     local msg="$1"
     local cmd="$2"
 
     echo -n "$msg "
-    local pid
+
+    # Запускаем команду в фоне
     eval "$cmd" >/dev/null 2>&1 &
-    pid=$!
+    local pid=$!
 
     local spinstr='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
     local i=0
-    while kill -0 $pid 2>/dev/null; do
-        local idx=$((i % ${#spinstr}))
-        local char="${spinstr:$idx:1}"
-        printf "\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b%10s" "$char"
+
+    # Анимация пока процесс жив
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "%s" "${spinstr:$((i % ${#spinstr})):1}"
         sleep 0.1
+        printf "\b"
         ((i++))
     done
 
-    wait $pid
-    printf "\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b%10s\n" "✅"
+    # Ждём завершения (на случай race condition)
+    wait "$pid"
+
+    # Заменяем спиннер на ✅ и переходим на новую строку
+    printf "✅\n"
 }
 
 echo "🚀 Начинаю базовую настройку безопасности сервера..."
