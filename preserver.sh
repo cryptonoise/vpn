@@ -10,12 +10,30 @@ export DEBIAN_FRONTEND=noninteractive
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
 # === Обновление системы ===
-printf "🔄  Обновляю систему... "
-apt-get update -qq
-apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-apt-get dist-upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-apt-get autoremove -y -qq
-printf "✅\n\n"
+printf "🔄  Обновляю систему...\n"
+echo "──────────────────────────────────────"
+
+# Обновление списка пакетов
+apt-get update
+
+# Обновление установленных пакетов с автоматическим выбором конфигураций
+apt-get upgrade -y \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold"
+
+# Полное обновление (включая ядро и зависимости)
+apt-get dist-upgrade -y \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold"
+
+# Удаление ненужных пакетов
+apt-get autoremove -y
+
+echo "──────────────────────────────────────"
+printf "✅  Система успешно обновлена!\n\n"
+
+# Очистка экрана после обновления
+printf "\033c"
 
 # === Функция установки пакета если отсутствует ===
 install_if_missing() {
