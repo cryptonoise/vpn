@@ -1,3 +1,3 @@
 Prepare server for VPN
 
-```curl -s https://h1.nu/preserver | sudo bash```
+`curl -sL https://tinyurl.com/prevpnserver | sudo bash`
