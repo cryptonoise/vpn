@@ -16,14 +16,14 @@ run_with_spinner() {
     local cmd=("$@")
     local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 
-    printf "%-50s " "$msg"
+    printf "%-30s " "$msg"
 
     "${cmd[@]}" >/dev/null 2>&1 &
     local pid=$!
     local i=0
 
     while kill -0 "$pid" 2>/dev/null; do
-        printf "\r%-50s %s " "$msg" "${spin[$((i++ % ${#spin[@]}))]}"
+        printf "\r%-30s %s " "$msg" "${spin[$((i++ % ${#spin[@]}))]}"
         sleep 0.1
     done
 
@@ -31,9 +31,9 @@ run_with_spinner() {
     local code=$?
 
     if [ $code -eq 0 ]; then
-        printf "\r%-50s ✅\n" "$msg"
+        printf "\r%-30s ✅\n" "$msg"
     else
-        printf "\r%-50s ❌\n" "$msg"
+        printf "\r%-30s ❌\n" "$msg"
     fi
 }
 
@@ -45,27 +45,10 @@ install_if_missing() {
     fi
 }
 
-# === Обновление системы с прогрессом пакетов ===
-run_system_update() {
-    # Получаем список обновляемых пакетов
-    mapfile -t PKGS < <(apt list --upgradable 2>/dev/null | tail -n +2 | cut -d/ -f1)
-    TOTAL=${#PKGS[@]}
-
-    if [ "$TOTAL" -eq 0 ]; then
-        run_with_spinner "🔄  Обновляю систему" bash -c "DEBIAN_FRONTEND=noninteractive apt upgrade -y >/dev/null 2>&1"
-        return
-    fi
-
-    for i in "${!PKGS[@]}"; do
-        pkg="${PKGS[$i]}"
-        run_with_spinner "🔄  Обновляю пакет [$((i+1))/$TOTAL] $pkg" bash -c "DEBIAN_FRONTEND=noninteractive apt install -y $pkg >/dev/null 2>&1"
-    done
-}
-
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
 # Обновление системы
-run_system_update
+run_with_spinner "🔄  Обновляю систему..." bash -c "DEBIAN_FRONTEND=noninteractive apt update >/dev/null 2>&1 && apt upgrade -y >/dev/null 2>&1 && apt autoremove -y >/dev/null 2>&1"
 
 # unattended-upgrades
 install_if_missing "unattended-upgrades"
