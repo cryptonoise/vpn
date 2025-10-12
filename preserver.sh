@@ -4,7 +4,7 @@ set -e
 # Очистка консоли
 printf "\033c"
 
-# === Спиннер для фоновых задач ===
+# === Спиннер ===
 run_with_spinner() {
     local msg="$1"
     shift
@@ -36,20 +36,14 @@ run_with_spinner() {
 install_if_missing() {
     local pkg="$1"
     if ! dpkg -s "$pkg" &>/dev/null; then
-        run_with_spinner "📦  Устанавливаю $pkg..." bash -c "sudo apt-get install -y -qq $pkg"
+        run_with_spinner "📦  Устанавливаю $pkg..." bash -c "DEBIAN_FRONTEND=noninteractive apt install -y $pkg >/dev/null 2>&1"
     fi
 }
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
-# === Обновление системы без спиннера (не в фоне!) ===
-echo "🔄  Обновляю систему..."
-export DEBIAN_FRONTEND=noninteractive
-sudo apt-get update -qq
-sudo apt-get upgrade -y -qq
-sudo apt-get dist-upgrade -y -qq
-sudo apt-get autoremove -y -qq
-echo "✅  Система обновлена."
+# Быстрое обновление системы
+run_with_spinner "🔄  Обновляю систему..." bash -c "DEBIAN_FRONTEND=noninteractive apt update && DEBIAN_FRONTEND=noninteractive apt upgrade -y"
 
 # unattended-upgrades
 install_if_missing "unattended-upgrades"
@@ -64,18 +58,18 @@ for pkg in htop iotop nethogs; do
     install_if_missing "$pkg"
 done
 
-# === Создание пользователя suser ===
+# === Автоматическое создание пользователя suser и отключение root ===
 if ! id -u suser &>/dev/null; then
-    run_with_spinner "👤  Создаю пользователя suser..." bash -c "sudo useradd -m -s /bin/bash -G sudo suser"
+    run_with_spinner "👤  Создаю пользователя suser..." bash -c "useradd -m -s /bin/bash -G sudo suser"
 fi
 
 # Настройка SSH
 SSH_CONFIG="/etc/ssh/sshd_config"
 run_with_spinner "🔐  Настройка SSH для безопасности..." bash -c "
-    sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' $SSH_CONFIG
-    sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' $SSH_CONFIG
-    sudo sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' $SSH_CONFIG
-    sudo systemctl restart sshd
+    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' $SSH_CONFIG
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' $SSH_CONFIG
+    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' $SSH_CONFIG
+    systemctl restart sshd
 "
 
 printf "\n✅  Готово! Сервер защищён и готов к работе.\n\n"
