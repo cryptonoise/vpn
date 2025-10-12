@@ -1,36 +1,37 @@
 #!/bin/bash
 set -e
 
+# === Проверка: уже настроен? ===
 if [ -f /root/.server_secured ]; then
     printf "✅ Сервер уже защищён. Повторный запуск не требуется.\n"
     exit 0
 fi
 
-# === Универсальный спиннер (работает и без tty) ===
+# === Спиннер с ровным выравниванием ===
 run_with_spinner() {
     local msg="$1"
     shift
     local cmd=("$@")
     local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local width=55
 
-    printf "%s " "$msg"
+    printf "%-60s" "$msg"
 
-    "${cmd[@]}" >/tmp/spinner_output.log 2>&1 &
+    "${cmd[@]}" >/dev/null 2>&1 &
     local pid=$!
     local i=0
 
     while kill -0 "$pid" 2>/dev/null; do
-        printf "\r%s %s " "$msg" "${spin[$((i++ % ${#spin[@]}))]}"
+        printf "\r%-60s%s" "$msg" "${spin[$((i++ % ${#spin[@]}))]}"
         sleep 0.1
     done
 
     wait "$pid"
     local code=$?
-
     if [ $code -eq 0 ]; then
-        printf "\r%s ✅\n" "$msg"
+        printf "\r%-60s✅\n" "$msg"
     else
-        printf "\r%s ❌ (ошибка, см. /tmp/spinner_output.log)\n" "$msg"
+        printf "\r%-60s❌\n" "$msg"
     fi
 }
 
@@ -54,4 +55,5 @@ run_with_spinner "📊 Устанавливаю htop, iotop, nethogs..." \
     bash -c "apt install -y -qq htop iotop nethogs"
 
 touch /root/.server_secured
-printf "\n✅ Готово! Сервер защищён и готов к работе.\n📄 Лог: /tmp/spinner_output.log\n"
+
+printf "\n✅ Готово! Сервер защищён и готов к работе.\n"
