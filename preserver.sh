@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Завершаем работу при ошибках
+# Завершаем работу при любой ошибке
 set -euo pipefail
 
 # Очищаем экран
@@ -16,19 +16,19 @@ if [ -d /var/lib/dpkg/updates ] && ls /var/lib/dpkg/updates/* >/dev/null 2>&1; t
     printf "🔧  Обнаружены следы прерванной установки. Восстанавливаю систему...\n"
     rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend
     rm -f /var/cache/apt/archives/lock /var/lib/apt/lists/lock
-    dpkg --configure -a --force-confdef --force-confold || true
+    dpkg --configure -a --force-confdef --force-confold >/dev/null 2>&1 || true
     rm -f /var/lib/dpkg/updates/*
-    dpkg --configure -a || true
+    dpkg --configure -a >/dev/null 2>&1 || true
     printf "✅  Восстановление завершено.\n\n"
 fi
 
-# === Обновление системы (видимый вывод) ===
+# === Обновление системы ===
 printf "🔄  Обновляю систему...\n"
 echo "──────────────────────────────────────"
 
-apt-get update || { echo "❌ apt-get update failed"; exit 1; }
-apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { echo "❌ upgrade failed"; exit 1; }
-apt-get dist-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { echo "❌ dist-upgrade failed"; exit 1; }
+apt-get update -qq
+apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+apt-get dist-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
 apt-get autoremove -y
 
 echo "──────────────────────────────────────"
@@ -41,7 +41,7 @@ printf "\033c"
 install_if_missing() {
     local pkg="$1"
     if ! dpkg -s "$pkg" &>/dev/null; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$pkg"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$pkg" >/dev/null
     fi
 }
 
@@ -56,7 +56,8 @@ systemctl start fail2ban --quiet || true
 SUSER="suser"
 PW_QUAL_CONF="/etc/security/pwquality.conf"
 PW_QUAL_BACKUP=""
-USER_PASSWORD=""
+# Переменная для отчёта пароля (будет заполнена, если пароль задан/изменён)
+REPORT_PASS="(не изменён)"
 
 # Временное ослабление проверки сложности пароля
 relax_pwquality() {
@@ -88,20 +89,21 @@ if ! id -u "$SUSER" &>/dev/null; then
     printf "👤  Создаю пользователя %s...\n" "$SUSER"
     useradd -m -s /bin/bash -G sudo "$SUSER"
 
-    # Если пароль передан через переменную окружения
+    # === Если пароль передан через переменную окружения ===
     if [ -n "${SUSER_PASS-}" ]; then
-        USER_PASSWORD="$SUSER_PASS"
         printf "🔑  Устанавливаю пароль из переменной окружения SUSER_PASS...\n"
         relax_pwquality
         if echo "${SUSER}:${SUSER_PASS}" | chpasswd; then
             printf "✅  Пароль успешно установлен из SUSER_PASS.\n\n"
+            REPORT_PASS="${SUSER_PASS}"
         else
             printf "❌  Не удалось установить пароль из SUSER_PASS.\n"
+            restore_pwquality
             exit 1
         fi
         restore_pwquality
 
-    # Если пароль не задан — интерактивный ввод
+    # === Если пароль не задан — интерактивный ввод ===
     else
         if [ ! -t 0 ]; then
             echo "❌  Ошибка: интерактивный ввод невозможен (нет TTY)."
@@ -110,9 +112,14 @@ if ! id -u "$SUSER" &>/dev/null; then
         fi
 
         while true; do
-            printf "🔒  Введите пароль для пользователя %s: " "$SUSER"
-            read -s password
-            printf "\n"
+            if [ "${SHOW_PASS-0}" = "1" ]; then
+                printf "🔒  Введите пароль для пользователя %s (символы видны): " "$SUSER"
+                read password
+            else
+                printf "🔒  Введите пароль для пользователя %s: " "$SUSER"
+                read -s password
+                printf "\n"
+            fi
 
             if [ -z "$password" ]; then
                 printf "⚠️  Пароль не может быть пустым. Попробуйте снова.\n"
@@ -121,8 +128,8 @@ if ! id -u "$SUSER" &>/dev/null; then
 
             relax_pwquality
             if echo "${SUSER}:${password}" | chpasswd; then
-                USER_PASSWORD="$password"
                 printf "✅  Пароль успешно установлен.\n\n"
+                REPORT_PASS="${password}"
                 restore_pwquality
                 break
             else
@@ -148,12 +155,11 @@ fi
 # === Итоговая информация ===
 printf "✅  Готово! Сервер защищён и готов к работе.\n"
 printf "   • Пользователь: %s\n" "$SUSER"
+# Здесь выводим пароль, который был введён пользователем или передан через SUSER_PASS
+printf "   • Пароль: %s\n" "$REPORT_PASS"
 if [ -n "${SUSER_PASS-}" ]; then
-    printf "   • Пароль: %s\n" "$SUSER_PASS"
-elif [ -n "$USER_PASSWORD" ]; then
-    printf "   • Пароль: %s\n" "$USER_PASSWORD"
-else
-    printf "   • Пароль: введён вручную (не удалось отобразить)\n"
+    # если пароль был передан через SUSER_PASS — REPORT_PASS уже установлен выше
+    :
 fi
 printf "   • Вход по SSH-ключу: разрешён (если ~/.ssh/authorized_keys существует)\n"
 printf "   • Root-доступ: отключён\n\n"
