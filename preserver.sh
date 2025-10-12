@@ -47,20 +47,29 @@ install_if_missing() {
 
 # === Обновление системы с прогрессом по пакетам ===
 update_with_progress() {
-    local packages=($(apt list --upgradable 2>/dev/null | grep -v Listing | cut -d/ -f1))
-    local total=${#packages[@]}
-    local count=0
+    local pkgs=($(apt list --upgradable 2>/dev/null | grep -v Listing | cut -d/ -f1))
+    local total=${#pkgs[@]}
 
     if [ $total -eq 0 ]; then
-        run_with_spinner "🔄  Обновляю систему..." bash -c "DEBIAN_FRONTEND=noninteractive apt upgrade -y >/dev/null 2>&1 && apt autoremove -y >/dev/null 2>&1"
+        run_with_spinner "🔄  Обновляю систему..." bash -c "apt upgrade -y >/dev/null 2>&1 && apt autoremove -y >/dev/null 2>&1"
         return
     fi
 
-    for pkg in "${packages[@]}"; do
-        local percent=$((count*100/total))
-        run_with_spinner "🔄  Обновляю $pkg ($percent%)..." bash -c "DEBIAN_FRONTEND=noninteractive apt install -y $pkg >/dev/null 2>&1"
-        count=$((count+1))
+    local count=0
+    # Запускаем обновление в фоне
+    apt upgrade -y >/tmp/apt_output.log 2>&1 &
+    local pid=$!
+
+    while kill -0 $pid 2>/dev/null; do
+        if [ -f /tmp/apt_output.log ]; then
+            count=$(grep -c 'Preparing to unpack' /tmp/apt_output.log)
+            printf "\r%-35s %d/%d пакетов" "🔄  Обновляю систему..." $count $total
+        fi
+        sleep 0.5
     done
+    wait $pid
+    printf "\r%-35s ✅\n" "🔄  Обновление системы завершено"
+    rm -f /tmp/apt_output.log
 }
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
