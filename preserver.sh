@@ -41,14 +41,14 @@ run_with_spinner() {
 install_if_missing() {
     local pkg="$1"
     if ! dpkg -s "$pkg" &>/dev/null; then
-        run_with_spinner "📦  Устанавливаю $pkg..." bash -c "DEBIAN_FRONTEND=noninteractive apt install -y $pkg >/dev/null 2>&1"
+        run_with_spinner "📦  Устанавливаю $pkg..." bash -c "apt install -y $pkg >/dev/null 2>&1"
     fi
 }
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
-# Обновление системы
-run_with_spinner "🔄  Обновляю систему..." bash -c "DEBIAN_FRONTEND=noninteractive apt update >/dev/null 2>&1 && apt upgrade -y >/dev/null 2>&1 && apt autoremove -y >/dev/null 2>&1"
+# Быстрое обновление списка пакетов и только обновление установленных
+run_with_spinner "🔄  Обновляю систему..." bash -c "apt update >/dev/null 2>&1 && apt list --upgradable >/dev/null 2>&1 && apt upgrade -y --only-upgrade >/dev/null 2>&1"
 
 # unattended-upgrades
 install_if_missing "unattended-upgrades"
