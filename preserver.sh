@@ -31,17 +31,15 @@ printf "✅  Система успешно обновлена!\n\n"
 
 printf "\033c"
 
-# === Установка пакетов (тихо, без лишнего вывода) ===
+# === Установка пакетов (тихо) ===
 install_if_missing() {
     local pkg="$1"
     if ! dpkg -s "$pkg" &>/dev/null; then
-        if DEBIAN_FRONTEND=noninteractive \
-           apt-get install -y --no-install-recommends \
-           -o Dpkg::Options::="--force-confdef" \
-           -o Dpkg::Options::="--force-confold" \
-           "$pkg" &>/dev/null; then
-            :
-        fi
+        DEBIAN_FRONTEND=noninteractive \
+        apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        "$pkg" &>/dev/null
     fi
 }
 
@@ -52,15 +50,36 @@ done
 systemctl enable fail2ban --quiet
 systemctl start fail2ban --quiet
 
-# === Создание пользователя и установка пароля ===
+# === Создание пользователя с вводом пароля ===
 if ! id -u suser &>/dev/null; then
+    printf "👤  Создаю пользователя suser...\n"
+    
+    # Запрос пароля (без эха)
+    while true; do
+        printf "🔒  Введите пароль для пользователя suser: "
+        read -s password
+        printf "\n"
+        
+        if [ -z "$password" ]; then
+            printf "⚠️  Пароль не может быть пустым. Попробуйте снова.\n"
+            continue
+        fi
+        
+        # Попытка установить пароль
+        if echo "suser:$password" | chpasswd; then
+            printf "✅  Пароль успешно установлен.\n\n"
+            break
+        else
+            printf "❌  Не удалось установить пароль (слишком простой или ошибка PAM). Попробуйте другой.\n"
+        fi
+    done
+    
     useradd -m -s /bin/bash -G sudo suser
+else
+    printf "👤  Пользователь suser уже существует — пароль не изменяется.\n\n"
 fi
 
-# Установка пароля (8+ символов, чтобы избежать ошибок PAM)
-echo "suser:0suser12" | chpasswd
-
-# === Настройка SSH (без вывода) ===
+# === Настройка SSH (тихо) ===
 SSH_CONFIG="/etc/ssh/sshd_config"
 if [[ -f "$SSH_CONFIG" ]]; then
     sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' "$SSH_CONFIG"
@@ -72,7 +91,7 @@ fi
 # === ФИНАЛЬНОЕ СООБЩЕНИЕ ===
 printf "✅  Готово! Сервер защищён и готов к работе.\n"
 printf "   • Пользователь: suser\n"
-printf "   • Пароль: 0suser12\n"
+printf "   • Пароль: задан вами при создании\n"
 printf "   • Вход по SSH-ключу: разрешён (если ~/.ssh/authorized_keys существует)\n"
 printf "   • Root-доступ: отключён\n\n"
 
