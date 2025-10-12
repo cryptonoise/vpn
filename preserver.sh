@@ -2,7 +2,7 @@
 
 set -e
 
-# Спиннер
+# Функция: выполнить команду с инлайн-спиннером
 run_with_spinner() {
     local msg="$1"
     local cmd="$2"
@@ -35,20 +35,19 @@ run_with_spinner "🔄 Обновляю систему..." \
 
 # 2. Автоматические обновления безопасности
 run_with_spinner "🛡️ Устанавливаю unattended-upgrades..." \
-    "sudo apt install -y unattended-upgrades && echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | sudo debconf-set-selections && sudo dpkg-reconfigure -f noninteractive unattended-upgrades"
+    "sudo apt install -y --no-install-recommends unattended-upgrades && echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | sudo debconf-set-selections && sudo dpkg-reconfigure -f noninteractive unattended-upgrades"
 
 # 3. Защита от брутфорса
 run_with_spinner "🛡️ Устанавливаю fail2ban..." \
-    "sudo apt install -y fail2ban && sudo systemctl enable fail2ban --quiet && sudo systemctl start fail2ban --quiet"
+    "sudo apt install -y --no-install-recommends fail2ban && sudo systemctl enable fail2ban --quiet && sudo systemctl start fail2ban --quiet"
 
 # 4. Антивирус/руткит сканеры
 run_with_spinner "🔍 Устанавливаю rkhunter и chkrootkit..." \
-    "sudo apt install -y rkhunter chkrootkit && sudo rkhunter --update --quiet && sudo rkhunter --propupd --quiet"
+    "sudo apt install -y --no-install-recommends rkhunter chkrootkit && sudo rkhunter --update --quiet && sudo rkhunter --propupd --quiet"
 
 # 5. Утилиты мониторинга
 run_with_spinner "📊 Устанавливаю htop, iotop, nethogs..." \
-    "sudo apt install -y htop iotop nethogs"
-
+    "sudo apt install -y --no-install-recommends htop iotop nethogs"
 
 echo
-echo "✅ Готово!"
+echo "✅ Готово! Сервер защищён и готов к работе."
