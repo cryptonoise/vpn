@@ -15,7 +15,7 @@ run_with_spinner() {
 
     printf "%s " "$msg"
 
-    "${cmd[@]}" >/tmp/spinner_output.log 2>&1 &
+    "${cmd[@]}" &
     local pid=$!
     local i=0
 
@@ -30,7 +30,7 @@ run_with_spinner() {
     if [ $code -eq 0 ]; then
         printf "\r%s ✅\n" "$msg"
     else
-        printf "\r%s ❌ (ошибка, см. /tmp/spinner_output.log)\n" "$msg"
+        printf "\r%s ❌\n" "$msg"
     fi
 }
 
@@ -47,11 +47,8 @@ run_with_spinner "🛡️ Устанавливаю unattended-upgrades..." \
 run_with_spinner "🚫 Устанавливаю fail2ban..." \
     bash -c "apt install -y -qq fail2ban && systemctl enable fail2ban --quiet && systemctl start fail2ban --quiet"
 
-run_with_spinner "🔍 Устанавливаю rkhunter и chkrootkit..." \
-    bash -c "apt install -y -qq rkhunter chkrootkit && rkhunter --update --quiet && rkhunter --propupd --quiet"
-
 run_with_spinner "📊 Устанавливаю htop, iotop, nethogs..." \
     bash -c "apt install -y -qq htop iotop nethogs"
 
 touch /root/.server_secured
-printf "\n✅ Готово! Сервер защищён и готов к работе.\n📄 Лог: /tmp/spinner_output.log\n"
+printf "\n✅ Готово! Сервер защищён и готов к работе.\n"
