@@ -2,63 +2,53 @@
 
 set -e
 
-# Функция анимации (спиннер)
-spinner() {
-    local pid=$1
-    local delay=0.1
+# Спиннер
+run_with_spinner() {
+    local msg="$1"
+    local cmd="$2"
+
+    echo -n "$msg "
+    local pid
+    eval "$cmd" >/dev/null 2>&1 &
+    pid=$!
+
     local spinstr='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\b\b\b\b\b\b"
+    local i=0
+    while kill -0 $pid 2>/dev/null; do
+        local idx=$((i % ${#spinstr}))
+        local char="${spinstr:$idx:1}"
+        printf "\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b%10s" "$char"
+        sleep 0.1
+        ((i++))
     done
-    printf " ✅ \n"
+
+    wait $pid
+    printf "\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b%10s\n" "✅"
 }
 
 echo "🚀 Начинаю базовую настройку безопасности сервера..."
 echo
 
 # 1. Обновление системы
-echo "🔄 Обновляю систему..."
-sudo apt update >/dev/null 2>&1 &
-spinner $!
-sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y >/dev/null 2>&1 &
-spinner $!
-sudo DEBIAN_FRONTEND=noninteractive apt dist-upgrade -y >/dev/null 2>&1 &
-spinner $!
-sudo apt autoremove -y >/dev/null 2>&1
-echo
+run_with_spinner "🔄 Обновляю систему..." \
+    "sudo apt update && sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y && sudo DEBIAN_FRONTEND=noninteractive apt dist-upgrade -y && sudo apt autoremove -y"
 
 # 2. Автоматические обновления безопасности
-echo "🛡️ Устанавливаю unattended-upgrades..."
-sudo apt install -y unattended-upgrades >/dev/null 2>&1 &
-spinner $!
-echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | sudo debconf-set-selections
-sudo dpkg-reconfigure -f noninteractive unattended-upgrades >/dev/null 2>&1
-echo
+run_with_spinner "🛡️ Устанавливаю unattended-upgrades..." \
+    "sudo apt install -y unattended-upgrades && echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | sudo debconf-set-selections && sudo dpkg-reconfigure -f noninteractive unattended-upgrades"
 
 # 3. Защита от брутфорса
-echo "🛡️ Устанавливаю fail2ban..."
-sudo apt install -y fail2ban >/dev/null 2>&1 &
-spinner $!
-sudo systemctl enable fail2ban --quiet
-sudo systemctl start fail2ban --quiet
-echo
+run_with_spinner "🛡️ Устанавливаю fail2ban..." \
+    "sudo apt install -y fail2ban && sudo systemctl enable fail2ban --quiet && sudo systemctl start fail2ban --quiet"
 
 # 4. Антивирус/руткит сканеры
-echo "🔍 Устанавливаю rkhunter и chkrootkit..."
-sudo apt install -y rkhunter chkrootkit >/dev/null 2>&1 &
-spinner $!
-sudo rkhunter --update --quiet >/dev/null 2>&1
-sudo rkhunter --propupd --quiet >/dev/null 2>&1
-echo
+run_with_spinner "🔍 Устанавливаю rkhunter и chkrootkit..." \
+    "sudo apt install -y rkhunter chkrootkit && sudo rkhunter --update --quiet && sudo rkhunter --propupd --quiet"
 
 # 5. Утилиты мониторинга
-echo "📊 Устанавливаю htop, iotop, nethogs..."
-sudo apt install -y htop iotop nethogs >/dev/null 2>&1 &
-spinner $!
+run_with_spinner "📊 Устанавливаю htop, iotop, nethogs..." \
+    "sudo apt install -y htop iotop nethogs"
+
 
 echo
 echo "✅ Готово!"
