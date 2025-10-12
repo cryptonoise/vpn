@@ -9,60 +9,32 @@ export APT_LISTCHANGES_FRONTEND=none
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
-# === ГАРАНТИРОВАННОЕ ВОССТАНОВЛЕНИЕ СОСТОЯНИЯ ПАКЕТОВ ===
-printf "🔧  Гарантированное восстановление состояния пакетов...\n"
-
-# Удаляем lock-файлы (на всякий случай)
-rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend
-rm -f /var/cache/apt/archives/lock /var/lib/apt/lists/lock
-
-# Принудительная настройка всех пакетов с подавлением запросов
-DEBIAN_FRONTEND=noninteractive dpkg --configure -a \
-  --force-confdef --force-confold --force-confnew >/dev/null 2>&1 || true
-
-# 🔥 КЛЮЧЕВОЙ ШАГ: удаляем остаточные файлы, вызывающие ошибку "dpkg was interrupted"
+# === ВОССТАНОВЛЕНИЕ ТОЛЬКО ЕСЛИ ЕСТЬ ПРОБЛЕМЫ ===
 if [ -d /var/lib/dpkg/updates ] && ls /var/lib/dpkg/updates/* >/dev/null 2>&1; then
+    printf "🔧  Обнаружены следы прерванной установки. Выполняю восстановление...\n"
+    rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend
+    rm -f /var/cache/apt/archives/lock /var/lib/apt/lists/lock
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a \
+        --force-confdef --force-confold >/dev/null 2>&1 || true
     rm -f /var/lib/dpkg/updates/*
-    printf "🗑️  Очистка /var/lib/dpkg/updates выполнена.\n"
+    dpkg --configure -a >/dev/null 2>&1 || true
+    printf "✅  Восстановление завершено.\n\n"
 fi
-
-# Финальная попытка завершить настройку
-dpkg --configure -a >/dev/null 2>&1 || true
-
-printf "✅  Состояние пакетов стабилизировано.\n\n"
 
 # === ОБНОВЛЕНИЕ СИСТЕМЫ ===
 printf "🔄  Обновляю систему...\n"
 echo "──────────────────────────────────────"
 
-# Обновление списков пакетов
-if ! apt-get update; then
-    echo "❌ Ошибка: не удалось обновить списки пакетов (apt-get update)."
-    exit 1
-fi
+apt-get update || { echo "❌ Ошибка: apt-get update завершился неудачно."; exit 1; }
 
-# Повторная очистка перед upgrade (на случай, если update что-то создал)
-if [ -d /var/lib/dpkg/updates ] && ls /var/lib/dpkg/updates/* >/dev/null 2>&1; then
-    rm -f /var/lib/dpkg/updates/*
-fi
-
-# Обновление пакетов
-if ! apt-get upgrade -y \
+apt-get upgrade -y \
     -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold"; then
-    echo "❌ Ошибка при выполнении apt-get upgrade."
-    exit 1
-fi
+    -o Dpkg::Options::="--force-confold" || { echo "❌ Ошибка при выполнении apt-get upgrade."; exit 1; }
 
-# Полное обновление
-if ! apt-get dist-upgrade -y \
+apt-get dist-upgrade -y \
     -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold"; then
-    echo "❌ Ошибка при выполнении apt-get dist-upgrade."
-    exit 1
-fi
+    -o Dpkg::Options::="--force-confold" || { echo "❌ Ошибка при выполнении apt-get dist-upgrade."; exit 1; }
 
-# Удаление ненужных пакетов
 apt-get autoremove -y
 
 echo "──────────────────────────────────────"
@@ -71,7 +43,7 @@ printf "✅  Система успешно обновлена!\n\n"
 # Очистка экрана после обновления
 printf "\033c"
 
-# === ФУНКЦИЯ: установка пакета, если отсутствует ===
+# === ФУНКЦИЯ: УСТАНОВКА ПАКЕТА ЕСЛИ ОТСУТСТВУЕТ ===
 install_if_missing() {
     local pkg="$1"
     if ! dpkg -s "$pkg" &>/dev/null; then
@@ -93,41 +65,53 @@ for pkg in unattended-upgrades fail2ban htop iotop nethogs; do
     install_if_missing "$pkg"
 done
 
-# Настройка и запуск fail2ban
+# Настройка fail2ban
 systemctl enable fail2ban --quiet
 systemctl start fail2ban --quiet
 
 # === СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ suser ===
 if ! id -u suser &>/dev/null; then
     printf "👤  Создаю пользователя suser... "
-    if useradd -m -s /bin/bash -G sudo suser; then
-        printf "✅\n"
-    else
-        printf "❌\n"
-    fi
+    useradd -m -s /bin/bash -G sudo suser && printf "✅\n"
 else
     printf "👤  Пользователь suser уже существует.\n"
 fi
+
+# Установка/обновление пароля
+echo "suser:0suser1" | chpasswd
+printf "🔑  Пароль для suser: 0suser1\n"
 
 # === НАСТРОЙКА SSH ===
 SSH_CONFIG="/etc/ssh/sshd_config"
 if [[ -f "$SSH_CONFIG" ]]; then
     printf "🔐  Настраиваю SSH... "
+
+    # Отключить root-доступ полностью
     sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' "$SSH_CONFIG"
-    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$SSH_CONFIG"
+    
+    # Включить аутентификацию по ключу (если ключ есть — работает)
     sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$SSH_CONFIG"
+    
+    # Разрешить вход по паролю (для suser и других пользователей с паролем)
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$SSH_CONFIG"
+
+    # Перезапуск SSH
     if systemctl restart sshd; then
         printf "✅\n\n"
     else
-        printf "❌\n\n"
+        printf "❌ (не удалось перезапустить sshd)\n\n"
     fi
 else
     echo "⚠️  Файл $SSH_CONFIG не найден. Пропускаю настройку SSH."
 fi
 
-printf "✅  Готово! Сервер защищён и готов к работе.\n\n"
+printf "✅  Готово! Сервер защищён и готов к работе.\n"
+printf "   • Пользователь: suser\n"
+printf "   • Пароль: 0suser1\n"
+printf "   • Вход по SSH-ключу: разрешён (если ~/.ssh/authorized_keys существует)\n"
+printf "   • Root-доступ: отключён\n\n"
 
-# === ПЕРЕЗАГРУЗКА С ВОЗМОЖНОСТЬЮ ОТМЕНЫ ===
+# === ПЕРЕЗАГРУЗКА С ОТМЕНОЙ ===
 echo "🔄  Перезагрузка через 5 секунд... (нажмите Enter, чтобы отменить)"
 for i in $(seq 5 -1 1); do
     printf "\r   %d " "$i"
