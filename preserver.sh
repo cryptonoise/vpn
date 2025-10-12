@@ -16,17 +16,17 @@ if [ -d /var/lib/dpkg/updates ] && ls /var/lib/dpkg/updates/* >/dev/null 2>&1; t
     printf "🔧  Обнаружены следы прерванной установки. Восстанавливаю систему...\n"
     rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend
     rm -f /var/cache/apt/archives/lock /var/lib/apt/lists/lock
-    dpkg --configure -a --force-confdef --force-confold >/dev/null 2>&1 || true
+    dpkg --configure -a --force-confdef --force-confold || true
     rm -f /var/lib/dpkg/updates/*
-    dpkg --configure -a >/dev/null 2>&1 || true
+    dpkg --configure -a || true
     printf "✅  Восстановление завершено.\n\n"
 fi
 
-# === Обновление системы ===
+# === Обновление системы (интерактивный вывод) ===
 printf "🔄  Обновляю систему...\n"
 echo "──────────────────────────────────────"
 
-apt-get update -qq
+apt-get update
 apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
 apt-get dist-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
 apt-get autoremove -y
@@ -41,7 +41,7 @@ printf "\033c"
 install_if_missing() {
     local pkg="$1"
     if ! dpkg -s "$pkg" &>/dev/null; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$pkg" >/dev/null
+        apt-get install -y --no-install-recommends "$pkg"
     fi
 }
 
@@ -49,25 +49,22 @@ for pkg in unattended-upgrades fail2ban htop iotop nethogs; do
     install_if_missing "$pkg"
 done
 
-systemctl enable fail2ban --quiet || true
-systemctl start fail2ban --quiet || true
+systemctl enable fail2ban || true
+systemctl start fail2ban || true
 
 # === Создание пользователя suser ===
 SUSER="suser"
 PW_QUAL_CONF="/etc/security/pwquality.conf"
 PW_QUAL_BACKUP=""
-# Переменная для отчёта пароля (будет заполнена, если пароль задан/изменён)
 REPORT_PASS="(не изменён)"
 
-# Временное ослабление проверки сложности пароля
 relax_pwquality() {
     if [ -f "$PW_QUAL_CONF" ]; then
         PW_QUAL_BACKUP="${PW_QUAL_CONF}.bak.$$"
         cp -p "$PW_QUAL_CONF" "$PW_QUAL_BACKUP" || true
     fi
-
     cat >"$PW_QUAL_CONF" <<'EOF'
-# Временные упрощённые правила паролей (создано скриптом)
+# Временные упрощённые правила паролей
 minlen = 4
 dcredit = 0
 ucredit = 0
@@ -78,7 +75,6 @@ EOF
     chmod 644 "$PW_QUAL_CONF" || true
 }
 
-# Восстановление исходных правил
 restore_pwquality() {
     if [ -n "$PW_QUAL_BACKUP" ] && [ -f "$PW_QUAL_BACKUP" ]; then
         mv -f "$PW_QUAL_BACKUP" "$PW_QUAL_CONF" || true
@@ -89,7 +85,6 @@ if ! id -u "$SUSER" &>/dev/null; then
     printf "👤  Создаю пользователя %s...\n" "$SUSER"
     useradd -m -s /bin/bash -G sudo "$SUSER"
 
-    # === Если пароль передан через переменную окружения ===
     if [ -n "${SUSER_PASS-}" ]; then
         printf "🔑  Устанавливаю пароль из переменной окружения SUSER_PASS...\n"
         relax_pwquality
@@ -102,8 +97,6 @@ if ! id -u "$SUSER" &>/dev/null; then
             exit 1
         fi
         restore_pwquality
-
-    # === Если пароль не задан — интерактивный ввод ===
     else
         if [ ! -t 0 ]; then
             echo "❌  Ошибка: интерактивный ввод невозможен (нет TTY)."
@@ -135,7 +128,6 @@ if ! id -u "$SUSER" &>/dev/null; then
             else
                 restore_pwquality
                 printf "❌  Ошибка установки пароля. Попробуйте другой.\n"
-                continue
             fi
         done
     fi
@@ -149,18 +141,13 @@ if [[ -f "$SSH_CONFIG" ]]; then
     sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' "$SSH_CONFIG"
     sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$SSH_CONFIG"
     sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$SSH_CONFIG"
-    systemctl restart sshd >/dev/null 2>&1 || true
+    systemctl restart sshd || true
 fi
 
 # === Итоговая информация ===
 printf "✅  Готово! Сервер защищён и готов к работе.\n"
 printf "   • Пользователь: %s\n" "$SUSER"
-# Здесь выводим пароль, который был введён пользователем или передан через SUSER_PASS
 printf "   • Пароль: %s\n" "$REPORT_PASS"
-if [ -n "${SUSER_PASS-}" ]; then
-    # если пароль был передан через SUSER_PASS — REPORT_PASS уже установлен выше
-    :
-fi
 printf "   • Вход по SSH-ключу: разрешён (если ~/.ssh/authorized_keys существует)\n"
 printf "   • Root-доступ: отключён\n\n"
 
