@@ -2,7 +2,7 @@
 set -e
 
 # Очистка консоли
-clear
+printf "\033c"
 
 if [ -f /root/.server_secured ]; then
     printf "✅  Сервер уже защищён. Повторный запуск не требуется.\n"
