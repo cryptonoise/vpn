@@ -1,49 +1,57 @@
 #!/bin/bash
-
 set -e
 
-# === Проверка: уже настроен? ===
 if [ -f /root/.server_secured ]; then
-    echo "✅ Сервер уже защищён. Повторный запуск не требуется."
+    printf "✅ Сервер уже защищён. Повторный запуск не требуется.\n"
     exit 0
 fi
 
-echo "🚀 Начинаю базовую настройку безопасности сервера..."
+# === Универсальный спиннер (работает и без tty) ===
+run_with_spinner() {
+    local msg="$1"
+    shift
+    local cmd=("$@")
+    local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 
-# 1. Обновление системы
-echo "🔄 Обновляю систему..."
-sudo apt update >/dev/null 2>&1
-sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y >/dev/null 2>&1
-sudo DEBIAN_FRONTEND=noninteractive apt dist-upgrade -y >/dev/null 2>&1
-sudo apt autoremove -y >/dev/null 2>&1
+    printf "%s " "$msg"
 
-# 2. Автоматические обновления безопасности
-echo "🛡️ Устанавливаю unattended-upgrades..."
-sudo apt install -y --no-install-recommends unattended-upgrades >/dev/null 2>&1
-echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | sudo debconf-set-selections
-sudo dpkg-reconfigure -f noninteractive unattended-upgrades >/dev/null 2>&1
+    "${cmd[@]}" >/tmp/spinner_output.log 2>&1 &
+    local pid=$!
+    local i=0
 
-# 3. Защита от брутфорса
-echo "🛡️ Устанавливаю fail2ban..."
-sudo apt install -y --no-install-recommends fail2ban >/dev/null 2>&1
-sudo systemctl enable fail2ban --quiet
-sudo systemctl start fail2ban --quiet
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r%s %s " "$msg" "${spin[$((i++ % ${#spin[@]}))]}"
+        sleep 0.1
+    done
 
-# 4. Антивирус/руткит сканеры
-echo "🔍 Устанавливаю rkhunter и chkrootkit..."
-sudo apt install -y --no-install-recommends rkhunter chkrootkit >/dev/null 2>&1
-sudo rkhunter --update --quiet >/dev/null 2>&1
-sudo rkhunter --propupd --quiet >/dev/null 2>&1
+    wait "$pid"
+    local code=$?
 
-# 5. Утилиты мониторинга
-echo "📊 Устанавливаю htop, iotop, nethogs..."
-sudo apt install -y --no-install-recommends htop iotop nethogs >/dev/null 2>&1
+    if [ $code -eq 0 ]; then
+        printf "\r%s ✅\n" "$msg"
+    else
+        printf "\r%s ❌ (ошибка, см. /tmp/spinner_output.log)\n" "$msg"
+    fi
+}
 
-# === Помечаем как настроенный ===
+printf "🚀 Начинаю базовую настройку безопасности сервера...\n\n"
+
+run_with_spinner "🔄 Обновляю систему..." \
+    bash -c "apt update -qq && DEBIAN_FRONTEND=noninteractive apt upgrade -y -qq && apt autoremove -y -qq"
+
+run_with_spinner "🛡️ Устанавливаю unattended-upgrades..." \
+    bash -c "apt install -y -qq unattended-upgrades && \
+             echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | debconf-set-selections && \
+             dpkg-reconfigure -f noninteractive unattended-upgrades"
+
+run_with_spinner "🚫 Устанавливаю fail2ban..." \
+    bash -c "apt install -y -qq fail2ban && systemctl enable fail2ban --quiet && systemctl start fail2ban --quiet"
+
+run_with_spinner "🔍 Устанавливаю rkhunter и chkrootkit..." \
+    bash -c "apt install -y -qq rkhunter chkrootkit && rkhunter --update --quiet && rkhunter --propupd --quiet"
+
+run_with_spinner "📊 Устанавливаю htop, iotop, nethogs..." \
+    bash -c "apt install -y -qq htop iotop nethogs"
+
 touch /root/.server_secured
-
-echo "✅ Базовая безопасность сервера настроена!"
-echo "💡 Рекомендуется:"
-echo "   - Отключить вход по паролю в SSH"
-echo "   - Настроить UFW (фаервол)"
-echo "   - Убедиться, что Amnezia использует только нужные порты"
+printf "\n✅ Готово! Сервер защищён и готов к работе.\n📄 Лог: /tmp/spinner_output.log\n"
