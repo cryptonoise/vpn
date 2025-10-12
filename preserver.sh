@@ -2,7 +2,7 @@
 set -e
 
 if [ -f /root/.server_secured ]; then
-    printf "✅ Сервер уже защищён. Повторный запуск не требуется.\n"
+    printf "✅  Сервер уже защищён. Повторный запуск не требуется.\n"
     exit 0
 fi
 
@@ -13,14 +13,14 @@ run_with_spinner() {
     local cmd=("$@")
     local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 
-    printf "%s " "$msg"
+    printf "%-25s " "$msg"  # Выравнивание по ширине
 
     "${cmd[@]}" &
     local pid=$!
     local i=0
 
     while kill -0 "$pid" 2>/dev/null; do
-        printf "\r%s %s " "$msg" "${spin[$((i++ % ${#spin[@]}))]}"
+        printf "\r%-25s %s " "$msg" "${spin[$((i++ % ${#spin[@]}))]}"
         sleep 0.1
     done
 
@@ -28,27 +28,37 @@ run_with_spinner() {
     local code=$?
 
     if [ $code -eq 0 ]; then
-        printf "\r%s ✅\n" "$msg"
+        printf "\r%-25s ✅\n" "$msg"
     else
-        printf "\r%s ❌\n" "$msg"
+        printf "\r%-25s ❌\n" "$msg"
     fi
 }
 
-printf "🚀 Начинаю базовую настройку безопасности сервера...\n\n"
+printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
-run_with_spinner "🔄 Обновляю систему..." \
+run_with_spinner "🔄  Обновляю систему..." \
     bash -c "apt update -qq && DEBIAN_FRONTEND=noninteractive apt upgrade -y -qq && apt autoremove -y -qq"
 
-run_with_spinner "🛡️ Устанавливаю unattended-upgrades..." \
+run_with_spinner "🛡️  Устанавливаю unattended-upgrades..." \
     bash -c "apt install -y -qq unattended-upgrades && \
              echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | debconf-set-selections && \
              dpkg-reconfigure -f noninteractive unattended-upgrades"
 
-run_with_spinner "🚫 Устанавливаю fail2ban..." \
+run_with_spinner "🚫  Устанавливаю fail2ban..." \
     bash -c "apt install -y -qq fail2ban && systemctl enable fail2ban --quiet && systemctl start fail2ban --quiet"
 
-run_with_spinner "📊 Устанавливаю htop, iotop, nethogs..." \
+run_with_spinner "📊  Устанавливаю htop, iotop, nethogs..." \
     bash -c "apt install -y -qq htop iotop nethogs"
 
 touch /root/.server_secured
-printf "\n✅ Готово! Сервер защищён и готов к работе.\n"
+printf "\n✅  Готово! Сервер защищён и готов к работе.\n\n"
+
+# === Таймер перезагрузки 5 секунд ===
+echo "🔄  Перезагрузка через 5 секунд..."
+for i in $(seq 5 -1 1); do
+    printf "\r   %d " "$i"
+    sleep 1
+done
+printf "\n"
+
+reboot
