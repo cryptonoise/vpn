@@ -6,31 +6,32 @@ if [ -f /root/.server_secured ]; then
     exit 0
 fi
 
-# === Универсальный спиннер с выравниванием ===
+# === Универсальный спиннер (работает и без tty) ===
 run_with_spinner() {
     local msg="$1"
     shift
     local cmd=("$@")
     local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-    local width=55
+    local width=58
 
-    printf "%-60s" "$msg"
+    printf "%-*s" "$width" "$msg"
 
     "${cmd[@]}" >/dev/null 2>&1 &
     local pid=$!
     local i=0
 
     while kill -0 "$pid" 2>/dev/null; do
-        printf "\r%-60s%s" "$msg" "${spin[$((i++ % ${#spin[@]}))]}"
+        printf "\r%-*s%s" "$width" "$msg" "${spin[$((i++ % ${#spin[@]}))]}"
         sleep 0.1
     done
 
     wait "$pid"
     local code=$?
+
     if [ $code -eq 0 ]; then
-        printf "\r%-60s✅\n" "$msg"
+        printf "\r%-*s✅\n" "$width" "$msg"
     else
-        printf "\r%-60s❌\n" "$msg"
+        printf "\r%-*s❌\n" "$width" "$msg"
     fi
 }
 
@@ -50,13 +51,8 @@ run_with_spinner "🚫  Устанавливаю fail2ban..." \
 run_with_spinner "🔍  Устанавливаю rkhunter и chkrootkit..." \
     bash -c "apt install -y -qq rkhunter chkrootkit && rkhunter --update --quiet && rkhunter --propupd --quiet"
 
-run_with_spinner "🔒  Настраиваю SSH..." \
-    bash -c "sed -i 's/#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && \
-             sed -i 's/#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && \
-             systemctl restart ssh >/dev/null 2>&1"
-
-run_with_spinner "🧹  Очищаю ненужные пакеты..." \
-    bash -c "apt autoremove -y -qq && apt clean -qq"
+run_with_spinner "📊  Устанавливаю htop, iotop, nethogs..." \
+    bash -c "apt install -y -qq htop iotop nethogs"
 
 touch /root/.server_secured
 
