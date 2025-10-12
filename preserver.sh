@@ -16,19 +16,19 @@ if [ -d /var/lib/dpkg/updates ] && ls /var/lib/dpkg/updates/* >/dev/null 2>&1; t
     printf "🔧  Обнаружены следы прерванной установки. Восстанавливаю систему...\n"
     rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend
     rm -f /var/cache/apt/archives/lock /var/lib/apt/lists/lock
-    dpkg --configure -a --force-confdef --force-confold >/dev/null 2>&1 || true
+    dpkg --configure -a --force-confdef --force-confold || true
     rm -f /var/lib/dpkg/updates/*
-    dpkg --configure -a >/dev/null 2>&1 || true
+    dpkg --configure -a || true
     printf "✅  Восстановление завершено.\n\n"
 fi
 
-# === Обновление системы ===
+# === Обновление системы (видимый вывод) ===
 printf "🔄  Обновляю систему...\n"
 echo "──────────────────────────────────────"
 
-apt-get update -qq
-apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-apt-get dist-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+apt-get update || { echo "❌ apt-get update failed"; exit 1; }
+apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { echo "❌ upgrade failed"; exit 1; }
+apt-get dist-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { echo "❌ dist-upgrade failed"; exit 1; }
 apt-get autoremove -y
 
 echo "──────────────────────────────────────"
@@ -41,7 +41,7 @@ printf "\033c"
 install_if_missing() {
     local pkg="$1"
     if ! dpkg -s "$pkg" &>/dev/null; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$pkg" >/dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$pkg"
     fi
 }
 
@@ -88,7 +88,7 @@ if ! id -u "$SUSER" &>/dev/null; then
     printf "👤  Создаю пользователя %s...\n" "$SUSER"
     useradd -m -s /bin/bash -G sudo "$SUSER"
 
-    # === Если пароль передан через переменную окружения ===
+    # Если пароль передан через переменную окружения
     if [ -n "${SUSER_PASS-}" ]; then
         USER_PASSWORD="$SUSER_PASS"
         printf "🔑  Устанавливаю пароль из переменной окружения SUSER_PASS...\n"
@@ -101,7 +101,7 @@ if ! id -u "$SUSER" &>/dev/null; then
         fi
         restore_pwquality
 
-    # === Если пароль не задан — интерактивный ввод ===
+    # Если пароль не задан — интерактивный ввод
     else
         if [ ! -t 0 ]; then
             echo "❌  Ошибка: интерактивный ввод невозможен (нет TTY)."
