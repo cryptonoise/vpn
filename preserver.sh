@@ -9,38 +9,6 @@ if [ -f /root/.server_secured ]; then
     exit 0
 fi
 
-# === Спиннер с прогрессом для обновления пакетов ===
-update_with_progress() {
-    local pkgs=($(apt list --upgradable 2>/dev/null | grep -v Listing | cut -d/ -f1))
-    local total=${#pkgs[@]}
-
-    # Если пакетов нет для обновления, обычное обновление
-    if [ $total -eq 0 ]; then
-        run_with_spinner "🔄  Обновляю систему..." bash -c "apt upgrade -y >/dev/null 2>&1 && apt autoremove -y >/dev/null 2>&1"
-        return
-    fi
-
-    local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-    local count=0
-    local i=0
-
-    # Запускаем обновление в фоне
-    apt upgrade -y >/tmp/apt_output.log 2>&1 &
-    local pid=$!
-
-    while kill -0 $pid 2>/dev/null; do
-        if [ -f /tmp/apt_output.log ]; then
-            count=$(grep -c 'Preparing to unpack' /tmp/apt_output.log)
-        fi
-        printf "\r%-35s %s %d/%d" "🔄  Обновляю систему..." "${spin[$((i++ % ${#spin[@]}))]}" "$count" "$total"
-        sleep 0.3
-    done
-
-    wait $pid
-    printf "\r%-35s ✅\n" "🔄  Обновление системы завершено"
-    rm -f /tmp/apt_output.log
-}
-
 # === Спиннер обычный ===
 run_with_spinner() {
     local msg="$1"
@@ -75,6 +43,37 @@ install_if_missing() {
     if ! dpkg -s "$pkg" &>/dev/null; then
         run_with_spinner "📦  Устанавливаю $pkg..." bash -c "DEBIAN_FRONTEND=noninteractive apt install -y $pkg >/dev/null 2>&1"
     fi
+}
+
+# === Обновление системы с прогрессом пакетов ===
+update_with_progress() {
+    # Получаем количество пакетов для обновления через симуляцию
+    local total=$(apt-get -s upgrade | grep -P '^\d+ upgraded' | awk '{print $1}')
+    
+    if [ -z "$total" ] || [ "$total" -eq 0 ]; then
+        run_with_spinner "🔄  Обновляю систему..." bash -c "apt upgrade -y >/dev/null 2>&1 && apt autoremove -y >/dev/null 2>&1"
+        return
+    fi
+
+    local count=0
+    local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+
+    # Запускаем реальное обновление в фоне
+    apt upgrade -y >/tmp/apt_output.log 2>&1 &
+    local pid=$!
+
+    while kill -0 $pid 2>/dev/null; do
+        if [ -f /tmp/apt_output.log ]; then
+            # Считаем установленные пакеты
+            count=$(grep -c 'Setting up' /tmp/apt_output.log)
+        fi
+        printf "\r%-35s %s %d/%d" "🔄  Обновляю систему..." "${spin[$((count % ${#spin[@]}))]}" "$count" "$total"
+        sleep 0.3
+    done
+
+    wait $pid
+    printf "\r%-35s ✅\n" "🔄  Обновление системы завершено"
+    rm -f /tmp/apt_output.log
 }
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
