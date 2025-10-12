@@ -4,37 +4,28 @@ set -e
 # Очистка консоли
 printf "\033c"
 
-# === Выполнение команды с сообщением ===
-run() {
-    local msg="$1"
-    shift
-    printf "%-50s" "$msg"
-    "$@"
-    local code=$?
-    if [ $code -eq 0 ]; then
-        printf " ✅\n"
-    else
-        printf " ❌\n"
-    fi
-}
-
-# === Установка пакета если отсутствует ===
-install_if_missing() {
-    local pkg="$1"
-    if ! dpkg -s "$pkg" &>/dev/null; then
-        run "📦  Устанавливаю $pkg..." bash -c "DEBIAN_FRONTEND=noninteractive apt install -y $pkg >/dev/null 2>&1"
-    fi
-}
+# Установка переменной для неинтерактивного apt
+export DEBIAN_FRONTEND=noninteractive
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
-# Быстрое обновление системы без интерактивности
-run "🔄  Обновляю систему..." bash -c "
-DEBIAN_FRONTEND=noninteractive apt update >/dev/null 2>&1 &&
-DEBIAN_FRONTEND=noninteractive apt upgrade -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' >/dev/null 2>&1 &&
-DEBIAN_FRONTEND=noninteractive apt dist-upgrade -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' >/dev/null 2>&1 &&
-DEBIAN_FRONTEND=noninteractive apt autoremove -y >/dev/null 2>&1
-"
+# === Обновление системы ===
+printf "🔄  Обновляю систему... "
+apt-get update -qq
+apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+apt-get dist-upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+apt-get autoremove -y -qq
+printf "✅\n\n"
+
+# === Функция установки пакета если отсутствует ===
+install_if_missing() {
+    local pkg="$1"
+    if ! dpkg -s "$pkg" &>/dev/null; then
+        printf "📦  Устанавливаю %s... " "$pkg"
+        apt-get install -y -qq "$pkg"
+        printf "✅\n"
+    fi
+}
 
 # unattended-upgrades
 install_if_missing "unattended-upgrades"
@@ -51,19 +42,21 @@ done
 
 # === Автоматическое создание пользователя suser и отключение root ===
 if ! id -u suser &>/dev/null; then
-    run "👤  Создаю пользователя suser..." bash -c "useradd -m -s /bin/bash -G sudo suser"
+    printf "👤  Создаю пользователя suser... "
+    useradd -m -s /bin/bash -G sudo suser
+    printf "✅\n"
 fi
 
-# Настройка SSH
+# === Настройка SSH для безопасности ===
 SSH_CONFIG="/etc/ssh/sshd_config"
-run "🔐  Настройка SSH для безопасности..." bash -c "
-    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' $SSH_CONFIG
-    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' $SSH_CONFIG
-    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' $SSH_CONFIG
-    systemctl restart sshd
-"
+printf "🔐  Настраиваю SSH... "
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' "$SSH_CONFIG"
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$SSH_CONFIG"
+sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$SSH_CONFIG"
+systemctl restart sshd
+printf "✅\n\n"
 
-printf "\n✅  Готово! Сервер защищён и готов к работе.\n\n"
+printf "✅  Готово! Сервер защищён и готов к работе.\n\n"
 
 # === Таймер перезагрузки 5 секунд с возможностью отмены по Enter ===
 echo "🔄  Перезагрузка через 5 секунд... (нажмите Enter чтобы отменить)"
