@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Завершаем работу при любой ошибке
+# Завершаем работу при ошибках
 set -euo pipefail
 
 # Очищаем экран
@@ -56,6 +56,7 @@ systemctl start fail2ban --quiet || true
 SUSER="suser"
 PW_QUAL_CONF="/etc/security/pwquality.conf"
 PW_QUAL_BACKUP=""
+USER_PASSWORD=""
 
 # Временное ослабление проверки сложности пароля
 relax_pwquality() {
@@ -89,6 +90,7 @@ if ! id -u "$SUSER" &>/dev/null; then
 
     # === Если пароль передан через переменную окружения ===
     if [ -n "${SUSER_PASS-}" ]; then
+        USER_PASSWORD="$SUSER_PASS"
         printf "🔑  Устанавливаю пароль из переменной окружения SUSER_PASS...\n"
         relax_pwquality
         if echo "${SUSER}:${SUSER_PASS}" | chpasswd; then
@@ -108,14 +110,9 @@ if ! id -u "$SUSER" &>/dev/null; then
         fi
 
         while true; do
-            if [ "${SHOW_PASS-0}" = "1" ]; then
-                printf "🔒  Введите пароль для пользователя %s (символы видны): " "$SUSER"
-                read password
-            else
-                printf "🔒  Введите пароль для пользователя %s: " "$SUSER"
-                read -s password
-                printf "\n"
-            fi
+            printf "🔒  Введите пароль для пользователя %s: " "$SUSER"
+            read -s password
+            printf "\n"
 
             if [ -z "$password" ]; then
                 printf "⚠️  Пароль не может быть пустым. Попробуйте снова.\n"
@@ -124,6 +121,7 @@ if ! id -u "$SUSER" &>/dev/null; then
 
             relax_pwquality
             if echo "${SUSER}:${password}" | chpasswd; then
+                USER_PASSWORD="$password"
                 printf "✅  Пароль успешно установлен.\n\n"
                 restore_pwquality
                 break
@@ -151,9 +149,11 @@ fi
 printf "✅  Готово! Сервер защищён и готов к работе.\n"
 printf "   • Пользователь: %s\n" "$SUSER"
 if [ -n "${SUSER_PASS-}" ]; then
-    printf "   • Пароль: задан из переменной окружения SUSER_PASS\n"
+    printf "   • Пароль: %s\n" "$SUSER_PASS"
+elif [ -n "$USER_PASSWORD" ]; then
+    printf "   • Пароль: %s\n" "$USER_PASSWORD"
 else
-    printf "   • Пароль: введён вручную\n"
+    printf "   • Пароль: введён вручную (не удалось отобразить)\n"
 fi
 printf "   • Вход по SSH-ключу: разрешён (если ~/.ssh/authorized_keys существует)\n"
 printf "   • Root-доступ: отключён\n\n"
