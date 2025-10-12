@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# Очистка консоли
+clear
+
 if [ -f /root/.server_secured ]; then
     printf "✅  Сервер уже защищён. Повторный запуск не требуется.\n"
     exit 0
@@ -13,7 +16,7 @@ run_with_spinner() {
     local cmd=("$@")
     local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 
-    printf "%-25s " "$msg"  # Выравнивание по ширине
+    printf "%-25s " "$msg"
 
     "${cmd[@]}" &
     local pid=$!
@@ -34,21 +37,42 @@ run_with_spinner() {
     fi
 }
 
+# === Проверка и установка пакета ===
+install_if_missing() {
+    local pkg="$1"
+    local msg="$2"
+    if dpkg -s "$pkg" &>/dev/null; then
+        printf "%-25s ✅ уже установлено\n" "$msg"
+    else
+        run_with_spinner "$msg" bash -c "apt install -y -qq $pkg"
+    fi
+}
+
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
+# Обновление системы
 run_with_spinner "🔄  Обновляю систему..." \
     bash -c "apt update -qq && DEBIAN_FRONTEND=noninteractive apt upgrade -y -qq && apt autoremove -y -qq"
 
-run_with_spinner "🛡️  Устанавливаю unattended-upgrades..." \
-    bash -c "apt install -y -qq unattended-upgrades && \
-             echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | debconf-set-selections && \
-             dpkg-reconfigure -f noninteractive unattended-upgrades"
+# unattended-upgrades
+if dpkg -s "unattended-upgrades" &>/dev/null; then
+    printf "%-25s ✅ уже установлено\n" "🛡️  unattended-upgrades"
+else
+    run_with_spinner "🛡️  Устанавливаю unattended-upgrades..." \
+        bash -c "apt install -y -qq unattended-upgrades && \
+                 echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | debconf-set-selections && \
+                 dpkg-reconfigure -f noninteractive unattended-upgrades"
+fi
 
-run_with_spinner "🚫  Устанавливаю fail2ban..." \
-    bash -c "apt install -y -qq fail2ban && systemctl enable fail2ban --quiet && systemctl start fail2ban --quiet"
+# fail2ban
+install_if_missing "fail2ban" "🚫  Устанавливаю fail2ban..."
+systemctl enable fail2ban --quiet
+systemctl start fail2ban --quiet
 
-run_with_spinner "📊  Устанавливаю htop, iotop, nethogs..." \
-    bash -c "apt install -y -qq htop iotop nethogs"
+# htop, iotop, nethogs
+for pkg in htop iotop nethogs; do
+    install_if_missing "$pkg" "📊  Устанавливаю $pkg..."
+done
 
 touch /root/.server_secured
 printf "\n✅  Готово! Сервер защищён и готов к работе.\n\n"
