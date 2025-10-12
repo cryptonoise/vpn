@@ -11,28 +11,18 @@ printf "🚀  Начинаю базовую настройку безопасн�
 
 # === ФУНКЦИЯ: автоматическое восстановление dpkg ===
 auto_fix_dpkg() {
-    # Проверяем: есть ли файлы в /var/lib/dpkg/updates/ — это главный признак проблемы
-    if [ -d /var/lib/dpkg/updates ] && ls /var/lib/dpkg/updates/* >/dev/null 2>&1; then
-        printf "🔧  Обнаружены следы прерванной установки пакетов. Выполняю автоматическое восстановление...\n"
-        
-        # Принудительно завершаем все незавершённые операции dpkg
-        if dpkg --configure -a \
-            --force-confdef \
-            --force-confold \
-            >/dev/null 2>&1; then
-            printf "✅  Восстановление dpkg успешно завершено.\n\n"
+    printf "🔧  Проверяю состояние dpkg... "
+    if dpkg --audit &>/dev/null; then
+        printf "все в порядке.\n"
+    else
+        printf "обнаружены незавершённые пакеты, исправляю...\n"
+        if DEBIAN_FRONTEND=noninteractive dpkg --configure -a \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold"; then
+            printf "✅  dpkg успешно восстановлен.\n"
         else
-            # Если не получилось — пробуем ещё раз с DEBIAN_FRONTEND
-            if DEBIAN_FRONTEND=noninteractive dpkg --configure -a \
-                -o Dpkg::Options::="--force-confdef" \
-                -o Dpkg::Options::="--force-confold" \
-                >/dev/null 2>&1; then
-                printf "✅  Восстановление dpkg успешно завершено (вторая попытка).\n\n"
-            else
-                echo "❌ Критическая ошибка: не удалось восстановить dpkg автоматически."
-                echo "   Вручную выполните: dpkg --configure -a"
-                exit 1
-            fi
+            echo "❌  Критическая ошибка: не удалось автоматически восстановить dpkg."
+            exit 1
         fi
     fi
 }
@@ -44,14 +34,15 @@ auto_fix_dpkg
 printf "🔄  Обновляю систему...\n"
 echo "──────────────────────────────────────"
 
-if ! apt-get update; then
+if ! apt-get update -y; then
     echo "❌ Ошибка: apt-get update завершился неудачно."
     exit 1
 fi
 
-# ЕЩЁ РАЗ проверяем и исправляем dpkg — на случай, если update что-то активировало
+# Проверяем dpkg после update
 auto_fix_dpkg
 
+# Обновление пакетов
 if ! apt-get upgrade -y \
     -o Dpkg::Options::="--force-confdef" \
     -o Dpkg::Options::="--force-confold"; then
