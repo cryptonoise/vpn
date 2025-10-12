@@ -1,10 +1,9 @@
 #!/bin/bash
-set -e
 
-# Очистка консоли
+# Очистка консоли в начале
 printf "\033c"
 
-# Установка переменной для неинтерактивного apt
+# Установка переменной для неинтерактивного режима apt
 export DEBIAN_FRONTEND=noninteractive
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
@@ -13,20 +12,25 @@ printf "🚀  Начинаю базовую настройку безопасн�
 printf "🔄  Обновляю систему...\n"
 echo "──────────────────────────────────────"
 
-# Обновление списка пакетов
-apt-get update
+if ! apt-get update; then
+    echo "❌ Ошибка: не удалось выполнить 'apt-get update'. Проверьте подключение к интернету и файл /etc/apt/sources.list."
+    exit 1
+fi
 
-# Обновление установленных пакетов с автоматическим выбором конфигураций
-apt-get upgrade -y \
+if ! apt-get upgrade -y \
     -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold"
+    -o Dpkg::Options::="--force-confold"; then
+    echo "❌ Ошибка при выполнении 'apt-get upgrade'."
+    exit 1
+fi
 
-# Полное обновление (включая ядро и зависимости)
-apt-get dist-upgrade -y \
+if ! apt-get dist-upgrade -y \
     -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold"
+    -o Dpkg::Options::="--force-confold"; then
+    echo "❌ Ошибка при выполнении 'apt-get dist-upgrade'."
+    exit 1
+fi
 
-# Удаление ненужных пакетов
 apt-get autoremove -y
 
 echo "──────────────────────────────────────"
@@ -35,57 +39,60 @@ printf "✅  Система успешно обновлена!\n\n"
 # Очистка экрана после обновления
 printf "\033c"
 
-# === Функция установки пакета если отсутствует ===
+# === Функция установки пакета, если отсутствует ===
 install_if_missing() {
     local pkg="$1"
     if ! dpkg -s "$pkg" &>/dev/null; then
         printf "📦  Устанавливаю %s... " "$pkg"
-        apt-get install -y -qq "$pkg"
-        printf "✅\n"
+        if apt-get install -y -qq "$pkg"; then
+            printf "✅\n"
+        else
+            printf "❌\n"
+            echo "⚠️  Не удалось установить пакет: $pkg"
+        fi
+    else
+        printf "📦  Пакет %s уже установлен.\n" "$pkg"
     fi
 }
 
-# unattended-upgrades
+# Установка необходимых пакетов
 install_if_missing "unattended-upgrades"
-
-# fail2ban
 install_if_missing "fail2ban"
-systemctl enable fail2ban --quiet
-systemctl start fail2ban --quiet
+install_if_missing "htop"
+install_if_missing "iotop"
+install_if_missing "nethogs"
 
-# htop, iotop, nethogs
-for pkg in htop iotop nethogs; do
-    install_if_missing "$pkg"
-done
-
-# === Автоматическое создание пользователя suser и отключение root ===
-if ! id -u suser &>/dev/null; then
-    printf "👤  Создаю пользователя suser... "
-    useradd -m -s /bin/bash -G sudo suser
-    printf "✅\n"
+# Запуск и включение fail2ban
+if systemctl is-active --quiet fail2ban; then
+    printf "🛡️  fail2ban уже запущен.\n"
+else
+    systemctl enable fail2ban --quiet
+    systemctl start fail2ban --quiet
+    printf "🛡️  fail2ban запущен и включён в автозагрузку.\n"
 fi
 
-# === Настройка SSH для безопасности ===
-SSH_CONFIG="/etc/ssh/sshd_config"
-printf "🔐  Настраиваю SSH... "
-sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' "$SSH_CONFIG"
-sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$SSH_CONFIG"
-sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$SSH_CONFIG"
-systemctl restart sshd
-printf "✅\n\n"
-
-printf "✅  Готово! Сервер защищён и готов к работе.\n\n"
-
-# === Таймер перезагрузки 5 секунд с возможностью отмены по Enter ===
-echo "🔄  Перезагрузка через 5 секунд... (нажмите Enter чтобы отменить)"
-for i in $(seq 5 -1 1); do
-    printf "\r   %d " "$i"
-    read -t 1 -n 1 key
-    if [[ $key == "" ]]; then
-        echo -e "\n⏹  Перезагрузка отменена пользователем."
-        exit 0
+# === Создание пользователя suser (если не существует) ===
+if ! id -u suser &>/dev/null; then
+    printf "👤  Создаю пользователя suser... "
+    if useradd -m -s /bin/bash -G sudo suser; then
+        printf "✅\n"
+    else
+        printf "❌\n"
+        echo "⚠️  Не удалось создать пользователя suser."
     fi
-done
-printf "\n"
+else
+    printf "👤  Пользователь suser уже существует.\n"
+fi
 
-reboot
+# === Настройка SSH ===
+SSH_CONFIG="/etc/ssh/sshd_config"
+if [[ -f "$SSH_CONFIG" ]]; then
+    printf "🔐  Настраиваю SSH... "
+    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' "$SSH_CONFIG"
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$SSH_CONFIG"
+    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$SSH_CONFIG"
+    if systemctl restart sshd; then
+        printf "✅\n\n"
+    else
+        printf "❌\n"
+        echo "⚠️  Не удалось перезапустить sshd.
