@@ -31,67 +31,57 @@ printf "✅  Система успешно обновлена!\n\n"
 
 printf "\033c"
 
-# === ФУНКЦИЯ УСТАНОВКИ (без лишнего вывода и с защитой от зависаний) ===
+# === Установка пакетов (тихо, без лишнего вывода) ===
 install_if_missing() {
     local pkg="$1"
     if ! dpkg -s "$pkg" &>/dev/null; then
-        printf "📦  Устанавливаю %s... " "$pkg"
         if DEBIAN_FRONTEND=noninteractive \
            apt-get install -y --no-install-recommends \
            -o Dpkg::Options::="--force-confdef" \
            -o Dpkg::Options::="--force-confold" \
            "$pkg" &>/dev/null; then
-            printf "✅\n"
-        else
-            printf "❌\n"
+            :
         fi
     fi
-    # Если пакет уже установлен — ничего не выводим
 }
 
-# === Установка пакетов ===
 for pkg in unattended-upgrades fail2ban htop iotop nethogs; do
     install_if_missing "$pkg"
 done
 
-# Настройка fail2ban
 systemctl enable fail2ban --quiet
 systemctl start fail2ban --quiet
 
-# === Пользователь suser ===
+# === Создание пользователя и установка пароля ===
 if ! id -u suser &>/dev/null; then
-    printf "👤  Создаю пользователя suser... "
-    useradd -m -s /bin/bash -G sudo suser && printf "✅\n"
-else
-    printf "👤  Пользователь suser уже существует.\n"
+    useradd -m -s /bin/bash -G sudo suser
 fi
 
-echo "suser:0suser1" | chpasswd
-printf "🔑  Пароль для suser: 0suser1\n"
+# Установка пароля (8+ символов, чтобы избежать ошибок PAM)
+echo "suser:0suser12" | chpasswd
 
-# === Настройка SSH ===
+# === Настройка SSH (без вывода) ===
 SSH_CONFIG="/etc/ssh/sshd_config"
 if [[ -f "$SSH_CONFIG" ]]; then
-    printf "🔐  Настраиваю SSH... "
     sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' "$SSH_CONFIG"
     sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$SSH_CONFIG"
     sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$SSH_CONFIG"
-    systemctl restart sshd && printf "✅\n\n" || printf "❌\n\n"
-else
-    echo "⚠️  SSH config not found."
+    systemctl restart sshd >/dev/null 2>&1
 fi
 
-printf "✅  Готово! Сервер настроен.\n"
+# === ФИНАЛЬНОЕ СООБЩЕНИЕ ===
+printf "✅  Готово! Сервер защищён и готов к работе.\n"
 printf "   • Пользователь: suser\n"
-printf "   • Пароль: 0suser1\n"
+printf "   • Пароль: 0suser12\n"
+printf "   • Вход по SSH-ключу: разрешён (если ~/.ssh/authorized_keys существует)\n"
 printf "   • Root-доступ: отключён\n\n"
 
-# === Перезагрузка ===
+# === Перезагрузка с отменой ===
 echo "🔄  Перезагрузка через 5 секунд... (нажмите Enter, чтобы отменить)"
 for i in $(seq 5 -1 1); do
     printf "\r   %d " "$i"
     if read -t 1 -n 1 key; then
-        echo -e "\n⏹  Перезагрузка отменена."
+        echo -e "\n⏹  Перезагрузка отменена пользователем."
         exit 0
     fi
 done
