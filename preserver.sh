@@ -22,35 +22,40 @@ if [ -d /var/lib/dpkg/updates ] && ls /var/lib/dpkg/updates/* >/dev/null 2>&1; t
     printf "✅  Восстановление завершено.\n\n"
 fi
 
-# === Обновление системы (интерактивный вывод) ===
-printf "🔄  Обновляю систему...\n"
+# === Обновление системы с выводом основных моментов ===
 echo "──────────────────────────────────────"
+printf "🔄  Обновление системы...\n"
 
+echo "• Обновление списка пакетов..."
 apt-get update
+
+echo "• Обновление пакетов системы..."
 apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+
+echo "• Обновление дистрибутива (dist-upgrade)..."
 apt-get dist-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+
+echo "• Удаление ненужных пакетов..."
 apt-get autoremove -y
 
 echo "──────────────────────────────────────"
 printf "✅  Система успешно обновлена!\n\n"
 
-# Очищаем экран
-printf "\033c"
-
-# === Установка необходимых пакетов ===
-install_if_missing() {
-    local pkg="$1"
-    if ! dpkg -s "$pkg" &>/dev/null; then
-        apt-get install -y --no-install-recommends "$pkg"
-    fi
-}
-
+# === Установка пакетов с пошаговым выводом ===
+echo "──────────────────────────────────────"
 for pkg in unattended-upgrades fail2ban htop iotop nethogs; do
-    install_if_missing "$pkg"
+    if ! dpkg -s "$pkg" &>/dev/null; then
+        echo "• Устанавливаем $pkg..."
+        apt-get install -y --no-install-recommends "$pkg"
+    else
+        echo "• Пакет $pkg уже установлен"
+    fi
 done
 
+echo "• Включаем и запускаем fail2ban..."
 systemctl enable fail2ban || true
 systemctl start fail2ban || true
+echo "──────────────────────────────────────"
 
 # === Создание пользователя suser ===
 SUSER="suser"
@@ -81,22 +86,18 @@ restore_pwquality() {
     fi
 }
 
+echo "──────────────────────────────────────"
 if ! id -u "$SUSER" &>/dev/null; then
-    printf "👤  Создаю пользователя %s...\n" "$SUSER"
+    printf "👤  Создаём пользователя %s...\n" "$SUSER"
     useradd -m -s /bin/bash -G sudo "$SUSER"
 
     if [ -n "${SUSER_PASS-}" ]; then
-        printf "🔑  Устанавливаю пароль из переменной окружения SUSER_PASS...\n"
+        printf "🔑  Устанавливаем пароль из переменной окружения SUSER_PASS...\n"
         relax_pwquality
-        if echo "${SUSER}:${SUSER_PASS}" | chpasswd; then
-            printf "✅  Пароль успешно установлен из SUSER_PASS.\n\n"
-            REPORT_PASS="${SUSER_PASS}"
-        else
-            printf "❌  Не удалось установить пароль из SUSER_PASS.\n"
-            restore_pwquality
-            exit 1
-        fi
+        echo "${SUSER}:${SUSER_PASS}" | chpasswd
+        REPORT_PASS="${SUSER_PASS}"
         restore_pwquality
+        printf "✅  Пароль успешно установлен.\n\n"
     else
         if [ ! -t 0 ]; then
             echo "❌  Ошибка: интерактивный ввод невозможен (нет TTY)."
@@ -105,25 +106,18 @@ if ! id -u "$SUSER" &>/dev/null; then
         fi
 
         while true; do
-            if [ "${SHOW_PASS-0}" = "1" ]; then
-                printf "🔒  Введите пароль для пользователя %s (символы видны): " "$SUSER"
-                read password
-            else
-                printf "🔒  Введите пароль для пользователя %s: " "$SUSER"
-                read -s password
-                printf "\n"
-            fi
-
+            printf "🔒  Введите пароль для пользователя %s: " "$SUSER"
+            read -s password
+            printf "\n"
             if [ -z "$password" ]; then
                 printf "⚠️  Пароль не может быть пустым. Попробуйте снова.\n"
                 continue
             fi
-
             relax_pwquality
             if echo "${SUSER}:${password}" | chpasswd; then
+                restore_pwquality
                 printf "✅  Пароль успешно установлен.\n\n"
                 REPORT_PASS="${password}"
-                restore_pwquality
                 break
             else
                 restore_pwquality
@@ -132,17 +126,21 @@ if ! id -u "$SUSER" &>/dev/null; then
         done
     fi
 else
-    printf "👤  Пользователь %s уже существует — пропускаю создание.\n\n" "$SUSER"
+    printf "👤  Пользователь %s уже существует — пропускаем создание.\n\n" "$SUSER"
 fi
 
 # === Настройка SSH ===
+echo "──────────────────────────────────────"
+echo "• Настраиваем SSH: отключаем root, разрешаем Pubkey, включаем пароль"
 SSH_CONFIG="/etc/ssh/sshd_config"
 if [[ -f "$SSH_CONFIG" ]]; then
     sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' "$SSH_CONFIG"
     sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$SSH_CONFIG"
     sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$SSH_CONFIG"
+    echo "• Перезапуск SSH сервиса..."
     systemctl restart sshd || true
 fi
+echo "──────────────────────────────────────"
 
 # === Итоговая информация ===
 printf "✅  Готово! Сервер защищён и готов к работе.\n"
