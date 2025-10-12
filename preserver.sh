@@ -61,4 +61,4 @@ sudo apt install -y htop iotop nethogs >/dev/null 2>&1 &
 spinner $!
 
 echo
-echo "✅ Готово! Сервер защищён и готов к работе."
+echo "✅ Готово!"
