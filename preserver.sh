@@ -45,10 +45,35 @@ install_if_missing() {
     fi
 }
 
+# === Обновление системы с прогрессом пакетов и спиннером ===
+update_system_with_progress() {
+    # Получаем список пакетов для обновления
+    pkgs=$(apt list --upgradable 2>/dev/null | tail -n +2 | cut -d/ -f1)
+    total=$(echo "$pkgs" | wc -l)
+
+    if [ "$total" -eq 0 ]; then
+        printf "%-30s ✅\n" "🔄  Обновляю систему..."
+        return
+    fi
+
+    local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    count=0
+    i=0
+
+    for pkg in $pkgs; do
+        DEBIAN_FRONTEND=noninteractive apt install -y "$pkg" >/dev/null 2>&1
+        count=$((count+1))
+        percent=$((count*100/total))
+        printf "\r%-30s %s %d/%d (%d%%)" "🔄  Обновляю систему..." "${spin[$((i++ % ${#spin[@]}))]}" "$count" "$total" "$percent"
+        sleep 0.1
+    done
+    printf "\r%-30s ✅\n" "🔄  Обновляю систему..."
+}
+
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
 # Обновление системы
-run_with_spinner "🔄  Обновляю систему..." bash -c "DEBIAN_FRONTEND=noninteractive apt update >/dev/null 2>&1 && apt upgrade -y >/dev/null 2>&1 && apt autoremove -y >/dev/null 2>&1"
+update_system_with_progress
 
 # unattended-upgrades
 install_if_missing "unattended-upgrades"
@@ -62,6 +87,22 @@ systemctl start fail2ban --quiet
 for pkg in htop iotop nethogs; do
     install_if_missing "$pkg"
 done
+
+# === Автоматическое создание пользователя suser и отключение root ===
+if ! id -u suser &>/dev/null; then
+    run_with_spinner "👤  Создаю пользователя suser..." bash -c "useradd -m -s /bin/bash -G sudo suser"
+fi
+
+# Настройка SSH
+SSH_CONFIG="/etc/ssh/sshd_config"
+if ! grep -q "^PermitRootLogin no" $SSH_CONFIG; then
+    run_with_spinner "🔐  Настройка SSH для безопасности..." bash -c "
+        sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' $SSH_CONFIG
+        sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' $SSH_CONFIG
+        sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' $SSH_CONFIG
+        systemctl restart sshd
+    "
+fi
 
 # Отмечаем сервер как защищённый
 touch /root/.server_secured
