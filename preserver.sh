@@ -4,11 +4,6 @@ set -e
 # Очистка консоли
 printf "\033c"
 
-if [ -f /root/.server_secured ]; then
-    printf "✅  Сервер уже защищён. Повторный запуск не требуется.\n"
-    exit 0
-fi
-
 # === Спиннер ===
 run_with_spinner() {
     local msg="$1"
@@ -47,7 +42,7 @@ install_if_missing() {
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
-# Быстрое обновление списка пакетов и только обновление установленных
+# Быстрое обновление системы
 run_with_spinner "🔄  Обновляю систему..." bash -c "apt update >/dev/null 2>&1 && apt list --upgradable >/dev/null 2>&1 && apt upgrade -y --only-upgrade >/dev/null 2>&1"
 
 # unattended-upgrades
@@ -70,17 +65,13 @@ fi
 
 # Настройка SSH
 SSH_CONFIG="/etc/ssh/sshd_config"
-if ! grep -q "^PermitRootLogin no" $SSH_CONFIG; then
-    run_with_spinner "🔐  Настройка SSH для безопасности..." bash -c "
-        sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' $SSH_CONFIG
-        sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' $SSH_CONFIG
-        sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' $SSH_CONFIG
-        systemctl restart sshd
-    "
-fi
+run_with_spinner "🔐  Настройка SSH для безопасности..." bash -c "
+    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' $SSH_CONFIG
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' $SSH_CONFIG
+    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' $SSH_CONFIG
+    systemctl restart sshd
+"
 
-# Отмечаем сервер как защищённый
-touch /root/.server_secured
 printf "\n✅  Готово! Сервер защищён и готов к работе.\n\n"
 
 # === Таймер перезагрузки 5 секунд с возможностью отмены по Enter ===
