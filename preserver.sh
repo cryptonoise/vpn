@@ -36,20 +36,14 @@ run_with_spinner() {
 install_if_missing() {
     local pkg="$1"
     if ! dpkg -s "$pkg" &>/dev/null; then
-        run_with_spinner "📦  Устанавливаю $pkg..." bash -c "apt install -y $pkg >/dev/null 2>&1"
+        run_with_spinner "📦  Устанавливаю $pkg..." bash -c "DEBIAN_FRONTEND=noninteractive apt install -y $pkg >/dev/null 2>&1"
     fi
 }
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
-# Быстрое обновление системы (скрыто, без зависаний)
-run_with_spinner "🔄  Обновляю систему..." bash -c "
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get upgrade -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' -qq
-apt-get dist-upgrade -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' -qq
-apt-get autoremove -y -qq
-"
+# Быстрое обновление системы без интерактивности
+run_with_spinner "🔄  Обновляю систему..." bash -c "DEBIAN_FRONTEND=noninteractive apt update >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt upgrade -y -o Dpkg::Options::='--force-confnew' >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt dist-upgrade -y -o Dpkg::Options::='--force-confnew' >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt autoremove -y >/dev/null 2>&1"
 
 # unattended-upgrades
 install_if_missing "unattended-upgrades"
