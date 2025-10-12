@@ -16,14 +16,14 @@ run_with_spinner() {
     local cmd=("$@")
     local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 
-    printf "%-30s " "$msg"
+    printf "%-35s " "$msg"
 
     "${cmd[@]}" >/dev/null 2>&1 &
     local pid=$!
     local i=0
 
     while kill -0 "$pid" 2>/dev/null; do
-        printf "\r%-30s %s " "$msg" "${spin[$((i++ % ${#spin[@]}))]}"
+        printf "\r%-35s %s " "$msg" "${spin[$((i++ % ${#spin[@]}))]}"
         sleep 0.1
     done
 
@@ -31,9 +31,9 @@ run_with_spinner() {
     local code=$?
 
     if [ $code -eq 0 ]; then
-        printf "\r%-30s ✅\n" "$msg"
+        printf "\r%-35s ✅\n" "$msg"
     else
-        printf "\r%-30s ❌\n" "$msg"
+        printf "\r%-35s ❌\n" "$msg"
     fi
 }
 
@@ -45,35 +45,28 @@ install_if_missing() {
     fi
 }
 
-# === Обновление системы с прогрессом пакетов и спиннером ===
-update_system_with_progress() {
-    # Получаем список пакетов для обновления
-    pkgs=$(apt list --upgradable 2>/dev/null | tail -n +2 | cut -d/ -f1)
-    total=$(echo "$pkgs" | wc -l)
+# === Обновление системы с прогрессом по пакетам ===
+update_with_progress() {
+    local packages=($(apt list --upgradable 2>/dev/null | grep -v Listing | cut -d/ -f1))
+    local total=${#packages[@]}
+    local count=0
 
-    if [ "$total" -eq 0 ]; then
-        printf "%-30s ✅\n" "🔄  Обновляю систему..."
+    if [ $total -eq 0 ]; then
+        run_with_spinner "🔄  Обновляю систему..." bash -c "DEBIAN_FRONTEND=noninteractive apt upgrade -y >/dev/null 2>&1 && apt autoremove -y >/dev/null 2>&1"
         return
     fi
 
-    local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-    count=0
-    i=0
-
-    for pkg in $pkgs; do
-        DEBIAN_FRONTEND=noninteractive apt install -y "$pkg" >/dev/null 2>&1
+    for pkg in "${packages[@]}"; do
+        local percent=$((count*100/total))
+        run_with_spinner "🔄  Обновляю $pkg ($percent%)..." bash -c "DEBIAN_FRONTEND=noninteractive apt install -y $pkg >/dev/null 2>&1"
         count=$((count+1))
-        percent=$((count*100/total))
-        printf "\r%-30s %s %d/%d (%d%%)" "🔄  Обновляю систему..." "${spin[$((i++ % ${#spin[@]}))]}" "$count" "$total" "$percent"
-        sleep 0.1
     done
-    printf "\r%-30s ✅\n" "🔄  Обновляю систему..."
 }
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
-# Обновление системы
-update_system_with_progress
+# Обновление системы с прогрессом
+update_with_progress
 
 # unattended-upgrades
 install_if_missing "unattended-upgrades"
