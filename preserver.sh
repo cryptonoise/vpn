@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Очистка консоли
+# Очистка консоли (надёжно)
 printf "\033c"
 
 if [ -f /root/.server_secured ]; then
@@ -37,31 +37,31 @@ run_with_spinner() {
     fi
 }
 
-# === Проверка и установка пакета ===
+# === Проверка и скрытая установка пакета ===
 install_if_missing() {
     local pkg="$1"
     local msg="$2"
     if dpkg -s "$pkg" &>/dev/null; then
         printf "%-25s ✅ уже установлено\n" "$msg"
     else
-        run_with_spinner "$msg" bash -c "apt install -y -qq $pkg"
+        run_with_spinner "$msg" bash -c "DEBIAN_FRONTEND=noninteractive apt install -y $pkg >/dev/null 2>&1"
     fi
 }
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
-# Обновление системы
+# Обновление системы (скрыто)
 run_with_spinner "🔄  Обновляю систему..." \
-    bash -c "apt update -qq && DEBIAN_FRONTEND=noninteractive apt upgrade -y -qq && apt autoremove -y -qq"
+    bash -c "DEBIAN_FRONTEND=noninteractive apt update >/dev/null 2>&1 && apt upgrade -y >/dev/null 2>&1 && apt autoremove -y >/dev/null 2>&1"
 
 # unattended-upgrades
 if dpkg -s "unattended-upgrades" &>/dev/null; then
     printf "%-25s ✅ уже установлено\n" "🛡️  unattended-upgrades"
 else
     run_with_spinner "🛡️  Устанавливаю unattended-upgrades..." \
-        bash -c "apt install -y -qq unattended-upgrades && \
+        bash -c "DEBIAN_FRONTEND=noninteractive apt install -y unattended-upgrades >/dev/null 2>&1 && \
                  echo 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | debconf-set-selections && \
-                 dpkg-reconfigure -f noninteractive unattended-upgrades"
+                 dpkg-reconfigure -f noninteractive unattended-upgrades >/dev/null 2>&1"
 fi
 
 # fail2ban
