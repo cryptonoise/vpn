@@ -4,7 +4,7 @@ set -e
 # Очистка консоли
 printf "\033c"
 
-# === Спиннер ===
+# === Спиннер для фоновых задач ===
 run_with_spinner() {
     local msg="$1"
     shift
@@ -42,14 +42,14 @@ install_if_missing() {
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
-# Быстрое обновление системы с автосоглашением
-run_with_spinner "🔄  Обновляю систему..." bash -c "
-    export DEBIAN_FRONTEND=noninteractive
-    sudo apt-get update -qq
-    sudo apt-get upgrade -y -qq
-    sudo apt-get dist-upgrade -y -qq
-    sudo apt-get autoremove -y -qq
-"
+# === Обновление системы без спиннера (не в фоне!) ===
+echo "🔄  Обновляю систему..."
+export DEBIAN_FRONTEND=noninteractive
+sudo apt-get update -qq
+sudo apt-get upgrade -y -qq
+sudo apt-get dist-upgrade -y -qq
+sudo apt-get autoremove -y -qq
+echo "✅  Система обновлена."
 
 # unattended-upgrades
 install_if_missing "unattended-upgrades"
@@ -64,7 +64,7 @@ for pkg in htop iotop nethogs; do
     install_if_missing "$pkg"
 done
 
-# === Автоматическое создание пользователя suser и отключение root ===
+# === Создание пользователя suser ===
 if ! id -u suser &>/dev/null; then
     run_with_spinner "👤  Создаю пользователя suser..." bash -c "sudo useradd -m -s /bin/bash -G sudo suser"
 fi
@@ -83,3 +83,13 @@ printf "\n✅  Готово! Сервер защищён и готов к раб
 # === Таймер перезагрузки 5 секунд с возможностью отмены по Enter ===
 echo "🔄  Перезагрузка через 5 секунд... (нажмите Enter чтобы отменить)"
 for i in $(seq 5 -1 1); do
+    printf "\r   %d " "$i"
+    read -t 1 -n 1 key
+    if [[ $key == "" ]]; then
+        echo -e "\n⏹  Перезагрузка отменена пользователем."
+        exit 0
+    fi
+done
+printf "\n"
+
+reboot
