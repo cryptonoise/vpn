@@ -42,6 +42,15 @@ install_if_missing() {
 
 printf "🚀  Начинаю базовую настройку безопасности сервера...\n\n"
 
+# === Принудительно снимаем блокировки apt ===
+run_with_spinner "🛠  Снимаю блокировки apt..." bash -c "
+    pkill -f apt || true
+    rm -f /var/lib/dpkg/lock-frontend
+    rm -f /var/lib/dpkg/lock
+    rm -f /var/cache/apt/archives/lock
+    dpkg --configure -a
+"
+
 # Быстрое обновление системы (скрыто, без зависаний)
 run_with_spinner "🔄  Обновляю систему..." bash -c "
 export DEBIAN_FRONTEND=noninteractive
