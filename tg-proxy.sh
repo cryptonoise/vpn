@@ -1,9 +1,9 @@
 #!/bin/sh
-# 🚀 MTProto Proxy Installer для Telegram (Interactive Version)
+# 🚀 MTProto Proxy Installer для Telegram (Final Interactive)
 
 set -e
 
-# Цвета для вывода
+# Цвета
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -11,7 +11,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # -------------------------------
-# Приветственное сообщение
+# Приветствие
 # -------------------------------
 show_welcome() {
     clear
@@ -21,7 +21,7 @@ show_welcome() {
     printf "\n"
     printf "${GREEN}Что делает скрипт:${NC}\n"
     printf "  • Проверяет Docker\n"
-    printf "  • Настраивает фаервол (UFW)\n"
+    printf "  • Настраивает фаервол (опционально)\n"
     printf "  • Разворачивает MTProto-прокси с маскировкой под HTTPS\n"
     printf "  • Генерирует ссылку для подключения в Telegram\n"
     printf "\n"
@@ -39,42 +39,35 @@ check_root() {
 }
 
 # -------------------------------
-# Получение IP сервера
+# IP сервера
 # -------------------------------
 get_server_ip() {
     curl -s4 https://ifconfig.me 2>/dev/null || curl -s4 https://api.ipify.org 2>/dev/null || echo "0.0.0.0"
 }
 
 # -------------------------------
-# Установка зависимостей (ПУСТАЯ)
+# Зависимости (пусто)
 # -------------------------------
 install_deps() {
     :
 }
 
 # -------------------------------
-# Исправление проблем с dpkg/apt (только при ошибке)
+# Исправление dpkg (только при ошибке)
 # -------------------------------
 fix_dpkg() {
     printf "${RED}⚠️  Обнаружена ошибка. Исправляю...${NC}\n"
-    
     pkill -9 -f "dpkg" 2>/dev/null || true
     pkill -9 -f "apt" 2>/dev/null || true
-    
-    rm -f /var/lib/dpkg/lock-frontend
-    rm -f /var/lib/dpkg/lock
-    rm -f /var/cache/apt/archives/lock
-    rm -f /var/lib/apt/lists/lock
-    
+    rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock /var/lib/apt/lists/lock
     dpkg --configure -a 2>/dev/null || true
     apt-get install -f -y 2>/dev/null || true
     apt-get update -qq 2>/dev/null || true
-    
-    printf "${GREEN}✅ Система исправлена. Повторяю установку...${NC}\n\n"
+    printf "${GREEN}✅ Система исправлена. Повторяю...${NC}\n\n"
 }
 
 # -------------------------------
-# Установка Docker (с авто-исправлением ошибок)
+# Установка Docker
 # -------------------------------
 install_docker() {
     if command -v docker >/dev/null 2>&1; then
@@ -103,7 +96,7 @@ install_docker() {
 }
 
 # -------------------------------
-# Интерактивный запрос параметров
+# Интерактивные параметры
 # -------------------------------
 ask_params() {
     printf "${BLUE}────────────────────────────────────────${NC}\n"
@@ -114,30 +107,22 @@ ask_params() {
     printf "🔹 Введите порт прокси [8443]: "
     read -r PROXY_PORT_INPUT < /dev/tty || true
     PROXY_PORT=${PROXY_PORT_INPUT:-8443}
-    
-    # Валидация порта
     case "$PROXY_PORT" in
-        ''|*[!0-9]*) 
-            printf "⚠️  Некорректный порт, используем 8443\n"
-            PROXY_PORT=8443
-            ;;
-        *)
-            if [ "$PROXY_PORT" -lt 1 ] || [ "$PROXY_PORT" -gt 65535 ]; then
-                printf "⚠️  Некорректный порт, используем 8443\n"
-                PROXY_PORT=8443
-            fi
-            ;;
+        ''|*[!0-9]*) printf "⚠️  Некорректный порт, используем 8443\n"; PROXY_PORT=8443 ;;
+        *) if [ "$PROXY_PORT" -lt 1 ] || [ "$PROXY_PORT" -gt 65535 ]; then
+               printf "⚠️  Некорректный порт, используем 8443\n"; PROXY_PORT=8443
+           fi ;;
     esac
     printf "✅ Порт: %s\n\n" "$PROXY_PORT"
 
-    # Fake TLS домен
+    # Fake TLS
     printf "🔹 Введите Fake TLS домен [yastatic.net]: "
     read -r FAKE_TLS_DOMAIN_INPUT < /dev/tty || true
     FAKE_TLS_DOMAIN=${FAKE_TLS_DOMAIN_INPUT:-yastatic.net}
     printf "✅ Fake TLS домен: %s\n\n" "$FAKE_TLS_DOMAIN"
 
     # Домен для ссылки
-    printf "🔹 Введите ваш домен для ссылки\n   (или нажмите Enter, чтобы использовать IP этого сервера): "
+    printf "🔹 Введите ваш домен для ссылки\n   (или Enter = IP сервера): "
     read -r PROXY_DOMAIN_INPUT < /dev/tty || true
     if [ -z "$PROXY_DOMAIN_INPUT" ]; then
         PROXY_DOMAIN=$(get_server_ip)
@@ -145,6 +130,29 @@ ask_params() {
     else
         PROXY_DOMAIN="$PROXY_DOMAIN_INPUT"
         printf "✅ Домен: %s\n\n" "$PROXY_DOMAIN"
+    fi
+}
+
+# -------------------------------
+# Фаервол (опционально)
+# -------------------------------
+setup_firewall() {
+    printf "${BLUE}────────────────────────────────────────${NC}\n"
+    printf "🔥 Настроить фаервол (UFW)? [y/N]: "
+    read -r UFW_CHOICE < /dev/tty || true
+    UFW_CHOICE=$(printf "%s" "$UFW_CHOICE" | tr '[:upper:]' '[:lower:]')
+    
+    if [ "$UFW_CHOICE" = "y" ] || [ "$UFW_CHOICE" = "yes" ]; then
+        printf "🔧 Применяю правила UFW...\n"
+        ufw default deny incoming 2>/dev/null || true
+        ufw default allow outgoing 2>/dev/null || true
+        ufw allow 22/tcp 2>/dev/null || true
+        ufw allow "${PROXY_PORT}"/tcp 2>/dev/null || true
+        [ "${PROXY_PORT}" != "443" ] && ufw allow 443/tcp 2>/dev/null || true
+        printf "y\n" | ufw enable 2>/dev/null || true
+        printf "✅ Фаервол настроен (порт %s открыт)\n\n" "${PROXY_PORT}"
+    else
+        printf "⏭️  Пропущено (фаервол не настроен)\n\n"
     fi
 }
 
@@ -188,7 +196,7 @@ save_secret() {
 }
 
 # -------------------------------
-# Вывод результата
+# Результат
 # -------------------------------
 show_result() {
     printf "\n"
@@ -212,7 +220,7 @@ show_result() {
 }
 
 # -------------------------------
-# Основная функция
+# MAIN
 # -------------------------------
 main() {
     show_welcome
