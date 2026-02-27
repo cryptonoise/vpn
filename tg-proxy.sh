@@ -1,5 +1,5 @@
 #!/bin/sh
-# 🚀 MTProto Proxy Installer для Telegram (Auto-Fix on Error)
+# 🚀 MTProto Proxy Installer для Telegram (Interactive Version)
 
 set -e
 
@@ -53,7 +53,7 @@ install_deps() {
 }
 
 # -------------------------------
-# Исправление проблем с dpkg/apt
+# Исправление проблем с dpkg/apt (только при ошибке)
 # -------------------------------
 fix_dpkg() {
     printf "${RED}⚠️  Обнаружена ошибка. Исправляю...${NC}\n"
@@ -86,59 +86,66 @@ install_docker() {
     printf "🐳 Устанавливаю Docker...\n"
     printf "${BLUE}────────────────────────────────────────${NC}\n"
     
-    # Первая попытка установки
     if curl -fsSL https://get.docker.com | sh 2>/dev/null; then
         printf "\n${GREEN}✅ Docker установлен${NC}\n\n"
         return 0
     fi
     
-    # Если ошибка — исправляем и пробуем снова
     fix_dpkg
     
-    # Вторая попытка (после исправления)
     if curl -fsSL https://get.docker.com | sh; then
         printf "\n${GREEN}✅ Docker установлен${NC}\n\n"
         return 0
     fi
     
-    # Если всё ещё ошибка — выходим
     printf "${RED}❌ Не удалось установить Docker${NC}\n" >&2
     exit 1
 }
 
 # -------------------------------
-# Настройка фаервола
-# -------------------------------
-setup_firewall() {
-    printf "${BLUE}────────────────────────────────────────${NC}\n"
-    printf "🔥 Настройка UFW...\n"
-    printf "${BLUE}────────────────────────────────────────${NC}\n"
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow 22/tcp
-    ufw allow "${PROXY_PORT}"/tcp
-    if [ "${PROXY_PORT}" != "443" ]; then
-        ufw allow 443/tcp
-    fi
-    printf "y\n" | ufw enable
-    printf "\n✅ Фаервол настроен (порт %s открыт)\n\n" "${PROXY_PORT}"
-}
-
-# -------------------------------
-# Параметры (автоматически)
+# Интерактивный запрос параметров
 # -------------------------------
 ask_params() {
     printf "${BLUE}────────────────────────────────────────${NC}\n"
     printf "⚙️  Настройка прокси\n"
     printf "${BLUE}────────────────────────────────────────${NC}\n\n"
 
-    PROXY_PORT="${PROXY_PORT:-8443}"
-    FAKE_TLS_DOMAIN="${FAKE_TLS_DOMAIN:-yastatic.net}"
-    PROXY_DOMAIN="${PROXY_DOMAIN:-$(get_server_ip)}"
+    # Порт
+    printf "🔹 Введите порт прокси [8443]: "
+    read -r PROXY_PORT_INPUT < /dev/tty || true
+    PROXY_PORT=${PROXY_PORT_INPUT:-8443}
+    
+    # Валидация порта
+    case "$PROXY_PORT" in
+        ''|*[!0-9]*) 
+            printf "⚠️  Некорректный порт, используем 8443\n"
+            PROXY_PORT=8443
+            ;;
+        *)
+            if [ "$PROXY_PORT" -lt 1 ] || [ "$PROXY_PORT" -gt 65535 ]; then
+                printf "⚠️  Некорректный порт, используем 8443\n"
+                PROXY_PORT=8443
+            fi
+            ;;
+    esac
+    printf "✅ Порт: %s\n\n" "$PROXY_PORT"
 
-    printf "🔹 Порт прокси: %s\n" "$PROXY_PORT"
-    printf "🔹 Fake TLS домен: %s\n" "$FAKE_TLS_DOMAIN"
-    printf "ℹ️  Используем IP/домен: %s\n\n" "$PROXY_DOMAIN"
+    # Fake TLS домен
+    printf "🔹 Введите Fake TLS домен [yastatic.net]: "
+    read -r FAKE_TLS_DOMAIN_INPUT < /dev/tty || true
+    FAKE_TLS_DOMAIN=${FAKE_TLS_DOMAIN_INPUT:-yastatic.net}
+    printf "✅ Fake TLS домен: %s\n\n" "$FAKE_TLS_DOMAIN"
+
+    # Домен для ссылки
+    printf "🔹 Введите ваш домен для ссылки\n   (или нажмите Enter, чтобы использовать IP этого сервера): "
+    read -r PROXY_DOMAIN_INPUT < /dev/tty || true
+    if [ -z "$PROXY_DOMAIN_INPUT" ]; then
+        PROXY_DOMAIN=$(get_server_ip)
+        printf "ℹ️  Будет использован IP: %s\n\n" "$PROXY_DOMAIN"
+    else
+        PROXY_DOMAIN="$PROXY_DOMAIN_INPUT"
+        printf "✅ Домен: %s\n\n" "$PROXY_DOMAIN"
+    fi
 }
 
 # -------------------------------
