@@ -1,5 +1,4 @@
 #!/bin/sh
-# 🚀 MTProto Proxy Installer для Telegram (Final Interactive)
 
 set -e
 
@@ -46,14 +45,14 @@ get_server_ip() {
 }
 
 # -------------------------------
-# Зависимости (пусто)
+# Зависимости
 # -------------------------------
 install_deps() {
     :
 }
 
 # -------------------------------
-# Исправление dpkg (только при ошибке)
+# Исправление dpkg
 # -------------------------------
 fix_dpkg() {
     printf "${RED}⚠️  Обнаружена ошибка. Исправляю...${NC}\n"
@@ -104,7 +103,7 @@ ask_params() {
     printf "${BLUE}────────────────────────────────────────${NC}\n\n"
 
     # Порт
-    printf "🔹 Введите порт прокси [8443]: "
+    printf "🔹 Введите порт прокси [по умолчанию - 8443]: "
     read -r PROXY_PORT_INPUT < /dev/tty || true
     PROXY_PORT=${PROXY_PORT_INPUT:-8443}
     case "$PROXY_PORT" in
@@ -116,13 +115,13 @@ ask_params() {
     printf "✅ Порт: %s\n\n" "$PROXY_PORT"
 
     # Fake TLS
-    printf "🔹 Введите Fake TLS домен [yastatic.net]: "
+    printf "🔹 Введите Fake TLS домен [по умолчанию - yastatic.net]: "
     read -r FAKE_TLS_DOMAIN_INPUT < /dev/tty || true
     FAKE_TLS_DOMAIN=${FAKE_TLS_DOMAIN_INPUT:-yastatic.net}
     printf "✅ Fake TLS домен: %s\n\n" "$FAKE_TLS_DOMAIN"
 
     # Домен для ссылки
-    printf "🔹 Введите ваш домен для ссылки\n   (или Enter = IP сервера): "
+    printf "🔹 Введите ваш домен для ссылки\n   (или Enter чтобы использовать IP этого сервера): "
     read -r PROXY_DOMAIN_INPUT < /dev/tty || true
     if [ -z "$PROXY_DOMAIN_INPUT" ]; then
         PROXY_DOMAIN=$(get_server_ip)
@@ -134,15 +133,15 @@ ask_params() {
 }
 
 # -------------------------------
-# Фаервол (опционально)
+# Фаервол
 # -------------------------------
 setup_firewall() {
     printf "${BLUE}────────────────────────────────────────${NC}\n"
-    printf "🔥 Настроить фаервол (UFW)? [y/N]: "
+    printf "🔥 Настроить фаервол (UFW)? [Enter - нет | Y - да]: "
     read -r UFW_CHOICE < /dev/tty || true
-    UFW_CHOICE=$(printf "%s" "$UFW_CHOICE" | tr '[:upper:]' '[:lower:]')
+    UFW_CHOICE=$(printf "%s" "$UFW_CHOICE" | tr '[:lower:]' '[:upper:]')
     
-    if [ "$UFW_CHOICE" = "y" ] || [ "$UFW_CHOICE" = "yes" ]; then
+    if [ "$UFW_CHOICE" = "Y" ] || [ "$UFW_CHOICE" = "YES" ]; then
         printf "🔧 Применяю правила UFW...\n"
         ufw default deny incoming 2>/dev/null || true
         ufw default allow outgoing 2>/dev/null || true
@@ -168,18 +167,39 @@ generate_secret() {
 }
 
 # -------------------------------
-# Запуск контейнера
+# Запуск контейнера (с проверкой существования)
 # -------------------------------
 run_proxy() {
     printf "${BLUE}────────────────────────────────────────${NC}\n"
     printf "🚀 Запуск MTProxy контейнера...\n"
     printf "${BLUE}────────────────────────────────────────${NC}\n"
+    
+    # Проверяем, существует ли контейнер с именем "telegram"
+    if docker ps -a --filter name=^/telegram$ --format "{{.ID}}" | grep -q .; then
+        printf "${YELLOW}⚠️  Контейнер 'telegram' уже существует.${NC}\n"
+        printf "🔹 Переустановить контейнер? [Enter=да / N=нет]: "
+        read -r REINSTALL_CHOICE < /dev/tty || true
+        REINSTALL_CHOICE=$(printf "%s" "$REINSTALL_CHOICE" | tr '[:upper:]' '[:lower:]')
+        
+        if [ -z "$REINSTALL_CHOICE" ] || [ "$REINSTALL_CHOICE" = "y" ] || [ "$REINSTALL_CHOICE" = "yes" ]; then
+            printf "🗑️  Удаляю старый контейнер...\n"
+            docker stop telegram 2>/dev/null || true
+            docker rm telegram 2>/dev/null || true
+            printf "✅ Старый контейнер удалён\n"
+        else
+            printf "⏭️  Пропущено (контейнер не переустановлен)\n\n"
+            return 0
+        fi
+    fi
+    
+    # Запускаем новый контейнер
     docker run -d \
         --name telegram \
         --restart unless-stopped \
         -p "${PROXY_PORT}":8443 \
         nineseconds/mtg:2 \
         simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:8443 "${SECRET}"
+    
     printf "\n✅ Контейнер запущен\n\n"
 }
 
