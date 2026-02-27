@@ -149,7 +149,13 @@ setup_firewall() {
         ufw allow "${PROXY_PORT}"/tcp 2>/dev/null || true
         [ "${PROXY_PORT}" != "443" ] && ufw allow 443/tcp 2>/dev/null || true
         printf "y\n" | ufw enable 2>/dev/null || true
-        printf "✅ Фаервол настроен (порт %s открыт)\n\n" "${PROXY_PORT}"
+        
+        # Формируем список открытых портов
+        OPEN_PORTS="22/tcp, ${PROXY_PORT}/tcp"
+        [ "${PROXY_PORT}" != "443" ] && OPEN_PORTS="${OPEN_PORTS}, 443/tcp"
+        
+        printf "✅ Фаервол настроен\n"
+        printf "🔓 Открыты порты: %s\n\n" "$OPEN_PORTS"
     else
         printf "⏭️  Пропущено (фаервол не настроен)\n\n"
     fi
@@ -239,7 +245,6 @@ main() {
     setup_firewall
     generate_secret
     run_proxy
-    save_secret
     show_result
 }
 
