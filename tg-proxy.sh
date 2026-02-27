@@ -136,12 +136,14 @@ generate_secret() {
 # Запуск контейнера
 # -------------------------------
 run_proxy() {
-    spinner "🚀 Запуск MTProxy контейнера..." docker run -d \
+    printf "🚀 Запуск MTProxy контейнера...\n"
+    docker run -d \
         --name telegram \
         --restart unless-stopped \
         -p "${PROXY_PORT}":8443 \
         nineseconds/mtg:2 \
-        simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:8443 "$SECRET"
+        simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:8443 "$SECRET" >/dev/null 2>&1
+    printf "✅ Контейнер запущен\n"
 }
 
 # -------------------------------
