@@ -1,29 +1,6 @@
 /**
- * 🚀 MTProto Proxy Installer for Telegram
- * Worker для tg.travelarium.ph
- * 
- * Деплой: Cloudflare Dashboard → Workers & Pages → Create Worker
- * Затем: Triggers → Custom Domains → tg.travelarium.ph
+ * 🚀 MTProto Proxy Installer для Telegram
  */
-
-export default {
-  async fetch(request) {
-    const url = new URL(request.url);
-    
-    // Блокируем всё, кроме GET запросов к корню домена
-    if (request.method !== 'GET') {
-      return new Response('Method Not Allowed', { status: 405 });
-    }
-    
-    // Отдаём скрипт только на запрос к корню (/)
-    if (url.pathname !== '/' && url.pathname !== '/install.sh') {
-      return new Response('Not Found', { status: 404 });
-    }
-
-    // 📜 Сам bash-скрипт (полная версия)
-    const installerScript = `#!/bin/bash
-# 🚀 MTProto Proxy Installer for Telegram
-# Запуск: curl -fsSL https://tg.travelarium.ph | sudo bash
 
 set -e
 
@@ -39,14 +16,7 @@ show_welcome() {
     clear
     echo -e "\${BLUE}╔════════════════════════════════════════╗\${NC}"
     echo -e "\${BLUE}║  📡 MTProto Proxy для Telegram         ║\${NC}"
-    echo -e "\${BLUE}║  Быстрая настройка прокси с Fake TLS   ║\${NC}"
     echo -e "\${BLUE}╚════════════════════════════════════════╝\${NC}"
-    echo ""
-    echo -e "\${GREEN}Что делает скрипт:\${NC}"
-    echo "  • Устанавливает Docker и зависимости"
-    echo "  • Настраивает фаервол (UFW)"
-    echo "  • Разворачивает MTProto-прокси с маскировкой под HTTPS"
-    echo "  • Генерирует ссылку для подключения в Telegram"
     echo ""
     echo -e "\${YELLOW}Нажмите [Enter] чтобы начать установку...\${NC}"
     read -r
@@ -120,12 +90,12 @@ ask_params() {
     log_ok "Порт: \$PROXY_PORT"
     
     echo ""
-    read -rp "🔹 Введите Fake TLS домен [yastatic.net]: " FAKE_TLS_DOMAIN
+    read -rp "🔹 Введите Fake TLS домен [По умолчанию - yastatic.net]: " FAKE_TLS_DOMAIN
     FAKE_TLS_DOMAIN=\${FAKE_TLS_DOMAIN:-yastatic.net}
     log_ok "Fake TLS домен: \$FAKE_TLS_DOMAIN"
     
     echo ""
-    read -rp "🔹 Введите домен для ссылки (Enter = IP сервера): " PROXY_DOMAIN
+    read -rp "🔹 Введите ваш домен (или нажмите Enter, чтобы использовать IP этого сервера): " PROXY_DOMAIN
     if [[ -z "\$PROXY_DOMAIN" ]]; then
         PROXY_DOMAIN=\$(get_server_ip)
         log_info "Будет использован IP: \$PROXY_DOMAIN"
@@ -176,7 +146,6 @@ show_result() {
     echo "  4. Проверьте: Настройки → Данные и память → Прокси → ✅"
     echo ""
     echo -e "\${BLUE}🔧 Полезные команды:\${NC}"
-    echo "  docker logs --tail 50 telegram   # посмотреть логи"
     echo "  docker restart telegram          # перезапустить"
     echo "  docker stop telegram && docker rm telegram  # удалить"
     echo ""
