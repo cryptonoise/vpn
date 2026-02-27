@@ -1,5 +1,5 @@
 #!/bin/sh
-# 🚀 MTProto Proxy Installer для Telegram (Full Visible Output)
+# 🚀 MTProto Proxy Installer для Telegram (Auto-Fix Version)
 
 set -e
 
@@ -50,6 +50,36 @@ get_server_ip() {
 # -------------------------------
 install_deps() {
     :
+}
+
+# -------------------------------
+# Исправление проблем с dpkg/apt
+# -------------------------------
+fix_dpkg() {
+    printf "${BLUE}────────────────────────────────────────${NC}\n"
+    printf "🔧 Проверка системы на ошибки...\n"
+    printf "${BLUE}────────────────────────────────────────${NC}\n"
+    
+    # Убиваем зависшие процессы dpkg/apt
+    pkill -9 -f "dpkg" 2>/dev/null || true
+    pkill -9 -f "apt" 2>/dev/null || true
+    
+    # Удаляем lock-файлы
+    rm -f /var/lib/dpkg/lock-frontend
+    rm -f /var/lib/dpkg/lock
+    rm -f /var/cache/apt/archives/lock
+    rm -f /var/lib/apt/lists/lock
+    
+    # Конфигурируем прерванные пакеты
+    dpkg --configure -a 2>/dev/null || true
+    
+    # Исправляем зависимости
+    apt-get install -f -y 2>/dev/null || true
+    
+    # Обновляем кэш apt
+    apt-get update -qq 2>/dev/null || true
+    
+    printf "✅ Система проверена\n\n"
 }
 
 # -------------------------------
@@ -172,6 +202,7 @@ main() {
     show_welcome
     check_root
     install_deps
+    fix_dpkg
     install_docker
     ask_params
     setup_firewall
