@@ -23,15 +23,16 @@ show_welcome() {
     printf "  • Разворачивает MTProto-прокси с маскировкой под HTTPS\n"
     printf "  • Генерирует ссылку для подключения в Telegram\n"
     printf "\n"
-    printf "${YELLOW}Нажмите [Enter] чтобы начать установку...${NC}\n"
-    read -r dummy
-}
-
-# Проверка прав root
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        printf "❌ Скрипт требует прав root. Запустите с sudo.\n" >&2
-        exit 1
+    
+    # Проверяем, запущен ли скрипт интерактивно
+    if [ -t 0 ]; then
+        # Интерактивный режим - ждём Enter
+        printf "${YELLOW}Нажмите [Enter] чтобы начать установку...${NC}\n"
+        read -r dummy
+    else
+        # Неинтерактивный режим (curl | sh) - сразу начинаем
+        printf "${YELLOW}Запуск установки...${NC}\n"
+        sleep 1
     fi
 }
 
