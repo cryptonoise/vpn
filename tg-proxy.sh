@@ -1,6 +1,5 @@
-/**
- * 🚀 MTProto Proxy Installer для Telegram
- */
+#!/bin/bash
+# 🚀 MTProto Proxy Installer для Telegram
 
 set -e
 
