@@ -115,9 +115,18 @@ ask_params() {
     printf "✅ Порт: %s\n\n" "$PROXY_PORT"
 
     # Fake TLS
-    printf "🔹 Введите Fake TLS домен [по умолчанию - yastatic.net]: "
-    read -r FAKE_TLS_DOMAIN_INPUT < /dev/tty || true
-    FAKE_TLS_DOMAIN=${FAKE_TLS_DOMAIN_INPUT:-yastatic.net}
+    while true; do
+        printf "🔹 Введите Fake TLS домен: "
+        read -r FAKE_TLS_DOMAIN_INPUT < /dev/tty || true
+        FAKE_TLS_DOMAIN_INPUT=$(printf "%s" "$FAKE_TLS_DOMAIN_INPUT" | tr -d '[:space:]') 
+        
+        if [ -n "$FAKE_TLS_DOMAIN_INPUT" ]; then
+            FAKE_TLS_DOMAIN="$FAKE_TLS_DOMAIN_INPUT"
+            break
+        else
+            printf "${RED}⚠️  Домен не может быть пустым. Попробуйте снова.${NC}\n"
+        fi
+    done
     printf "✅ Fake TLS домен: %s\n\n" "$FAKE_TLS_DOMAIN"
 
     # Домен для ссылки
