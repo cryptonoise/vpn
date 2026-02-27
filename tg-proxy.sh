@@ -1,5 +1,5 @@
 #!/bin/sh
-# 🚀 MTProto Proxy Installer для Telegram (без пауз)
+# 🚀 MTProto Proxy Installer для Telegram (с анимацией брайля)
 
 set -e
 
@@ -10,7 +10,25 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Приветственное сообщение (без паузы)
+# Функция анимации брайля
+show_spinner() {
+    # $1 - текст этапа
+    local text="$1"
+    local i=0
+    local chars="/-\|"
+    printf "%s " "$text"
+    while :; do
+        printf "\b%s" "${chars:i%4:1}"
+        i=$((i+1))
+        sleep 0.1
+        # проверяем наличие файла /tmp/.spinner_done
+        [ -f /tmp/.spinner_done ] && break
+    done
+    rm -f /tmp/.spinner_done
+    printf "\b✅\n"
+}
+
+# Приветственное сообщение
 show_welcome() {
     clear
     printf "${BLUE}╔════════════════════════════════════════╗${NC}\n"
@@ -23,7 +41,7 @@ show_welcome() {
     printf "  • Разворачивает MTProto-прокси с маскировкой под HTTPS\n"
     printf "  • Генерирует ссылку для подключения в Telegram\n"
     printf "\n"
-    printf "${YELLOW}🚀 Запуск установки...${NC}\n\n"
+    printf "${YELLOW}🚀 Начинаем...${NC}\n\n"
 }
 
 # Проверка прав root
@@ -39,20 +57,33 @@ get_server_ip() {
     curl -s4 https://ifconfig.me 2>/dev/null || curl -s4 https://api.ipify.org 2>/dev/null || echo "0.0.0.0"
 }
 
+# Функция установки пакета с анимацией
+install_step() {
+    local desc="$1"
+    shift
+    touch /tmp/.spinner_done &  # файл для завершения спиннера
+    show_spinner "$desc"
+    "$@" >/dev/null 2>&1
+    touch /tmp/.spinner_done
+}
+
 # Установка зависимостей
 install_deps() {
     printf "🔄 Обновление системы и установка зависимостей...\n"
-    apt update -qq >/dev/null 2>&1
-    apt upgrade -y -qq >/dev/null 2>&1
-    apt install -y -qq curl git dnsutils ufw >/dev/null 2>&1
+
+    # обновление репозиториев
+    install_step "🔄 Обновляю apt..." apt update -qq
+    # апгрейд пакетов
+    install_step "🔄 Обновляю систему..." apt upgrade -y -qq
+    # установка базовых утилит
+    install_step "🔄 Устанавливаю curl, git, dnsutils, ufw..." apt install -y -qq curl git dnsutils ufw
     printf "✅ Зависимости установлены\n"
 }
 
 # Установка Docker
 install_docker() {
     if ! command -v docker >/dev/null 2>&1; then
-        printf "🐳 Установка Docker...\n"
-        curl -fsSL https://get.docker.com | sh >/dev/null 2>&1
+        install_step "🐳 Устанавливаю Docker..." sh -c "curl -fsSL https://get.docker.com | sh"
         printf "✅ Docker установлен\n"
     else
         printf "✅ Docker уже установлен\n"
@@ -66,9 +97,7 @@ setup_firewall() {
     ufw default allow outgoing >/dev/null 2>&1
     ufw allow 22/tcp >/dev/null 2>&1
     ufw allow "${PROXY_PORT}"/tcp >/dev/null 2>&1
-    if [ "${PROXY_PORT}" != "443" ]; then
-        ufw allow 443/tcp >/dev/null 2>&1
-    fi
+    [ "${PROXY_PORT}" != "443" ] && ufw allow 443/tcp >/dev/null 2>&1
     printf "y\n" | ufw enable >/dev/null 2>&1
     printf "✅ Фаервол настроен (порт %s открыт)\n" "${PROXY_PORT}"
 }
@@ -77,24 +106,8 @@ setup_firewall() {
 ask_params() {
     printf "\n⚙️  Настройка прокси\n\n"
     
-    PROXY_PORT_INPUT="${PROXY_PORT_INPUT:-8443}"
-    printf "🔹 Используем порт для прокси: %s\n" "${PROXY_PORT_INPUT}"
-    PROXY_PORT="${PROXY_PORT_INPUT}"
-
-    # Валидация порта
-    case "${PROXY_PORT}" in
-        ''|*[!0-9]*) 
-            printf "⚠️  Некорректный порт, используем 8443\n"
-            PROXY_PORT=8443
-            ;;
-        *)
-            if [ "${PROXY_PORT}" -lt 1 ] || [ "${PROXY_PORT}" -gt 65535 ]; then
-                printf "⚠️  Некорректный порт, используем 8443\n"
-                PROXY_PORT=8443
-            fi
-            ;;
-    esac
-    printf "✅ Порт: %s\n" "${PROXY_PORT}"
+    PROXY_PORT="${PROXY_PORT:-8443}"
+    printf "🔹 Используем порт для прокси: %s\n" "${PROXY_PORT}"
     
     FAKE_TLS_DOMAIN="${FAKE_TLS_DOMAIN:-yastatic.net}"
     printf "🔹 Используем Fake TLS домен: %s\n" "${FAKE_TLS_DOMAIN}"
@@ -105,20 +118,19 @@ ask_params() {
 
 # Генерация секрета
 generate_secret() {
-    printf "🔑 Генерация секретного ключа...\n"
+    install_step "🔑 Генерирую секрет..." docker run --rm nineseconds/mtg:2 generate-secret --hex "${FAKE_TLS_DOMAIN}"
     SECRET=$(docker run --rm nineseconds/mtg:2 generate-secret --hex "${FAKE_TLS_DOMAIN}")
     printf "✅ Секрет сгенерирован\n"
 }
 
 # Запуск контейнера
 run_proxy() {
-    printf "🚀 Запуск MTProxy контейнера...\n"
-    docker run -d \
+    install_step "🚀 Запуск MTProxy контейнера..." docker run -d \
         --name telegram \
         --restart unless-stopped \
         -p "${PROXY_PORT}":8443 \
         nineseconds/mtg:2 \
-        simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:8443 "${SECRET}" >/dev/null 2>&1
+        simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:8443 "${SECRET}"
     sleep 2
     if docker ps | grep -q telegram; then
         printf "✅ Контейнер запущен\n"
