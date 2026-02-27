@@ -1,5 +1,5 @@
 #!/bin/sh
-# 🚀 MTProto Proxy Installer для Telegram
+# 🚀 MTProto Proxy Installer для Telegram (без пауз)
 
 set -e
 
@@ -10,7 +10,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Приветственное сообщение
+# Приветственное сообщение (без паузы)
 show_welcome() {
     clear
     printf "${BLUE}╔════════════════════════════════════════╗${NC}\n"
@@ -23,14 +23,7 @@ show_welcome() {
     printf "  • Разворачивает MTProto-прокси с маскировкой под HTTPS\n"
     printf "  • Генерирует ссылку для подключения в Telegram\n"
     printf "\n"
-    
-    if [ -t 0 ]; then
-        printf "${YELLOW}Нажмите [Enter] чтобы начать установку...${NC}\n"
-        read -r dummy || true
-    else
-        printf "${YELLOW}Запуск установки...${NC}\n"
-        sleep 1
-    fi
+    printf "${YELLOW}🚀 Запуск установки...${NC}\n\n"
 }
 
 # Проверка прав root
@@ -80,17 +73,15 @@ setup_firewall() {
     printf "✅ Фаервол настроен (порт %s открыт)\n" "${PROXY_PORT}"
 }
 
-# Запрос параметров
+# Запрос параметров (без пауз)
 ask_params() {
-    printf "\n"
-    printf "⚙️  Настройка прокси\n"
-    printf "\n"
+    printf "\n⚙️  Настройка прокси\n\n"
     
-    printf "🔹 Введите порт для прокси [8443]: "
-    read -r PROXY_PORT_INPUT || true
-    PROXY_PORT=${PROXY_PORT_INPUT:-8443}
-    
-    # Валидация порта (POSIX-совместимая)
+    PROXY_PORT_INPUT="${PROXY_PORT_INPUT:-8443}"
+    printf "🔹 Используем порт для прокси: %s\n" "${PROXY_PORT_INPUT}"
+    PROXY_PORT="${PROXY_PORT_INPUT}"
+
+    # Валидация порта
     case "${PROXY_PORT}" in
         ''|*[!0-9]*) 
             printf "⚠️  Некорректный порт, используем 8443\n"
@@ -105,22 +96,11 @@ ask_params() {
     esac
     printf "✅ Порт: %s\n" "${PROXY_PORT}"
     
-    printf "\n"
-    printf "🔹 Введите Fake TLS домен [yastatic.net]: "
-    read -r FAKE_TLS_DOMAIN_INPUT || true
-    FAKE_TLS_DOMAIN=${FAKE_TLS_DOMAIN_INPUT:-yastatic.net}
-    printf "✅ Fake TLS домен: %s\n" "${FAKE_TLS_DOMAIN}"
+    FAKE_TLS_DOMAIN="${FAKE_TLS_DOMAIN:-yastatic.net}"
+    printf "🔹 Используем Fake TLS домен: %s\n" "${FAKE_TLS_DOMAIN}"
     
-    printf "\n"
-    printf "🔹 Введите ваш домен (или нажмите Enter, чтобы использовать IP этого сервера): "
-    read -r PROXY_DOMAIN_INPUT || true
-    if [ -z "${PROXY_DOMAIN_INPUT}" ]; then
-        PROXY_DOMAIN=$(get_server_ip)
-        printf "ℹ️  Будет использован IP: %s\n" "${PROXY_DOMAIN}"
-    else
-        PROXY_DOMAIN="${PROXY_DOMAIN_INPUT}"
-        printf "✅ Домен: %s\n" "${PROXY_DOMAIN}"
-    fi
+    PROXY_DOMAIN="${PROXY_DOMAIN:-$(get_server_ip)}"
+    printf "ℹ️  Используем IP/домен: %s\n" "${PROXY_DOMAIN}"
 }
 
 # Генерация секрета
@@ -150,8 +130,7 @@ run_proxy() {
 
 # Вывод результата
 show_result() {
-    printf "\n"
-    printf "${GREEN}╔════════════════════════════════════════╗${NC}\n"
+    printf "\n${GREEN}╔════════════════════════════════════════╗${NC}\n"
     printf "${GREEN}║  🎉 Прокси готов к использованию!      ║${NC}\n"
     printf "${GREEN}╚════════════════════════════════════════╝${NC}\n"
     printf "\n"
@@ -183,8 +162,8 @@ main() {
     check_root
     install_deps
     install_docker
-    setup_firewall
     ask_params
+    setup_firewall
     generate_secret
     run_proxy
     save_secret
