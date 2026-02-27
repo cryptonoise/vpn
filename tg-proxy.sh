@@ -10,22 +10,31 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Функция анимации брайля
+# Функция спиннера, совместимая с sh
 show_spinner() {
-    # $1 - текст этапа
-    local text="$1"
-    local i=0
-    local chars="/-\|"
+    text="$1"
+    i=0
+    chars="/-\|"
     printf "%s " "$text"
     while :; do
-        printf "\b%s" "${chars:i%4:1}"
+        # substring для sh: берем один символ через expr
+        c=$(expr substr "$chars" $((i % 4 + 1)) 1)
+        printf "\b%s" "$c"
         i=$((i+1))
         sleep 0.1
-        # проверяем наличие файла /tmp/.spinner_done
         [ -f /tmp/.spinner_done ] && break
     done
     rm -f /tmp/.spinner_done
     printf "\b✅\n"
+}
+
+install_step() {
+    desc="$1"
+    shift
+    touch /tmp/.spinner_done &
+    show_spinner "$desc"
+    "$@" >/dev/null 2>&1
+    touch /tmp/.spinner_done
 }
 
 # Приветственное сообщение
