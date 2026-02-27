@@ -1,5 +1,5 @@
 #!/bin/sh
-# 🚀 MTProto Proxy Installer для Telegram (Clean Version)
+# 🚀 MTProto Proxy Installer для Telegram (Full Visible Output)
 
 set -e
 
@@ -9,31 +9,6 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
-
-# -------------------------------
-# 🔹 Функция спиннера
-# -------------------------------
-spinner() {
-    text="$1"
-    shift
-    cmd="$@"
-
-    $cmd >/dev/null 2>&1 &
-    pid=$!
-
-    chars="/-\|"
-    i=0
-
-    while kill -0 $pid 2>/dev/null; do
-        c=$(expr substr "$chars" $((i % 4 + 1)) 1)
-        printf "\r%s %s" "$text" "$c"
-        i=$((i+1))
-        sleep 0.1
-    done
-
-    wait $pid
-    printf "\r%s ✅\n" "$text"
-}
 
 # -------------------------------
 # Приветственное сообщение
@@ -71,7 +46,7 @@ get_server_ip() {
 }
 
 # -------------------------------
-# Установка зависимостей (ПУСТАЯ - ничего не делаем)
+# Установка зависимостей (ПУСТАЯ)
 # -------------------------------
 install_deps() {
     :
@@ -82,9 +57,13 @@ install_deps() {
 # -------------------------------
 install_docker() {
     if ! command -v docker >/dev/null 2>&1; then
-        spinner "🐳 Устанавливаю Docker..." sh -c "curl -fsSL https://get.docker.com | sh"
+        printf "${BLUE}────────────────────────────────────────${NC}\n"
+        printf "🐳 Устанавливаю Docker...\n"
+        printf "${BLUE}────────────────────────────────────────${NC}\n"
+        curl -fsSL https://get.docker.com | sh
+        printf "\n✅ Docker установлен\n\n"
     else
-        printf "✅ Docker уже установлен\n"
+        printf "✅ Docker уже установлен\n\n"
     fi
 }
 
@@ -92,21 +71,27 @@ install_docker() {
 # Настройка фаервола
 # -------------------------------
 setup_firewall() {
+    printf "${BLUE}────────────────────────────────────────${NC}\n"
     printf "🔥 Настройка UFW...\n"
-    ufw default deny incoming >/dev/null 2>&1
-    ufw default allow outgoing >/dev/null 2>&1
-    ufw allow 22/tcp >/dev/null 2>&1
-    ufw allow "${PROXY_PORT}"/tcp >/dev/null 2>&1
-    [ "${PROXY_PORT}" != "443" ] && ufw allow 443/tcp >/dev/null 2>&1
-    printf "y\n" | ufw enable >/dev/null 2>&1
-    printf "✅ Фаервол настроен (порт %s открыт)\n" "${PROXY_PORT}"
+    printf "${BLUE}────────────────────────────────────────${NC}\n"
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw allow 22/tcp
+    ufw allow "${PROXY_PORT}"/tcp
+    if [ "${PROXY_PORT}" != "443" ]; then
+        ufw allow 443/tcp
+    fi
+    printf "y\n" | ufw enable
+    printf "\n✅ Фаервол настроен (порт %s открыт)\n\n" "${PROXY_PORT}"
 }
 
 # -------------------------------
 # Параметры (автоматически)
 # -------------------------------
 ask_params() {
-    printf "\n⚙️  Настройка прокси\n\n"
+    printf "${BLUE}────────────────────────────────────────${NC}\n"
+    printf "⚙️  Настройка прокси\n"
+    printf "${BLUE}────────────────────────────────────────${NC}\n\n"
 
     PROXY_PORT="${PROXY_PORT:-8443}"
     FAKE_TLS_DOMAIN="${FAKE_TLS_DOMAIN:-yastatic.net}"
@@ -114,43 +99,54 @@ ask_params() {
 
     printf "🔹 Порт прокси: %s\n" "$PROXY_PORT"
     printf "🔹 Fake TLS домен: %s\n" "$FAKE_TLS_DOMAIN"
-    printf "ℹ️  Используем IP/домен: %s\n" "$PROXY_DOMAIN"
+    printf "ℹ️  Используем IP/домен: %s\n\n" "$PROXY_DOMAIN"
 }
 
 # -------------------------------
 # Генерация секрета
 # -------------------------------
 generate_secret() {
+    printf "${BLUE}────────────────────────────────────────${NC}\n"
+    printf "🔑 Генерация секретного ключа...\n"
+    printf "${BLUE}────────────────────────────────────────${NC}\n"
     SECRET=$(docker run --rm nineseconds/mtg:2 generate-secret --hex "${FAKE_TLS_DOMAIN}")
-    printf "✅ Секрет сгенерирован\n"
+    printf "\n✅ Секрет сгенерирован\n\n"
 }
 
 # -------------------------------
 # Запуск контейнера
 # -------------------------------
 run_proxy() {
-    spinner "🚀 Запуск MTProxy контейнера..." docker run -d \
+    printf "${BLUE}────────────────────────────────────────${NC}\n"
+    printf "🚀 Запуск MTProxy контейнера...\n"
+    printf "${BLUE}────────────────────────────────────────${NC}\n"
+    docker run -d \
         --name telegram \
         --restart unless-stopped \
         -p "${PROXY_PORT}":8443 \
         nineseconds/mtg:2 \
         simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:8443 "${SECRET}"
+    printf "\n✅ Контейнер запущен\n\n"
 }
 
 # -------------------------------
 # Сохранение секрета
 # -------------------------------
 save_secret() {
+    printf "${BLUE}────────────────────────────────────────${NC}\n"
+    printf "💾 Сохранение секрета...\n"
+    printf "${BLUE}────────────────────────────────────────${NC}\n"
     printf "%s\n" "${SECRET}" > ~/mtproxy_secret.txt
     chmod 600 ~/mtproxy_secret.txt
-    printf "ℹ️  Секрет сохранён в ~/mtproxy_secret.txt\n"
+    printf "\n✅ Секрет сохранён в ~/mtproxy_secret.txt\n\n"
 }
 
 # -------------------------------
 # Вывод результата
 # -------------------------------
 show_result() {
-    printf "\n${GREEN}╔════════════════════════════════════════╗${NC}\n"
+    printf "\n"
+    printf "${GREEN}╔════════════════════════════════════════╗${NC}\n"
     printf "${GREEN}║  🎉 Прокси готов к использованию!      ║${NC}\n"
     printf "${GREEN}╚════════════════════════════════════════╝${NC}\n"
     printf "\n"
