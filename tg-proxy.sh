@@ -139,6 +139,19 @@ ask_params() {
         PROXY_DOMAIN="$PROXY_DOMAIN_INPUT"
         printf "✅ Домен: %s\n\n" "$PROXY_DOMAIN"
     fi
+    
+    # 🆕 Имя контейнера: из домена (точки → дефисы) или "telegram" по умолчанию
+    if [ -n "$PROXY_DOMAIN_INPUT" ]; then
+        # Заменяем точки на дефисы, убираем опасные символы
+        CONTAINER_NAME=$(printf "%s" "$PROXY_DOMAIN_INPUT" | tr '.' '-' | tr -cd 'a-zA-Z0-9_-')
+        # Если имя начинается с дефиса/подчёркивания — добавляем префикс
+        case "$CONTAINER_NAME" in
+            [-_]*) CONTAINER_NAME="mtg-${CONTAINER_NAME}" ;;
+        esac
+    else
+        CONTAINER_NAME="telegram"
+    fi
+    printf "✅ Имя контейнера: %s\n\n" "$CONTAINER_NAME"
 }
 
 # -------------------------------
@@ -189,40 +202,65 @@ run_proxy() {
     printf "🚀 Запуск MTProxy контейнера...\n"
     printf "${BLUE}────────────────────────────────────────${NC}\n"
     
-    # Проверяем, существует ли контейнер с именем "telegram"
-    if docker ps -a --filter name=^/telegram$ --format "{{.ID}}" | grep -q .; then
-        printf "${YELLOW}⚠️  Контейнер 'telegram' уже существует.${NC}\n"
+    # 🆕 Путь для хранения секрета (уникальный для каждого контейнера)
+    SECRET_FILE="/root/mtg-secret-${CONTAINER_NAME}"
+    
+    # Проверяем, существует ли контейнер с таким именем
+    if docker ps -a --filter name="^/${CONTAINER_NAME}$" --format "{{.ID}}" | grep -q .; then
+        printf "${YELLOW}⚠️  Контейнер '${CONTAINER_NAME}' уже существует.${NC}\n"
         printf "🔹 Переустановить контейнер? [Enter=да / N=нет]: "
         read -r REINSTALL_CHOICE < /dev/tty || true
         REINSTALL_CHOICE=$(printf "%s" "$REINSTALL_CHOICE" | tr '[:upper:]' '[:lower:]')
         
         if [ -z "$REINSTALL_CHOICE" ] || [ "$REINSTALL_CHOICE" = "y" ] || [ "$REINSTALL_CHOICE" = "yes" ]; then
-            # ✅ Пользователь согласился на переустановку — генерируем НОВЫЙ секрет
-            generate_secret
+            # ✅ Сохраняем старый секрет, если файл есть
+            if [ -f "$SECRET_FILE" ]; then
+                OLD_SECRET=$(cat "$SECRET_FILE")
+                printf "ℹ️  Используем сохранённый секрет\n"
+                SECRET="$OLD_SECRET"
+            else
+                # Генерируем новый, если файла нет
+                generate_secret
+                printf "%s" "$SECRET" > "$SECRET_FILE"
+                chmod 600 "$SECRET_FILE"
+            fi
             printf "🗑️  Удаляю старый контейнер...\n"
-            docker stop telegram 2>/dev/null || true
-            docker rm telegram 2>/dev/null || true
+            docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+            docker rm "${CONTAINER_NAME}" 2>/dev/null || true
             printf "✅ Старый контейнер удалён\n"
         else
-            # ❌ Пользователь отказался — останавливаем скрипт
             printf "\n${YELLOW}⏭️  Прокси не был переустановлен. Скрипт завершён.${NC}\n"
             printf "${BLUE}💡 Чтобы создать новый прокси, запустите скрипт снова и нажмите Enter.${NC}\n\n"
             exit 0
         fi
     else
-        # ✅ Контейнера нет — генерируем секрет для нового
+        # ✅ Новый запуск — генерируем и сохраняем секрет
         generate_secret
+        printf "%s" "$SECRET" > "$SECRET_FILE"
+        chmod 600 "$SECRET_FILE"
     fi
     
-    # Запускаем контейнер (SECRET уже определён)
+    # Запускаем контейнер с исправленными флагами
     docker run -d \
-        --name telegram \
+        --name "${CONTAINER_NAME}" \
         --restart unless-stopped \
+        --sysctl net.ipv6.conf.all.disable_ipv6=1 \
+        --sysctl net.ipv6.conf.default.disable_ipv6=1 \
         -p "${PROXY_PORT}":8443 \
-        nineseconds/mtg:latest \
-        simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:8443 "${SECRET}"
+        -v "${SECRET_FILE}:/secret:ro" \
+        nineseconds/mtg:2 \
+        simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:8443 "$(cat "${SECRET_FILE}")"
     
-    printf "\n✅ Контейнер запущен\n\n"
+    # Ждём 3 секунды и проверяем, жив ли контейнер
+    sleep 3
+    if docker ps --filter name="^/${CONTAINER_NAME}$" --format "{{.Status}}" | grep -q "Up"; then
+        printf "\n${GREEN}✅ Контейнер '${CONTAINER_NAME}' запущен и работает${NC}\n"
+    else
+        printf "\n${RED}❌ Контейнер не запустился! Проверьте логи:${NC}\n"
+        printf "  docker logs ${CONTAINER_NAME} --tail 20\n"
+        exit 1
+    fi
+    printf "\n"
 }
 
 # -------------------------------
@@ -244,8 +282,9 @@ show_result() {
     printf "  4. Проверьте: Настройки → Данные и память → Прокси → ✅\n"
     printf "\n"
     printf "${BLUE}🔧 Полезные команды:${NC}\n"
-    printf "  docker restart telegram          # перезапустить\n"
-    printf "  docker stop telegram && docker rm telegram  # удалить\n"
+    printf "  docker restart %-20s # перезапустить\n" "${CONTAINER_NAME}"
+    printf "  docker stop %-22s && docker rm %-20s # удалить\n" "${CONTAINER_NAME}" "${CONTAINER_NAME}"
+    printf "  docker logs %-23s --tail 20 # посмотреть логи\n" "${CONTAINER_NAME}"
     printf "\n"
 }
 
