@@ -132,11 +132,13 @@ ask_params() {
     # Домен для ссылки
     printf "🔹 Введите ваш домен для ссылки\n   (или Enter чтобы использовать IP этого сервера): "
     read -r PROXY_DOMAIN_INPUT < /dev/tty || true
+    
     if [ -z "$PROXY_DOMAIN_INPUT" ]; then
         PROXY_DOMAIN=$(get_server_ip)
         printf "ℹ️  Будет использован IP: %s\n\n" "$PROXY_DOMAIN"
     else
-        PROXY_DOMAIN="$PROXY_DOMAIN_INPUT"
+        # 🆕 Санитизация домена: удаляем невидимые символы, \r, \n, пробелы, BOM
+        PROXY_DOMAIN=$(printf "%s" "$PROXY_DOMAIN_INPUT" | tr -d '\r\n\t' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -cd 'a-zA-Z0-9._-')
         printf "✅ Домен: %s\n\n" "$PROXY_DOMAIN"
     fi
     
@@ -303,6 +305,7 @@ show_result() {
     printf "${GREEN}╚════════════════════════════════════════╝${NC}\n"
     printf "\n"
     printf "${YELLOW}📋 Ссылка для Telegram:${NC}\n"
+    # 🆕 Используем printf %s для безопасного вывода без лишних символов
     printf "https://t.me/proxy?server=%s&port=%s&secret=%s\n" "$PROXY_DOMAIN" "$PROXY_PORT" "$SECRET"
     printf "\n"
     printf "${YELLOW}💡 Как подключить:${NC}\n"
