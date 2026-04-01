@@ -219,7 +219,7 @@ run_proxy() {
         --name telegram \
         --restart unless-stopped \
         -p "${PROXY_PORT}":8443 \
-        nineseconds/mtg:2 \
+        nineseconds/mtg:latest \
         simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:8443 "${SECRET}"
     
     printf "\n✅ Контейнер запущен\n\n"
