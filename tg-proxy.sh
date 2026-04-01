@@ -195,7 +195,16 @@ generate_secret() {
 }
 
 # -------------------------------
-# Запуск контейнера (с логикой переустановки)
+# Проверка: какой контейнер занимает порт
+# -------------------------------
+find_container_by_port() {
+    local port="$1"
+    # Ищем контейнер, который слушает этот порт через docker-proxy
+    docker ps --format "{{.Names}}:{{.Ports}}" | grep ":${port}->" | cut -d: -f1 | head -1
+}
+
+# -------------------------------
+# Запуск контейнера (с проверкой конфликтов портов)
 # -------------------------------
 run_proxy() {
     printf "${BLUE}────────────────────────────────────────${NC}\n"
@@ -204,6 +213,27 @@ run_proxy() {
     
     # 🆕 Путь для хранения секрета (уникальный для каждого контейнера)
     SECRET_FILE="/root/mtg-secret-${CONTAINER_NAME}"
+    
+    # 🔍 Проверка: не занят ли порт другим контейнером
+    EXISTING_CONTAINER=$(find_container_by_port "${PROXY_PORT}")
+    if [ -n "$EXISTING_CONTAINER" ] && [ "$EXISTING_CONTAINER" != "$CONTAINER_NAME" ]; then
+        printf "${YELLOW}⚠️  Порт ${PROXY_PORT} уже занят контейнером '${EXISTING_CONTAINER}'.${NC}\n"
+        printf "🔹 Удалить '${EXISTING_CONTAINER}' и освободить порт? [Enter=да / N=нет]: "
+        read -r REMOVE_CHOICE < /dev/tty || true
+        REMOVE_CHOICE=$(printf "%s" "$REMOVE_CHOICE" | tr '[:upper:]' '[:lower:]')
+        
+        if [ -z "$REMOVE_CHOICE" ] || [ "$REMOVE_CHOICE" = "y" ] || [ "$REMOVE_CHOICE" = "yes" ]; then
+            printf "🗑️  Останавливаю '${EXISTING_CONTAINER}'...\n"
+            docker stop "${EXISTING_CONTAINER}" 2>/dev/null || true
+            docker rm "${EXISTING_CONTAINER}" 2>/dev/null || true
+            printf "✅ Контейнер '${EXISTING_CONTAINER}' удалён, порт ${PROXY_PORT} свободен\n"
+        else
+            printf "${RED}❌ Порт занят. Скрипт завершён.${NC}\n"
+            printf "${BLUE}💡 Выберите другой порт или удалите контейнер вручную:${NC}\n"
+            printf "   docker stop ${EXISTING_CONTAINER} && docker rm ${EXISTING_CONTAINER}\n\n"
+            exit 1
+        fi
+    fi
     
     # Проверяем, существует ли контейнер с таким именем
     if docker ps -a --filter name="^/${CONTAINER_NAME}$" --format "{{.ID}}" | grep -q .; then
