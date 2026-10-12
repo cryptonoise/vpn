@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
-
-VERSION="1.2.0"
+#
+# relay-setup.sh — RELAY·BACKEND Tunnel Setup
+# Запускать на RELAY (РФ-сервер) от root:  bash relay-setup.sh
+#
+# Что делает:
+#   RELAY   — rathole-server, ufw, пересылка UDP 8443 (Hysteria2)
+#   BACKEND — (по SSH) пакеты, rathole-client, 3x-ui, nginx, сертификат Let's Encrypt, ufw
+# Итог: данные для входа в панель по https://домен/<WebBasePath>
+# Требования: Ubuntu 22.04+ на обоих серверах, root-доступ, SSH-ключ root для BACKEND
+# Туннель rathole работает по TLS (свой CA, SNI = домен панели). Noise-транспорт не используется:
+# поток из случайных байт сам по себе выглядит подозрительно.
+#
+VERSION="1.2.1"
 NAME="RELAY·BACKEND Tunnel Setup"
 
 set -u
@@ -72,8 +83,14 @@ ask() {  # ask VAR "Вопрос" "по умолчанию"
 
 confirm() {  # Enter / y = да, n = нет
   local a
-  read -r -p "${B}?${R} $1 ${DIM}[Y/n]${R}: " a
-  case "${a:-y}" in y | Y | yes | YES | д | Д) return 0 ;; *) return 1 ;; esac
+  while true; do
+    read -r -p "${B}?${R} $1 ${DIM}[Enter/y — да, n — нет]${R}: " a
+    case "${a:-y}" in
+      y | Y | yes | YES | д | Д) return 0 ;;
+      n | N | no | NO | н | Н | нет) return 1 ;;
+      *) printf '  %sВведите Enter / y (да) или n (нет)%s\n' "$DIM" "$R" ;;
+    esac
+  done
 }
 
 valid_ip()   { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && ! [[ "$1" =~ (^|\.)(25[6-9]|2[6-9][0-9]|[3-9][0-9]{2})(\.|$) ]]; }
@@ -782,9 +799,7 @@ main() {
     fail "неверный домен"
     DOMAIN=""
   done
-  base="${DOMAIN#*.}"
-  [[ "$base" == *.* ]] || base="$DOMAIN"
-  ask EMAIL "E-mail для Let's Encrypt" "${EMAIL:-admin@$base}"
+  EMAIL="admin@$DOMAIN"   # e-mail для Let's Encrypt: не спрашиваем
 
   # ── скрытая проверка DNS: молчит, если всё в порядке
   echo
