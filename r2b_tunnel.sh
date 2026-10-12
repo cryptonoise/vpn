@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-VERSION="1.0.0"
+VERSION="1.2.0"
 NAME="RELAY·BACKEND Tunnel Setup"
 
 set -u
@@ -12,6 +12,7 @@ UFW_SYSCTL="${UFW_SYSCTL:-/etc/ufw/sysctl.conf}"
 CONF_FILE="${CONF_FILE:-/root/.relay-setup.conf}"
 REPORT_FILE="${REPORT_FILE:-/root/relay-setup-report.txt}"
 LOG="${LOG:-/var/log/relay-setup.log}"
+TLS_DIR="${TLS_DIR:-/etc/rathole/tls}"
 PANEL_PORT=999
 TOTAL=13
 STEP=0
@@ -77,6 +78,7 @@ confirm() {  # Enter / y = да, n = нет
 
 valid_ip()   { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && ! [[ "$1" =~ (^|\.)(25[6-9]|2[6-9][0-9]|[3-9][0-9]{2})(\.|$) ]]; }
 valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+version_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]; }
 valid_dom()  { [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; }
 
 # ───────────────────────── выполнение шагов с анимацией ─────────────────────────
@@ -114,13 +116,17 @@ die() {
 }
 
 # ───────────────────────── общие функции (уходят и на BACKEND) ─────────────────────────
-rathole_install() {
-  local asset tmp
+rathole_asset() {
   case "$(uname -m)" in
-    x86_64 | amd64) asset="rathole-x86_64-unknown-linux-gnu.zip" ;;
-    aarch64 | arm64) asset="rathole-aarch64-unknown-linux-musl.zip" ;;
+    x86_64 | amd64) echo "rathole-x86_64-unknown-linux-gnu.zip" ;;
+    aarch64 | arm64) echo "rathole-aarch64-unknown-linux-musl.zip" ;;
     *) echo "unsupported arch: $(uname -m)" >&2; return 1 ;;
   esac
+}
+
+rathole_install() {
+  local asset tmp
+  asset=$(rathole_asset) || return 1
   tmp=$(mktemp -d) || return 1
   curl -fsSL --retry 3 -o "$tmp/r.zip" "https://github.com/rapiz1/rathole/releases/latest/download/$asset" || return 1
   unzip -oq "$tmp/r.zip" -d "$tmp" || return 1
@@ -129,11 +135,24 @@ rathole_install() {
   test -x /usr/local/bin/rathole
 }
 
-# порты, на которых слушает sshd (+ порт текущего SSH-подключения)
+# GitHub из РФ бывает недоступен: тогда архив скачивает BACKEND и передаёт на RELAY
+rathole_install_via_backend() {
+  local asset tmp
+  asset=$(rathole_asset) || return 1
+  tmp=$(mktemp -d) || return 1
+  bk "curl -fsSL --retry 3 https://github.com/rapiz1/rathole/releases/latest/download/$asset" > "$tmp/r.zip" || return 1
+  unzip -oq "$tmp/r.zip" -d "$tmp" || return 1
+  install -m 755 "$tmp/rathole" /usr/local/bin/rathole || return 1
+  rm -rf "$tmp"
+  test -x /usr/local/bin/rathole
+}
+
+# порты, на которых слушает sshd (+ порт текущего SSH-подключения; Ubuntu 22.10+ — ssh.socket)
 ssh_ports() {
   {
     ss -tlnp 2>/dev/null | awk '/"sshd"/ { n = split($4, a, ":"); print a[n] }'
     sshd -T 2>/dev/null | awk '/^port / { print $2 }'
+    systemctl show ssh.socket -p Listen 2>/dev/null | sed -n 's/^Listen=.*:\([0-9][0-9]*\) (Stream)$/\1/p'
     [ -n "${SSH_CONNECTION:-}" ] && echo "$SSH_CONNECTION" | awk '{ print $4 }'
   } | grep -E '^[0-9]+$' | sort -un
 }
@@ -141,9 +160,24 @@ ssh_ports() {
 # ───────────────────────── RELAY: подготовка ─────────────────────────
 relay_prepare() {
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-  apt-get update -y &&
-    apt-get install -y curl unzip ufw dnsutils openssh-client ca-certificates openssl iproute2 &&
-    rathole_install
+  apt-get -o DPkg::Lock::Timeout=300 update -y &&
+    apt-get -o DPkg::Lock::Timeout=300 install -y curl unzip ufw dnsutils openssh-client ca-certificates openssl iproute2 || return 1
+  rathole_install || { echo "прямая загрузка rathole не удалась, пробую через BACKEND"; rathole_install_via_backend; }
+}
+
+# базовые утилиты нужны ещё до вопросов (curl, dig, ssh, openssl, ss)
+ensure_tools() {
+  local miss=()
+  command -v curl >/dev/null 2>&1 || miss+=(curl)
+  command -v dig >/dev/null 2>&1 || miss+=(dnsutils)
+  { command -v ssh >/dev/null 2>&1 && command -v ssh-keygen >/dev/null 2>&1; } || miss+=(openssh-client)
+  command -v openssl >/dev/null 2>&1 || miss+=(openssl)
+  command -v ss >/dev/null 2>&1 || miss+=(iproute2)
+  [ ${#miss[@]} -eq 0 ] && return 0
+  info "устанавливаю: ${miss[*]}"
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+  apt-get -o DPkg::Lock::Timeout=300 update -y >>"$LOG" 2>&1 &&
+    apt-get -o DPkg::Lock::Timeout=300 install -y "${miss[@]}" >>"$LOG" 2>&1
 }
 
 detect_relay_ip() {
@@ -160,12 +194,48 @@ detect_relay_ip() {
 }
 
 # ───────────────────────── RELAY: rathole-server ─────────────────────────
+# свой CA и серверный сертификат для домена; PKCS#12 нужен rathole-server.
+# Сертификат привязан к имени (домену), не к IP — поэтому identity.pfx годится для любого нового RELAY.
+relay_tls_setup() {
+  local d="$TLS_DIR"
+  mkdir -p "$d" && chmod 700 "$d" || return 1
+  if [ -f "$d/identity.pfx" ] && [ -f "$d/srv.pem" ] &&
+    openssl x509 -in "$d/srv.pem" -noout -ext subjectAltName 2>/dev/null | grep -q "DNS:$DOMAIN"; then
+    return 0   # уже есть сертификат для этого домена — CA не меняем
+  fi
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$d/ca.key" -out "$d/ca.pem" -days 3650 -subj "/CN=rathole-ca" &&
+    openssl req -newkey rsa:2048 -nodes -keyout "$d/srv.key" -out "$d/srv.csr" -subj "/CN=$DOMAIN" &&
+    printf 'subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' "$DOMAIN" > "$d/ext.cnf" &&
+    openssl x509 -req -in "$d/srv.csr" -CA "$d/ca.pem" -CAkey "$d/ca.key" -CAcreateserial -out "$d/srv.pem" -days 3650 -extfile "$d/ext.cnf" &&
+    openssl rand -hex 16 > "$d/pfx.pass" &&
+    openssl pkcs12 -export -out "$d/identity.pfx" -inkey "$d/srv.key" -in "$d/srv.pem" -certfile "$d/ca.pem" -passout "pass:$(cat "$d/pfx.pass")" &&
+    chmod 600 "$d"/* &&
+    rm -f "$d/srv.csr" "$d/ca.srl"
+}
+
+# BACKEND: CA для проверки сервера + резервная копия identity (для замены RELAY) + rathole-client
+backend_rathole() {
+  bk "mkdir -p /etc/rathole/relay-tls && chmod 700 /etc/rathole/relay-tls" &&
+    bk "cat > /etc/rathole/ca.pem" < "$TLS_DIR/ca.pem" &&
+    tar -C "$TLS_DIR" -cf - identity.pfx pfx.pass ca.pem | bk "tar -C /etc/rathole/relay-tls -xf - && chmod 600 /etc/rathole/relay-tls/*" &&
+    rscript "$TMPD/rathole-client.sh" "$RELAY_IP" "$SECRET" "$DOMAIN"
+}
+
 relay_rathole_server() {
   mkdir -p /etc/rathole
+  local pfx_pw
+  pfx_pw=$(cat "$TLS_DIR/pfx.pass") || return 1
   cat > /etc/rathole/server.toml <<EOF
 [server]
 bind_addr = "0.0.0.0:2333"
 default_token = "$SECRET"
+
+[server.transport]
+type = "tls"
+
+[server.transport.tls]
+pkcs12 = "$TLS_DIR/identity.pfx"
+pkcs12_password = "$pfx_pw"
 
 [server.services.https]
 bind_addr = "0.0.0.0:443"
@@ -258,9 +328,11 @@ relay_cleanup_old_dnat() {
 }
 
 relay_firewall() {
-  local p
+  local p ports
+  ports=$(ssh_ports)
+  [ -n "$ports" ] || { echo "SSH-порт RELAY не определён: firewall не включаю, чтобы не потерять доступ" >&2; return 1; }
   relay_cleanup_old_dnat
-  for p in $(ssh_ports); do ufw allow "$p/tcp" || return 1; done
+  for p in $ports; do ufw allow "$p/tcp" || return 1; done
   ufw allow from "$BACKEND_IP" to any port 2333 proto tcp || return 1
   ufw allow 443/tcp && ufw allow 80/tcp && ufw allow 8443/tcp && ufw allow 8443/udp || return 1
   ufw route allow proto udp from any to "$BACKEND_IP" port 8443 || return 1
@@ -270,13 +342,21 @@ relay_firewall() {
 }
 
 # ───────────────────────── DNS ─────────────────────────
+dns_collect() {  # IPv4 из нескольких резолверов + системного
+  local d
+  for d in 8.8.8.8 1.1.1.1 77.88.8.8; do
+    dig +short +time=3 +tries=1 A "$DOMAIN" @"$d" 2>/dev/null
+  done
+  getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{ print $1 }'
+}
+
 dns_check() {
-  local a1 a2 all x
+  local all v6 x
   while true; do
-    a1=$(dig +short +time=3 +tries=1 A "$DOMAIN" @8.8.8.8 2>/dev/null | grep -E '^[0-9.]+$' | sort -u | tr '\n' ' ')
-    a2=$(dig +short +time=3 +tries=1 A "$DOMAIN" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | sort -u | tr '\n' ' ')
-    all=$(printf '%s %s' "$a1" "$a2" | tr ' ' '\n' | grep -E '^[0-9.]+$' | sort -u | tr '\n' ' ')
-    if [ -n "$all" ] && [ "$(echo "$all" | xargs)" = "$RELAY_IP" ]; then
+    all=$(dns_collect | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u | tr '\n' ' ')
+    all="${all% }"
+    v6=$(dig +short +time=3 +tries=1 AAAA "$DOMAIN" @8.8.8.8 2>/dev/null | grep ':' | head -1)
+    if [ "$all" = "$RELAY_IP" ] && [ -z "$v6" ]; then
       ok "DNS: $DOMAIN → $RELAY_IP"
       return 0
     fi
@@ -284,8 +364,9 @@ dns_check() {
     rule
     printf '  %s▲ Проблема с DNS%s\n' "$YLW" "$R"
     echo "  Домен:        $DOMAIN"
-    echo "  Сейчас:       ${all:+${all% }}${all:-нет A-записи}"
-    echo "  Должно быть:  $RELAY_IP  (IP RELAY, режим DNS only, TTL 1 мин)"
+    echo "  Сейчас:       A: ${all:-нет}   AAAA: ${v6:-нет}"
+    echo "  Должно быть:  A = $RELAY_IP (IP RELAY, DNS only, TTL 1 мин), AAAA — удалить"
+    echo "  ${DIM}(IPv6 через туннель не пробрасывается, а Let's Encrypt проверяет по IPv6 первым)${R}"
     rule
     read -r -p "  Нажмите Enter, когда исправили (n — пропустить проверку): " x
     if [[ "$x" =~ ^[nNнН] ]]; then
@@ -342,16 +423,25 @@ bk()      { ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" "$@"; }
 rscript() { local f="$1"; shift; ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" bash -s -- "$@" < "$f"; }
 
 ssh_connect() {
-  local out np
+  local err np
   ssh_opts
   while true; do
-    out=$(ssh "${SSH_OPTS[@]}" -o BatchMode=yes "root@$BACKEND_IP" true 2>&1) && { ok "SSH: root@$BACKEND_IP:$BACKEND_PORT"; return 0; }
-    if echo "$out" | grep -qi 'permission denied'; then
+    if ssh "${SSH_OPTS[@]}" -o BatchMode=yes "root@$BACKEND_IP" true >/dev/null 2>"$TMPD/ssh.err"; then
+      ok "SSH: root@$BACKEND_IP:$BACKEND_PORT"
+      return 0
+    fi
+    err=$(cat "$TMPD/ssh.err")
+    if echo "$err" | grep -q 'REMOTE HOST IDENTIFICATION HAS CHANGED'; then
+      warn "ключ хоста BACKEND изменился (сервер переустанавливали?)"
+      confirm "Удалить старую запись из known_hosts и продолжить?" || die "подключение отменено"
+      ssh-keygen -R "$BACKEND_IP" >/dev/null 2>&1 || true
+      ssh-keygen -R "[$BACKEND_IP]:$BACKEND_PORT" >/dev/null 2>&1 || true
+    elif echo "$err" | grep -qi 'permission denied'; then
       fail "BACKEND не принял ключ: его публичная часть должна быть в authorized_keys пользователя root на BACKEND"
       confirm "Указать другой приватный ключ?" || die "без доступа по ключу к BACKEND продолжить нельзя"
       read_key
     else
-      fail "SSH не удался: $(echo "$out" | tail -n 1)"
+      fail "SSH не удался: $(echo "$err" | tail -n 1)"
       confirm "Повторить?" || die "без SSH к BACKEND продолжить нельзя"
       ask np "SSH-порт BACKEND" "$BACKEND_PORT"
       valid_port "$np" && BACKEND_PORT="$np"
@@ -367,21 +457,29 @@ make_remote_scripts() {
   cat > "$D/pkgs.sh" <<'EOF'
 set -e
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-apt-get update -y
-apt-get upgrade -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
-apt-get install -y curl wget sudo nginx certbot dnsutils unzip ufw ca-certificates openssl python3
+APT="apt-get -o DPkg::Lock::Timeout=300"
+$APT update -y
+$APT upgrade -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+$APT install -y curl wget sudo nginx certbot dnsutils unzip ufw ca-certificates openssl python3
 timedatectl set-timezone Europe/Moscow || true
 EOF
 
-  { declare -f rathole_install; cat <<'EOF'
+  { declare -f rathole_asset rathole_install; cat <<'EOF'
 set -e
-RELAY="$1"; SECRET="$2"
+RELAY="$1"; SECRET="$2"; DOMAIN="$3"
 rathole_install
 mkdir -p /etc/rathole
 cat > /etc/rathole/client.toml <<EOT
 [client]
 remote_addr = "$RELAY:2333"
 default_token = "$SECRET"
+
+[client.transport]
+type = "tls"
+
+[client.transport.tls]
+trusted_root = "/etc/rathole/ca.pem"
+hostname = "$DOMAIN"
 
 [client.services.https]
 local_addr = "127.0.0.1:443"
@@ -532,8 +630,9 @@ RELAY="$1"
 ports=$( {
   ss -tlnp 2>/dev/null | awk '/"sshd"/ { n = split($4, a, ":"); print a[n] }'
   sshd -T 2>/dev/null | awk '/^port / { print $2 }'
+  systemctl show ssh.socket -p Listen 2>/dev/null | sed -n 's/^Listen=.*:\([0-9][0-9]*\) (Stream)$/\1/p'
   [ -n "${SSH_CONNECTION:-}" ] && echo "$SSH_CONNECTION" | awk '{ print $4 }'
-} | grep -E '^[0-9]+$' | sort -un )
+} | grep -E '^[0-9]+$' | sort -un || true )
 [ -n "$ports" ] || { echo "sshd port not found" >&2; exit 1; }
 for p in $ports; do ufw allow "$p/tcp"; done
 for r in "443/tcp" "80/tcp" "8443/tcp" "443" "80" "8443" "Nginx Full" "Nginx HTTP" "Nginx HTTPS"; do
@@ -647,8 +746,14 @@ main() {
   thin
   # shellcheck disable=SC1091
   . /etc/os-release 2>/dev/null || true
-  if [ "${ID:-}" = "ubuntu" ] || [ "${ID:-}" = "debian" ]; then ok "ОС: ${PRETTY_NAME:-$ID}"; else warn "ОС ${PRETTY_NAME:-?}: скрипт рассчитан на Ubuntu/Debian"; fi
-  command -v ssh >/dev/null 2>&1 && command -v ssh-keygen >/dev/null 2>&1 || { apt-get update -y >>"$LOG" 2>&1; apt-get install -y openssh-client curl >>"$LOG" 2>&1; }
+  if [ "${ID:-}" = "ubuntu" ]; then
+    if version_ge "${VERSION_ID:-0}" 22.04; then ok "ОС: ${PRETTY_NAME:-ubuntu}"; else die "нужна Ubuntu 22.04 или новее (найдена ${VERSION_ID:-?})"; fi
+  elif [ "${ID:-}" = "debian" ]; then
+    warn "ОС ${PRETTY_NAME:-debian}: скрипт проверен на Ubuntu 22.04+, на Debian 12+ должен работать"
+  else
+    warn "ОС ${PRETTY_NAME:-?}: скрипт рассчитан на Ubuntu 22.04+"
+  fi
+  ensure_tools || die "не удалось установить базовые утилиты (curl, dig, ssh, openssl)"
   RELAY_IP=$(detect_relay_ip)
   valid_ip "$RELAY_IP" || die "не удалось определить внешний IP этого сервера"
   ok "IP RELAY: $RELAY_IP"
@@ -660,6 +765,7 @@ main() {
   thin
   while true; do
     ask BACKEND_IP "IP BACKEND" "${BACKEND_IP:-}"
+    if [ "$BACKEND_IP" = "$RELAY_IP" ]; then fail "IP BACKEND совпадает с IP этого сервера"; BACKEND_IP=""; continue; fi
     valid_ip "$BACKEND_IP" && break
     fail "неверный IP"
     BACKEND_IP=""
@@ -696,8 +802,9 @@ main() {
   kv "BACKEND" "$BACKEND_IP  (SSH :$BACKEND_PORT)"
   kv "Domain" "$DOMAIN → https://$DOMAIN/<WebBasePath>"
   kv "E-mail" "$EMAIL"
-  kv "RELAY ports" "443, 80, 8443/tcp → туннель; 2333 (только с BACKEND); 8443/udp → DNAT"
+  kv "RELAY ports" "443, 80, 8443/tcp → туннель; 2333 (только с BACKEND); 8443/udp → DNAT; прочее входящее закрывается (ufw)"
   kv "BACKEND ports" "входящие TCP 443/80/8443 закрываются; 8443/udp только от RELAY"
+  kv "Tunnel" "rathole с TLS-транспортом (свой CA, SNI $DOMAIN); Noise не используется"
   kv "Panel" "3x-ui на 127.0.0.1:$PANEL_PORT (SQLite), nginx + Let's Encrypt"
   rule
   echo
@@ -706,20 +813,28 @@ main() {
   make_remote_scripts
   install_switch_backend
 
-  # [1] подготовка RELAY
-  section "RELAY: пакеты и rathole"
-  step_run "Установка пакетов и rathole" relay_prepare || die "не удалось подготовить RELAY"
-
-  # [2] SSH
+  # [1] SSH (первым: если GitHub недоступен с RELAY, rathole скачает BACKEND)
   section "Подключение к BACKEND"
   ssh_connect
+  local bos
+  bos=$(bk '. /etc/os-release; echo "$ID $VERSION_ID"' 2>>"$LOG")
+  case "$bos" in
+    ubuntu\ *) if version_ge "${bos#ubuntu }" 22.04; then ok "ОС BACKEND: Ubuntu ${bos#ubuntu }"; else die "BACKEND: нужна Ubuntu 22.04 или новее (найдена ${bos#ubuntu })"; fi ;;
+    debian\ *) warn "ОС BACKEND: $bos (скрипт рассчитан на Ubuntu 22.04+)" ;;
+    *) warn "ОС BACKEND не определена: ${bos:-?}" ;;
+  esac
+
+  # [2] подготовка RELAY
+  section "RELAY: пакеты и rathole"
+  step_run "Установка пакетов и rathole" relay_prepare || die "не удалось подготовить RELAY"
 
   # [3] rathole-server
   section "RELAY: rathole-server"
   local conflicts
   conflicts=$(relay_port_conflicts)
   [ -z "$conflicts" ] || die "на RELAY заняты порты:$conflicts (остановите nginx/apache/другие сервисы на этих портах)"
-  step_run "Конфиг и запуск rathole-server" relay_rathole_server || die "rathole-server не запустился"
+  step_run "TLS: свой CA и сертификат для $DOMAIN" relay_tls_setup || die "не удалось создать TLS-сертификат туннеля"
+  step_run "Конфиг и запуск rathole-server (TLS)" relay_rathole_server || die "rathole-server не запустился"
 
   # [4] firewall + UDP
   section "RELAY: firewall и пересылка UDP 8443"
@@ -731,7 +846,7 @@ main() {
 
   # [6] rathole-client
   section "BACKEND: rathole-client"
-  step_run "Установка rathole и подключение к RELAY" rscript "$TMPD/rathole-client.sh" "$RELAY_IP" "$SECRET" || die "rathole-client не запустился"
+  step_run "Установка rathole и подключение к RELAY (TLS)" backend_rathole || die "rathole-client не запустился (проверьте TLS-сертификат и порт 2333)"
 
   # [7] проверка туннеля
   section "Проверка туннеля"
@@ -762,7 +877,12 @@ main() {
   res=$(bk 'cat /etc/x-ui/install-result.env' 2>>"$LOG")
   getv() { printf '%s\n' "$res" | sed -n "s/^$1=//p" | head -1 | sed "s/^'//; s/'$//"; }
   xu=$(getv XUI_USERNAME); xp=$(getv XUI_PASSWORD); xw=$(getv XUI_WEB_BASE_PATH); xt=$(getv XUI_API_TOKEN)
-  [ -n "$xu" ] && [ -n "$xp" ] && [ -n "$xw" ] || die "не удалось прочитать данные панели (/etc/x-ui/install-result.env на BACKEND)"
+  if ! { [ -n "$xu" ] && [ -n "$xp" ] && [ -n "$xw" ]; }; then
+    warn "файл данных установщика не найден (панель уже была установлена?) — задаю новые данные входа"
+    xu=$(openssl rand -hex 5); xp=$(openssl rand -hex 5); xw=$(openssl rand -hex 9)
+    bk "/usr/local/x-ui/x-ui setting -username '$xu' -password '$xp' -port $PANEL_PORT -webBasePath '$xw' -listenIP 127.0.0.1 && systemctl restart x-ui" >>"$LOG" 2>&1 || die "не удалось задать данные панели"
+    xt=$(bk "/usr/local/x-ui/x-ui setting -getApiToken" 2>>"$LOG" | grep -Eo 'apiToken: .+' | awk '{print $2}')
+  fi
   echo
   rule
   printf '  %sPanel Installation Complete!%s\n' "$GRN" "$R"
