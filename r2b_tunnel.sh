@@ -11,7 +11,7 @@
 # Туннель rathole работает по TLS (свой CA, SNI = домен панели). Noise-транспорт не используется:
 # поток из случайных байт сам по себе выглядит подозрительно.
 #
-VERSION="1.3.1"
+VERSION="1.3.2"
 NAME="RELAY·BACKEND Tunnel Setup"
 
 set -u
@@ -300,19 +300,25 @@ do_uninstall() {
 # ───────────────────────── тест BACKEND (iperf3) ─────────────────────────
 iperf_run() {  # iperf_run имя [опции iperf3]
   local name="$1"; shift
-  timeout 45 iperf3 -c "$BACKEND_IP" -p 5201 -4 -t 8 -J "$@" > "$TMPD/iperf-$name.json" 2>>"$LOG" || true
+  timeout 45 iperf3 -c "$BACKEND_IP" -p 5201 -4 -t 8 --connect-timeout 5000 -J "$@" > "$TMPD/iperf-$name.json" 2>>"$LOG" || true
+  { echo "--- iperf3 $name:"; head -c 1500 "$TMPD/iperf-$name.json"; echo; } >> "$LOG"
 }
 
-iperf_parse() {  # → "Мбит/с байт retr"
+iperf_parse() {  # → "Мбит/с байт retr ошибка"
   python3 - "$1" <<'PY'
 import json, sys
 try:
-    e = json.load(open(sys.argv[1]))["end"]
-    r = e.get("sum_received") or {}
-    t = e.get("sum_sent") or {}
-    print(int(r.get("bits_per_second", 0) / 1e6), int(r.get("bytes", 0)), int(t.get("retransmits", 0)))
+    d = json.load(open(sys.argv[1]))
 except Exception:
-    print("0 0 0")
+    print("0 0 0 нет ответа от iperf3 (таймаут или запуск не удался)")
+    sys.exit(0)
+err = str(d.get("error", "")).replace("\n", " ")[:90]
+e = d.get("end") or {}
+r = e.get("sum_received") or {}
+t = e.get("sum_sent") or {}
+if not e and not err:
+    err = "iperf3 завершился без данных"
+print(int(r.get("bits_per_second", 0) / 1e6), int(r.get("bytes", 0)), int(t.get("retransmits", 0)), err)
 PY
 }
 
@@ -322,6 +328,25 @@ res_line() {  # res_line статус(ok|warn|fail|info) "название" "з�
   local n=$((26 - ${#2}))
   [ $n -lt 1 ] && n=1
   printf '  %s %s%s%*s%s %s\n' "$ic" "$DIM" "$2" "$n" "" "$R" "$3"
+}
+
+# оценка одного TCP-теста (массивы problems/warns — из run_test)
+tcp_line() {  # tcp_line "подпись" Мбит/с байт retr ошибка
+  local label="$1" mb="$2" by="$3" rt="$4" er="$5"
+  if [ "${PORT_BAD:-0}" = 1 ]; then
+    res_line fail "$label" "не выполнен: порт 5201 недоступен"
+  elif [ -n "$er" ] && [ "$by" -lt 200000 ]; then
+    res_line fail "$label" "не выполнен: $er"
+    problems+=("$label: тест не выполнен — $er")
+  elif [ "$by" -lt 200000 ] || [ "$mb" -lt 1 ]; then
+    res_line fail "$label" "получено $((by / 1024)) КБ за 8 с — поток замерзает"
+    problems+=("$label: TCP-поток замерзает после ~$((by / 1024)) КБ — заморозка на пути RELAY↔BACKEND (смена хостера/подсети; UDP-ветка Hysteria2 может работать)")
+  elif [ "$mb" -lt 100 ]; then
+    res_line warn "$label" "${mb} Мбит/с, retr ${rt}"
+    warns+=("$label: скорость ниже 100 Мбит/с")
+  else
+    res_line ok "$label" "${mb} Мбит/с, retr ${rt}"
+  fi
 }
 
 run_test() {
@@ -335,19 +360,41 @@ run_test() {
   section "Подключение к BACKEND"
   ssh_connect
 
-  section "Установка iperf3"
-  step_run "iperf3 на RELAY" bash -c 'export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a; apt-get -o DPkg::Lock::Timeout=300 update -y && apt-get -o DPkg::Lock::Timeout=300 install -y iperf3' || die "не удалось установить iperf3 на RELAY"
-  step_run "iperf3 на BACKEND" rscript "$TMPD/iperf-install.sh" || die "не удалось установить iperf3 на BACKEND"
+  section "Подготовка: iperf3 и сетевые настройки"
+  if command -v iperf3 >/dev/null 2>&1; then
+    ok "iperf3 на RELAY уже установлен"
+  else
+    step_run "iperf3 на RELAY" bash -c 'export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a; apt-get -o DPkg::Lock::Timeout=300 update -y && apt-get -o DPkg::Lock::Timeout=300 install -y iperf3' || die "не удалось установить iperf3 на RELAY"
+  fi
+  if bk 'command -v iperf3 >/dev/null 2>&1' 2>>"$LOG"; then
+    ok "iperf3 на BACKEND уже установлен"
+  else
+    step_run "iperf3 на BACKEND" rscript "$TMPD/iperf-install.sh" || die "не удалось установить iperf3 на BACKEND"
+  fi
+  # BBR/fq нужны для честного измерения — применяем скрыто на обоих серверах
+  tune_network >>"$LOG" 2>&1
+  rscript "$TMPD/tune.sh" >>"$LOG" 2>&1 || true
 
   section "Тестовый сервер на BACKEND"
   IPERF_STARTED=1
   step_run "iperf3 -s (порт 5201 открыт только для RELAY)" rscript "$TMPD/iperf-server.sh" "$RELAY_IP" || die "не удалось запустить iperf3-сервер на BACKEND"
+  PORT_BAD=0
+  if timeout 6 bash -c ">/dev/tcp/$BACKEND_IP/5201" 2>/dev/null; then
+    ok "порт 5201 на BACKEND доступен с RELAY"
+  else
+    warn "порт 5201 на BACKEND недоступен с RELAY (firewall хостера или iperf3 не запущен)"
+    PORT_BAD=1
+  fi
 
   section "Измерения (RELAY → BACKEND, напрямую, без туннеля)"
   step_run "ping, 10 пакетов" bash -c "ping -c 10 -i 0.3 -q '$BACKEND_IP' > '$TMPD/ping.txt' 2>&1 || true"
-  step_run "TCP, 1 поток (8 с)" iperf_run p1 -P 1
-  step_run "TCP, 8 потоков (8 с)" iperf_run p8 -P 8
-  step_run "TCP, обратное направление (8 с)" iperf_run rev -P 1 -R
+  if [ "$PORT_BAD" -eq 0 ]; then
+    step_run "TCP, 1 поток (8 с)" iperf_run p1 -P 1
+    step_run "TCP, 8 потоков (8 с)" iperf_run p8 -P 8
+    step_run "TCP, обратное направление (8 с)" iperf_run rev -P 1 -R
+  else
+    warn "TCP-тесты пропущены: порт 5201 недоступен"
+  fi
 
   section "Сетевые параметры"
   local cc_r cc_b qd_r qd_b
@@ -359,15 +406,16 @@ run_test() {
 
   section "Результаты"
   iperf_stop
-  local p1 p1b p1r p8 p8b p8r rv rvb rvr loss rtt
-  read -r p1 p1b p1r <<< "$(iperf_parse "$TMPD/iperf-p1.json")"
-  read -r p8 p8b p8r <<< "$(iperf_parse "$TMPD/iperf-p8.json")"
-  read -r rv rvb rvr <<< "$(iperf_parse "$TMPD/iperf-rev.json")"
+  local p1 p1b p1r p1e p8 p8b p8r p8e rv rvb rvr rve loss rtt
+  read -r p1 p1b p1r p1e <<< "$(iperf_parse "$TMPD/iperf-p1.json")"
+  read -r p8 p8b p8r p8e <<< "$(iperf_parse "$TMPD/iperf-p8.json")"
+  read -r rv rvb rvr rve <<< "$(iperf_parse "$TMPD/iperf-rev.json")"
   loss=$(grep -oE '[0-9.]+% packet loss' "$TMPD/ping.txt" | head -n1 | cut -d% -f1)
   rtt=$(grep -oE '= [0-9.]+/[0-9.]+/' "$TMPD/ping.txt" | head -n1 | cut -d/ -f2)
-  loss="${loss:-100}"; rtt="${rtt:-?}"
+  loss="${loss:-100}"; rtt="${rtt:-?}"; rtt="${rtt%.*}"
 
   local problems=() warns=()
+  [ "$PORT_BAD" -eq 1 ] && problems+=("порт 5201 на BACKEND недоступен с RELAY: проверьте firewall хостера (в ufw порт уже открыт для RELAY)")
   echo
   rule
   printf '  %sРезультаты теста BACKEND %s%s\n' "$B" "$BACKEND_IP" "$R"
@@ -376,29 +424,16 @@ run_test() {
   if [ "${loss%.*}" -ge 5 ]; then res_line fail "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; problems+=("потери пакетов ${loss}% на пути до BACKEND")
   elif [ "${loss%.*}" -ge 1 ]; then res_line warn "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; warns+=("есть потери пакетов (${loss}%)")
   else res_line ok "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; fi
-  # TCP 1 поток
-  if [ "$p1b" -lt 200000 ] || [ "$p1" -lt 1 ]; then
-    res_line fail "TCP, 1 поток" "получено $((p1b / 1024)) КБ за 8 с — поток замерзает"
-    problems+=("TCP-поток замерзает после ~$((p1b / 1024)) КБ: заморозка на пути RELAY↔BACKEND (смена хостера/подсети, UDP-ветка Hysteria2 может работать)")
-  elif [ "$p1" -lt 100 ]; then res_line warn "TCP, 1 поток" "${p1} Мбит/с, retr ${p1r}"; warns+=("скорость одного потока ниже 100 Мбит/с")
-  else res_line ok "TCP, 1 поток" "${p1} Мбит/с, retr ${p1r}"; fi
-  # TCP 8 потоков
-  if [ "$p8" -lt 1 ]; then res_line fail "TCP, 8 потоков" "нет данных"
-  elif [ "$p8" -lt 100 ]; then res_line warn "TCP, 8 потоков" "${p8} Мбит/с, retr ${p8r}"; warns+=("суммарная скорость ниже 100 Мбит/с: лимит хостера или нагрузка процессора")
-  else res_line ok "TCP, 8 потоков" "${p8} Мбит/с, retr ${p8r}"; fi
-  # обратное направление
-  if [ "$rvb" -lt 200000 ] || [ "$rv" -lt 1 ]; then
-    res_line fail "TCP, обратное напр." "получено $((rvb / 1024)) КБ за 8 с — поток замерзает"
-    problems+=("в обратном направлении (BACKEND→RELAY) TCP-поток замерзает")
-  elif [ "$rv" -lt 100 ]; then res_line warn "TCP, обратное напр." "${rv} Мбит/с"; warns+=("скорость BACKEND→RELAY ниже 100 Мбит/с")
-  else res_line ok "TCP, обратное напр." "${rv} Мбит/с, retr ${rvr}"; fi
+  tcp_line "TCP, 1 поток" "$p1" "$p1b" "$p1r" "$p1e"
+  tcp_line "TCP, 8 потоков" "$p8" "$p8b" "$p8r" "$p8e"
+  tcp_line "TCP, обратное напр." "$rv" "$rvb" "$rvr" "$rve"
   # BBR
   if [ "$cc_r" = bbr ] && [ "$cc_b" = bbr ]; then res_line ok "BBR / fq" "RELAY: $cc_r/$qd_r, BACKEND: $cc_b/$qd_b"
-  else res_line warn "BBR / fq" "RELAY: ${cc_r:-?}/${qd_r:-?}, BACKEND: ${cc_b:-?}/${qd_b:-?}"; warns+=("BBR включён не на обоих серверах (запустите установку: твики применятся)"); fi
+  else res_line warn "BBR / fq" "RELAY: ${cc_r:-?}/${qd_r:-?}, BACKEND: ${cc_b:-?}/${qd_b:-?}"; warns+=("BBR недоступен на одном из серверов (ядро или виртуализация хостера)"); fi
   rule
-  # подсказки
-  if [ "$p1" -ge 1 ] && [ "$p1b" -ge 200000 ]; then
-    [ "$p8" -ge $((p1 * 3)) ] && [ "$p1" -lt 200 ] && warns+=("один поток заметно медленнее восьми: узким местом являются потери или окна TCP (включите BBR, используйте несколько соединений)")
+  # подсказки (только если TCP-тест реально прошёл)
+  if [ "$PORT_BAD" -eq 0 ] && [ -z "$p1e" ] && [ "$p1" -ge 1 ] && [ "$p1b" -ge 200000 ]; then
+    [ "$p8" -ge $((p1 * 3)) ] && [ "$p1" -lt 200 ] && warns+=("один поток заметно медленнее восьми: узким местом являются потери или окна TCP (используйте несколько соединений)")
     [ "$rv" -ge 1 ] && [ "$rv" -lt $((p1 * 3 / 10)) ] && warns+=("обратное направление в разы медленнее прямого: проверьте асимметрию канала/лимиты хостера")
     [ "$p1r" -gt 300 ] && warns+=("много повторных передач (${p1r}): потери пакетов на пути")
   fi
@@ -410,7 +445,7 @@ run_test() {
     for m in "${problems[@]}"; do echo "   ${RED}✖${R} $m"; done
     for m in "${warns[@]}"; do echo "   ${YLW}▲${R} $m"; done
   fi
-  echo "  ${DIM}Тест идёт напрямую RELAY→BACKEND, без туннеля rathole. Лог: $LOG${R}"
+  echo "  ${DIM}Тест идёт напрямую RELAY→BACKEND, без туннеля rathole. Сырые ответы iperf3: $LOG${R}"
   echo
 }
 
@@ -676,11 +711,7 @@ read_key() {
     tries=$((tries + 1))
     [ $tries -le 5 ] || die "ключ не получен за 5 попыток"
     echo "${B}?${R} Приватный ключ root для BACKEND: путь к файлу или вставьте ключ целиком ${DIM}(ввод скрыт)${R}"
-    if [ -n "$default_key" ]; then
-      echo "  ${DIM}Enter — использовать $default_key${R}"
-    else
-      echo "  ${DIM}На этом сервере нет ключа (/root/.ssh/id_*): укажите путь к файлу или вставьте ключ${R}"
-    fi
+    [ -n "$default_key" ] && echo "  ${DIM}Enter — использовать $default_key${R}"
     IFS= rd -r -s line
     echo
     line="${line//$'\r'/}"
