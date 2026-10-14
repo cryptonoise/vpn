@@ -11,7 +11,7 @@
 # Туннель rathole работает по TLS (свой CA, SNI = домен панели). Noise-транспорт не используется:
 # поток из случайных байт сам по себе выглядит подозрительно.
 #
-VERSION="1.3.2"
+VERSION="1.4.0"
 NAME="RELAY·BACKEND Tunnel Setup"
 
 set -u
@@ -325,34 +325,60 @@ PY
 res_line() {  # res_line статус(ok|warn|fail|info) "название" "значение"
   local ic
   case "$1" in ok) ic="${GRN}✔${R}" ;; warn) ic="${YLW}▲${R}" ;; fail) ic="${RED}✖${R}" ;; *) ic="${BLU}•${R}" ;; esac
-  local n=$((26 - ${#2}))
+  local n=$((34 - ${#2}))
   [ $n -lt 1 ] && n=1
   printf '  %s %s%s%*s%s %s\n' "$ic" "$DIM" "$2" "$n" "" "$R" "$3"
 }
 
 # оценка одного TCP-теста (массивы problems/warns — из run_test)
-tcp_line() {  # tcp_line "подпись" Мбит/с байт retr ошибка
-  local label="$1" mb="$2" by="$3" rt="$4" er="$5"
-  if [ "${PORT_BAD:-0}" = 1 ]; then
-    res_line fail "$label" "не выполнен: порт 5201 недоступен"
+tcp_line() {  # tcp_line "подпись" Мбит/с байт retr|- ошибка секунд порт_недоступен
+  local label="$1" mb="$2" by="$3" rt="$4" er="$5" secs="$6" bad="$7" extra=""
+  [ "$rt" != "-" ] && extra=", retr ${rt}"
+  if [ "$bad" = 1 ]; then
+    res_line fail "$label" "не выполнен: тестовый порт недоступен"
   elif [ -n "$er" ] && [ "$by" -lt 200000 ]; then
     res_line fail "$label" "не выполнен: $er"
     problems+=("$label: тест не выполнен — $er")
   elif [ "$by" -lt 200000 ] || [ "$mb" -lt 1 ]; then
-    res_line fail "$label" "получено $((by / 1024)) КБ за 8 с — поток замерзает"
-    problems+=("$label: TCP-поток замерзает после ~$((by / 1024)) КБ — заморозка на пути RELAY↔BACKEND (смена хостера/подсети; UDP-ветка Hysteria2 может работать)")
+    res_line fail "$label" "получено $((by / 1024)) КБ за ${secs} с — поток замерзает"
+    problems+=("$label: поток замерзает после ~$((by / 1024)) КБ (заморозка на пути RELAY↔BACKEND)")
   elif [ "$mb" -lt 100 ]; then
-    res_line warn "$label" "${mb} Мбит/с, retr ${rt}"
+    res_line warn "$label" "${mb} Мбит/с${extra}"
     warns+=("$label: скорость ниже 100 Мбит/с")
+  else
+    res_line ok "$label" "${mb} Мбит/с${extra}"
+  fi
+}
+
+# сырой TCP без TLS (iperf3): справочно — заморозка здесь не означает, что VPN не работает
+raw_line() {  # raw_line "подпись" Мбит/с байт retr ошибка
+  local label="$1" mb="$2" by="$3" rt="$4" er="$5"
+  if [ "${PORT_BAD:-0}" = 1 ]; then
+    res_line info "$label" "пропущен: порт 5201 недоступен"
+  elif [ -n "$er" ] && [ "$by" -lt 200000 ]; then
+    res_line info "$label" "не выполнен: $er"
+  elif [ "$by" -lt 200000 ] || [ "$mb" -lt 1 ]; then
+    RAW_FROZEN=1
+    res_line warn "$label" "режется: получено $((by / 1024)) КБ за 8 с (справочно)"
   else
     res_line ok "$label" "${mb} Мбит/с, retr ${rt}"
   fi
 }
 
+tls_run() {  # tls_run имя sni D|U потоков
+  timeout 45 python3 "$TMPD/tlstest-client.py" "$BACKEND_IP" 8444 "$2" "$3" "$4" 6 > "$TMPD/tls-$1.txt" 2>>"$LOG" || true
+  echo "--- tls $1 (sni=$2 $3 x$4): $(cat "$TMPD/tls-$1.txt" 2>/dev/null)" >> "$LOG"
+}
+
+tls_get() {  # tls_get имя → "Мбит/с байт ошибка"
+  local f="$TMPD/tls-$1.txt"
+  if [ -s "$f" ]; then head -n1 "$f"; else echo "0 0 нет ответа (таймаут или запуск не удался)"; fi
+}
+
 run_test() {
   STEP=0; TOTAL=6
   echo
-  echo "${B}Тест BACKEND (iperf3)${R}"
+  echo "${B}Тест BACKEND (iperf3 + TLS)${R}"
   thin
   ask_backend
   make_remote_scripts
@@ -375,25 +401,27 @@ run_test() {
   tune_network >>"$LOG" 2>&1
   rscript "$TMPD/tune.sh" >>"$LOG" 2>&1 || true
 
-  section "Тестовый сервер на BACKEND"
+  section "Тестовые серверы на BACKEND"
   IPERF_STARTED=1
   step_run "iperf3 -s (порт 5201 открыт только для RELAY)" rscript "$TMPD/iperf-server.sh" "$RELAY_IP" || die "не удалось запустить iperf3-сервер на BACKEND"
-  PORT_BAD=0
-  if timeout 6 bash -c ">/dev/tcp/$BACKEND_IP/5201" 2>/dev/null; then
-    ok "порт 5201 на BACKEND доступен с RELAY"
-  else
-    warn "порт 5201 на BACKEND недоступен с RELAY (firewall хостера или iperf3 не запущен)"
-    PORT_BAD=1
-  fi
+  step_run "TLS-сервер для теста (порт 8444 открыт только для RELAY)" rscript "$TMPD/tlstest-start.sh" "$RELAY_IP" || die "не удалось запустить TLS-сервер на BACKEND"
+  PORT_BAD=0; TLS_BAD=0
+  if timeout 6 bash -c ">/dev/tcp/$BACKEND_IP/5201" 2>/dev/null; then ok "порт 5201 на BACKEND доступен с RELAY"; else warn "порт 5201 на BACKEND недоступен с RELAY"; PORT_BAD=1; fi
+  if timeout 6 bash -c ">/dev/tcp/$BACKEND_IP/8444" 2>/dev/null; then ok "порт 8444 на BACKEND доступен с RELAY"; else warn "порт 8444 на BACKEND недоступен с RELAY (firewall хостера?)"; TLS_BAD=1; fi
+
+  local SNI_W="dl.google.com" SNI_DOM="${DOMAIN:-}"
+  [ -n "$SNI_DOM" ] || SNI_DOM=$(marker_get DOMAIN)
 
   section "Измерения (RELAY → BACKEND, напрямую, без туннеля)"
   step_run "ping, 10 пакетов" bash -c "ping -c 10 -i 0.3 -q '$BACKEND_IP' > '$TMPD/ping.txt' 2>&1 || true"
-  if [ "$PORT_BAD" -eq 0 ]; then
-    step_run "TCP, 1 поток (8 с)" iperf_run p1 -P 1
-    step_run "TCP, 8 потоков (8 с)" iperf_run p8 -P 8
-    step_run "TCP, обратное направление (8 с)" iperf_run rev -P 1 -R
+  [ "$PORT_BAD" -eq 0 ] && step_run "сырой TCP, iperf3, 1 поток (8 с)" iperf_run p1 -P 1
+  if [ "$TLS_BAD" -eq 0 ]; then
+    step_run "TLS, SNI $SNI_W, 1 поток (6 с)" tls_run g1 "$SNI_W" D 1
+    step_run "TLS, SNI $SNI_W, 4 потока (6 с)" tls_run g4 "$SNI_W" D 4
+    step_run "TLS, SNI $SNI_W, отдача на BACKEND (6 с)" tls_run gu "$SNI_W" U 1
+    [ -n "$SNI_DOM" ] && step_run "TLS, SNI $SNI_DOM, 1 поток (6 с)" tls_run d1 "$SNI_DOM" D 1
   else
-    warn "TCP-тесты пропущены: порт 5201 недоступен"
+    warn "TLS-тесты пропущены: порт 8444 недоступен"
   fi
 
   section "Сетевые параметры"
@@ -406,36 +434,53 @@ run_test() {
 
   section "Результаты"
   iperf_stop
-  local p1 p1b p1r p1e p8 p8b p8r p8e rv rvb rvr rve loss rtt
+  local p1 p1b p1r p1e g1 g1b g1e g4 g4b g4e gu gub gue d1 d1b d1e loss rtt
   read -r p1 p1b p1r p1e <<< "$(iperf_parse "$TMPD/iperf-p1.json")"
-  read -r p8 p8b p8r p8e <<< "$(iperf_parse "$TMPD/iperf-p8.json")"
-  read -r rv rvb rvr rve <<< "$(iperf_parse "$TMPD/iperf-rev.json")"
+  read -r g1 g1b g1e <<< "$(tls_get g1)"
+  read -r g4 g4b g4e <<< "$(tls_get g4)"
+  read -r gu gub gue <<< "$(tls_get gu)"
+  read -r d1 d1b d1e <<< "$(tls_get d1)"
   loss=$(grep -oE '[0-9.]+% packet loss' "$TMPD/ping.txt" | head -n1 | cut -d% -f1)
   rtt=$(grep -oE '= [0-9.]+/[0-9.]+/' "$TMPD/ping.txt" | head -n1 | cut -d/ -f2)
   loss="${loss:-100}"; rtt="${rtt:-?}"; rtt="${rtt%.*}"
 
-  local problems=() warns=()
-  [ "$PORT_BAD" -eq 1 ] && problems+=("порт 5201 на BACKEND недоступен с RELAY: проверьте firewall хостера (в ufw порт уже открыт для RELAY)")
+  local problems=() warns=() notes=()
+  RAW_FROZEN=0; DOM_FROZEN=0
+  local g1ok=0
+  [ "$TLS_BAD" -eq 0 ] && [ -z "$g1e" ] && [ "$g1b" -ge 200000 ] && [ "$g1" -ge 1 ] && g1ok=1
+  [ "$PORT_BAD" -eq 1 ] && notes+=("порт 5201 недоступен с RELAY — сырой TCP-тест (iperf3) пропущен")
+  [ "$TLS_BAD" -eq 1 ] && problems+=("порт 8444 на BACKEND недоступен с RELAY: проверьте firewall хостера (в ufw порт уже открыт для RELAY)")
   echo
   rule
   printf '  %sРезультаты теста BACKEND %s%s\n' "$B" "$BACKEND_IP" "$R"
   rule
-  # канал
   if [ "${loss%.*}" -ge 5 ]; then res_line fail "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; problems+=("потери пакетов ${loss}% на пути до BACKEND")
   elif [ "${loss%.*}" -ge 1 ]; then res_line warn "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; warns+=("есть потери пакетов (${loss}%)")
   else res_line ok "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; fi
-  tcp_line "TCP, 1 поток" "$p1" "$p1b" "$p1r" "$p1e"
-  tcp_line "TCP, 8 потоков" "$p8" "$p8b" "$p8r" "$p8e"
-  tcp_line "TCP, обратное напр." "$rv" "$rvb" "$rvr" "$rve"
-  # BBR
+  raw_line "Сырой TCP (iperf3)" "$p1" "$p1b" "$p1r" "$p1e"
+  tcp_line "TLS $SNI_W, 1 поток" "$g1" "$g1b" "-" "$g1e" 6 "$TLS_BAD"
+  tcp_line "TLS $SNI_W, 4 потока" "$g4" "$g4b" "-" "$g4e" 6 "$TLS_BAD"
+  tcp_line "TLS $SNI_W, отдача" "$gu" "$gub" "-" "$gue" 6 "$TLS_BAD"
+  if [ -n "$SNI_DOM" ]; then
+    if [ $g1ok -eq 1 ] && { [ -n "$d1e" ] || [ "$d1b" -lt 200000 ] || [ "$d1" -lt 1 ]; }; then
+      DOM_FROZEN=1
+      res_line warn "TLS $SNI_DOM, 1 поток" "замерзает (получено $((d1b / 1024)) КБ за 6 с)"
+    else
+      tcp_line "TLS $SNI_DOM, 1 поток" "$d1" "$d1b" "-" "$d1e" 6 "$TLS_BAD"
+    fi
+  fi
   if [ "$cc_r" = bbr ] && [ "$cc_b" = bbr ]; then res_line ok "BBR / fq" "RELAY: $cc_r/$qd_r, BACKEND: $cc_b/$qd_b"
   else res_line warn "BBR / fq" "RELAY: ${cc_r:-?}/${qd_r:-?}, BACKEND: ${cc_b:-?}/${qd_b:-?}"; warns+=("BBR недоступен на одном из серверов (ядро или виртуализация хостера)"); fi
   rule
-  # подсказки (только если TCP-тест реально прошёл)
-  if [ "$PORT_BAD" -eq 0 ] && [ -z "$p1e" ] && [ "$p1" -ge 1 ] && [ "$p1b" -ge 200000 ]; then
-    [ "$p8" -ge $((p1 * 3)) ] && [ "$p1" -lt 200 ] && warns+=("один поток заметно медленнее восьми: узким местом являются потери или окна TCP (используйте несколько соединений)")
-    [ "$rv" -ge 1 ] && [ "$rv" -lt $((p1 * 3 / 10)) ] && warns+=("обратное направление в разы медленнее прямого: проверьте асимметрию канала/лимиты хостера")
-    [ "$p1r" -gt 300 ] && warns+=("много повторных передач (${p1r}): потери пакетов на пути")
+
+  # выводы
+  if [ $g1ok -eq 1 ]; then
+    [ "$RAW_FROZEN" -eq 1 ] && notes+=("сырой TCP без TLS режется, а TLS с SNI $SNI_W проходит — для VPN это нормально: трафик VLESS/Reality выглядит как TLS, и заморозка на него не действует")
+    if [ "$DOM_FROZEN" -eq 1 ]; then
+      warns+=("SNI вашего домена ($SNI_DOM) замораживается, а $SNI_W проходит: туннелю rathole (TLS с SNI домена) может понадобиться «белый» SNI")
+    fi
+    [ -z "$g4e" ] && [ "$g4" -ge $((g1 * 3)) ] && [ "$g1" -lt 200 ] && warns+=("один TLS-поток заметно медленнее четырёх: узким местом являются потери или окна TCP (используйте несколько соединений)")
+    [ -z "$gue" ] && [ "$gu" -ge 1 ] && [ "$gu" -lt $((g1 * 3 / 10)) ] && warns+=("отдача на BACKEND в разы медленнее скачивания: проверьте асимметрию канала/лимиты хостера")
   fi
   local m
   if [ ${#problems[@]} -eq 0 ] && [ ${#warns[@]} -eq 0 ]; then
@@ -445,7 +490,8 @@ run_test() {
     for m in "${problems[@]}"; do echo "   ${RED}✖${R} $m"; done
     for m in "${warns[@]}"; do echo "   ${YLW}▲${R} $m"; done
   fi
-  echo "  ${DIM}Тест идёт напрямую RELAY→BACKEND, без туннеля rathole. Сырые ответы iperf3: $LOG${R}"
+  for m in "${notes[@]}"; do echo "   ${BLU}•${R} $m"; done
+  echo "  ${DIM}Тест идёт напрямую RELAY→BACKEND, без туннеля rathole. Сырые ответы: $LOG${R}"
   echo
 }
 
@@ -745,7 +791,7 @@ read_key() {
 # IP, SSH-порт и ключ для доступа к BACKEND (используется в тесте и удалении)
 ask_backend() {
   while true; do
-    ask BACKEND_IP "IP BACKEND" "${BACKEND_IP:-}"
+    ask BACKEND_IP "IP BACKEND" ""
     valid_ip "$BACKEND_IP" && break
     fail "неверный IP"
     BACKEND_IP=""
@@ -1155,7 +1201,101 @@ EOF
 RELAY="$1"
 if [ -f /run/relay-iperf3.pid ]; then kill "$(cat /run/relay-iperf3.pid)" 2>/dev/null || true; rm -f /run/relay-iperf3.pid; fi
 if [ -f /run/relay-iperf.fw ]; then ufw delete allow from "$RELAY" to any port 5201 proto tcp >/dev/null 2>&1 || true; rm -f /run/relay-iperf.fw; fi
+if [ -f /run/relay-tls.pid ]; then kill "$(cat /run/relay-tls.pid)" 2>/dev/null || true; rm -f /run/relay-tls.pid /run/relay-tls-srv.py /run/relay-tls.key /run/relay-tls.crt; fi
+if [ -f /run/relay-tls.fw ]; then ufw delete allow from "$RELAY" to any port 8444 proto tcp >/dev/null 2>&1 || true; rm -f /run/relay-tls.fw; fi
 true
+EOF
+
+  cat > "$D/tlstest-start.sh" <<'EOF'
+set -e
+RELAY="$1"
+rm -f /run/relay-tls.fw
+if ufw status 2>/dev/null | grep -q '^Status: active'; then
+  ufw allow from "$RELAY" to any port 8444 proto tcp >/dev/null
+  touch /run/relay-tls.fw
+fi
+if [ -f /run/relay-tls.pid ]; then kill "$(cat /run/relay-tls.pid)" 2>/dev/null || true; fi
+openssl req -x509 -newkey rsa:2048 -nodes -keyout /run/relay-tls.key -out /run/relay-tls.crt -days 1 -subj "/CN=localhost" >/dev/null 2>&1
+cat > /run/relay-tls-srv.py <<'PYEOF'
+import socket, ssl, threading, time
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain("/run/relay-tls.crt", "/run/relay-tls.key")
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("0.0.0.0", 8444))
+srv.listen(64)
+chunk = b"x" * 65536
+
+def handle(c):
+    try:
+        c = ctx.wrap_socket(c, server_side=True)
+        c.settimeout(15)
+        mode = c.recv(1)
+        end = time.time() + 12
+        if mode == b"D":
+            while time.time() < end:
+                c.sendall(chunk)
+        elif mode == b"U":
+            while time.time() < end:
+                if not c.recv(65536):
+                    break
+    except Exception:
+        pass
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+PYEOF
+nohup python3 /run/relay-tls-srv.py >/dev/null 2>&1 &
+echo $! > /run/relay-tls.pid
+sleep 1
+ss -tlnH | grep -q ':8444 '
+EOF
+
+  # клиент TLS-теста (запускается на RELAY): "Мбит/с байт ошибка"
+  cat > "$D/tlstest-client.py" <<'EOF'
+import socket, ssl, sys, threading, time
+host, port, sni, mode, n, secs = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5]), float(sys.argv[6])
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+total = [0] * n
+errs = [""] * n
+
+def worker(i):
+    try:
+        s = socket.create_connection((host, port), timeout=8)
+        t = ctx.wrap_socket(s, server_hostname=sni)
+        t.settimeout(5)
+        t.sendall(mode.encode())
+        end = time.time() + secs
+        buf = b"x" * 65536
+        while time.time() < end:
+            if mode == "D":
+                d = t.recv(262144)
+                if not d:
+                    break
+                total[i] += len(d)
+            else:
+                t.sendall(buf)
+                total[i] += len(buf)
+    except Exception as e:
+        errs[i] = (type(e).__name__ + ": " + str(e))[:70].replace("\n", " ")
+
+th = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+t0 = time.time()
+for x in th:
+    x.start()
+for x in th:
+    x.join(secs + 12)
+el = max(time.time() - t0, 0.001)
+b = sum(total)
+print(int(b * 8 / el / 1e6), b, next((e for e in errs if e), ""))
 EOF
 
   cat > "$D/uninstall-backend.sh" <<'EOF'
@@ -1286,7 +1426,7 @@ run_install() {
   echo "${B}Параметры${R}"
   thin
   while true; do
-    ask BACKEND_IP "IP BACKEND" "${BACKEND_IP:-}"
+    ask BACKEND_IP "IP BACKEND" ""
     if [ "$BACKEND_IP" = "$RELAY_IP" ]; then fail "IP BACKEND совпадает с IP этого сервера"; BACKEND_IP=""; continue; fi
     valid_ip "$BACKEND_IP" && break
     fail "неверный IP"
