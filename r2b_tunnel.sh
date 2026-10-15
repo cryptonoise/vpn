@@ -11,7 +11,7 @@
 # Туннель rathole работает по TLS (свой CA, SNI = домен панели). Noise-транспорт не используется:
 # поток из случайных байт сам по себе выглядит подозрительно.
 #
-VERSION="1.4.0"
+VERSION="1.5.0"
 NAME="RELAY·BACKEND Tunnel Setup"
 
 set -u
@@ -331,20 +331,27 @@ res_line() {  # res_line статус(ok|warn|fail|info) "название" "з�
 }
 
 # оценка одного TCP-теста (массивы problems/warns — из run_test)
-tcp_line() {  # tcp_line "подпись" Мбит/с байт retr|- ошибка секунд порт_недоступен
-  local label="$1" mb="$2" by="$3" rt="$4" er="$5" secs="$6" bad="$7" extra=""
+tcp_line() {  # tcp_line "подпись" Мбит/с байт retr|- ошибка секунд порт_недоступен [тихо]
+  local label="$1" mb="$2" by="$3" rt="$4" er="$5" secs="$6" bad="$7" quiet="${8:-0}" extra=""
   [ "$rt" != "-" ] && extra=", retr ${rt}"
   if [ "$bad" = 1 ]; then
     res_line fail "$label" "не выполнен: тестовый порт недоступен"
+  elif [ "$er" = "STALL" ]; then
+    if [[ "$label" == *отдача* ]]; then
+      res_line fail "$label" "данные перестали уходить (поток встал)"
+    else
+      res_line fail "$label" "получено $((by / 1024)) КБ, затем данные перестали идти"
+    fi
+    [ "$quiet" = 1 ] || problems+=("$label: поток встаёт (получено ~$((by / 1024)) КБ)")
   elif [ -n "$er" ] && [ "$by" -lt 200000 ]; then
     res_line fail "$label" "не выполнен: $er"
-    problems+=("$label: тест не выполнен — $er")
+    [ "$quiet" = 1 ] || problems+=("$label: тест не выполнен — $er")
   elif [ "$by" -lt 200000 ] || [ "$mb" -lt 1 ]; then
     res_line fail "$label" "получено $((by / 1024)) КБ за ${secs} с — поток замерзает"
-    problems+=("$label: поток замерзает после ~$((by / 1024)) КБ (заморозка на пути RELAY↔BACKEND)")
+    [ "$quiet" = 1 ] || problems+=("$label: поток замерзает после ~$((by / 1024)) КБ")
   elif [ "$mb" -lt 100 ]; then
     res_line warn "$label" "${mb} Мбит/с${extra}"
-    warns+=("$label: скорость ниже 100 Мбит/с")
+    [ "$quiet" = 1 ] || warns+=("$label: скорость ниже 100 Мбит/с")
   else
     res_line ok "$label" "${mb} Мбит/с${extra}"
   fi
@@ -365,9 +372,28 @@ raw_line() {  # raw_line "подпись" Мбит/с байт retr ошибка
   fi
 }
 
-tls_run() {  # tls_run имя sni D|U потоков
-  timeout 45 python3 "$TMPD/tlstest-client.py" "$BACKEND_IP" 8444 "$2" "$3" "$4" 6 > "$TMPD/tls-$1.txt" 2>>"$LOG" || true
-  echo "--- tls $1 (sni=$2 $3 x$4): $(cat "$TMPD/tls-$1.txt" 2>/dev/null)" >> "$LOG"
+tls_run() {  # tls_run имя sni D|U потоков [mss]
+  timeout 45 python3 "$TMPD/tlstest-client.py" "$BACKEND_IP" 8444 "$2" "$3" "$4" 6 "${5:-0}" > "$TMPD/tls-$1.txt" 2>>"$LOG" || true
+  echo "--- tls $1 (sni=$2 $3 x$4 mss=${5:-0}): $(cat "$TMPD/tls-$1.txt" 2>/dev/null)" >> "$LOG"
+}
+
+tls_pass() {  # tls_pass имя → 0, если получено ≥200 КБ
+  local a b
+  read -r a b _ < "$TMPD/tls-$1.txt" 2>/dev/null || return 1
+  [ "${b:-0}" -ge 200000 ]
+}
+
+# наибольший размер пакета, проходящий без фрагментации (MTU пути)
+mtu_probe() {
+  local sz
+  : > "$TMPD/mtu.txt"
+  for sz in 1472 1452 1432 1412 1392 1372 1352 1300 1200; do
+    if ping -c 1 -W 1 -M "do" -s "$sz" -q "$BACKEND_IP" >/dev/null 2>&1; then
+      echo $((sz + 28)) > "$TMPD/mtu.txt"
+      return 0
+    fi
+  done
+  echo 0 > "$TMPD/mtu.txt"
 }
 
 tls_get() {  # tls_get имя → "Мбит/с байт ошибка"
@@ -414,40 +440,58 @@ run_test() {
 
   section "Измерения (RELAY → BACKEND, напрямую, без туннеля)"
   step_run "ping, 10 пакетов" bash -c "ping -c 10 -i 0.3 -q '$BACKEND_IP' > '$TMPD/ping.txt' 2>&1 || true"
-  [ "$PORT_BAD" -eq 0 ] && step_run "сырой TCP, iperf3, 1 поток (8 с)" iperf_run p1 -P 1
+  step_run "MTU пути (ping с запретом фрагментации)" mtu_probe
+  if [ "$PORT_BAD" -eq 0 ]; then
+    step_run "сырой TCP, iperf3, 1 поток (8 с)" iperf_run p1 -P 1
+    step_run "сырой TCP, iperf3, MSS 1200 (8 с)" iperf_run pm -P 1 -M 1200
+  fi
   if [ "$TLS_BAD" -eq 0 ]; then
     step_run "TLS, SNI $SNI_W, 1 поток (6 с)" tls_run g1 "$SNI_W" D 1
-    step_run "TLS, SNI $SNI_W, 4 потока (6 с)" tls_run g4 "$SNI_W" D 4
-    step_run "TLS, SNI $SNI_W, отдача на BACKEND (6 с)" tls_run gu "$SNI_W" U 1
-    [ -n "$SNI_DOM" ] && step_run "TLS, SNI $SNI_DOM, 1 поток (6 с)" tls_run d1 "$SNI_DOM" D 1
+    step_run "TLS, SNI $SNI_W, MSS 1200 (6 с)" tls_run gm "$SNI_W" D 1 1200
+    if tls_pass g1 || tls_pass gm; then
+      step_run "TLS, SNI $SNI_W, 4 потока (6 с)" tls_run g4 "$SNI_W" D 4
+      step_run "TLS, SNI $SNI_W, отдача на BACKEND (6 с)" tls_run gu "$SNI_W" U 1
+      [ -n "$SNI_DOM" ] && step_run "TLS, SNI $SNI_DOM, 1 поток (6 с)" tls_run d1 "$SNI_DOM" D 1
+    else
+      info "потоки не идут ни с обычным MSS, ни с MSS 1200 — остальные TLS-тесты пропущены"
+    fi
   else
     warn "TLS-тесты пропущены: порт 8444 недоступен"
   fi
 
   section "Сетевые параметры"
-  local cc_r cc_b qd_r qd_b
+  local cc_r cc_b qd_r qd_b dev_r dev_b mtu_r mtu_b
   cc_r=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
   qd_r=$(sysctl -n net.core.default_qdisc 2>/dev/null)
   cc_b=$(bk 'sysctl -n net.ipv4.tcp_congestion_control' 2>>"$LOG")
   qd_b=$(bk 'sysctl -n net.core.default_qdisc' 2>>"$LOG")
   ok "RELAY: ${cc_r:-?} / ${qd_r:-?}   BACKEND: ${cc_b:-?} / ${qd_b:-?}"
+  dev_r=$(ip route get "$BACKEND_IP" 2>/dev/null | grep -oP 'dev \K\S+' | head -n1)
+  mtu_r=$(cat "/sys/class/net/${dev_r:-none}/mtu" 2>/dev/null)
+  dev_b=$(bk "ip route get $RELAY_IP | grep -oP 'dev \K\S+' | head -n1" 2>>"$LOG")
+  mtu_b=$(bk "cat /sys/class/net/${dev_b:-none}/mtu" 2>>"$LOG")
+  ok "MTU интерфейсов: RELAY ${dev_r:-?}=${mtu_r:-?}, BACKEND ${dev_b:-?}=${mtu_b:-?}"
 
   section "Результаты"
   iperf_stop
-  local p1 p1b p1r p1e g1 g1b g1e g4 g4b g4e gu gub gue d1 d1b d1e loss rtt
+  local p1 p1b p1r p1e pm pmb pmr pme g1 g1b g1e gm gmb gme g4 g4b g4e gu gub gue d1 d1b d1e loss rtt pmtu
   read -r p1 p1b p1r p1e <<< "$(iperf_parse "$TMPD/iperf-p1.json")"
+  read -r pm pmb pmr pme <<< "$(iperf_parse "$TMPD/iperf-pm.json")"
   read -r g1 g1b g1e <<< "$(tls_get g1)"
+  read -r gm gmb gme <<< "$(tls_get gm)"
   read -r g4 g4b g4e <<< "$(tls_get g4)"
   read -r gu gub gue <<< "$(tls_get gu)"
   read -r d1 d1b d1e <<< "$(tls_get d1)"
   loss=$(grep -oE '[0-9.]+% packet loss' "$TMPD/ping.txt" | head -n1 | cut -d% -f1)
   rtt=$(grep -oE '= [0-9.]+/[0-9.]+/' "$TMPD/ping.txt" | head -n1 | cut -d/ -f2)
   loss="${loss:-100}"; rtt="${rtt:-?}"; rtt="${rtt%.*}"
+  pmtu=$(cat "$TMPD/mtu.txt" 2>/dev/null); pmtu="${pmtu:-0}"
 
   local problems=() warns=() notes=()
   RAW_FROZEN=0; DOM_FROZEN=0
-  local g1ok=0
-  [ "$TLS_BAD" -eq 0 ] && [ -z "$g1e" ] && [ "$g1b" -ge 200000 ] && [ "$g1" -ge 1 ] && g1ok=1
+  local g1p=0 gmp=0
+  [ "$TLS_BAD" -eq 0 ] && [ -z "$g1e" ] && [ "$g1b" -ge 200000 ] && [ "$g1" -ge 1 ] && g1p=1
+  [ "$TLS_BAD" -eq 0 ] && [ -z "$gme" ] && [ "$gmb" -ge 200000 ] && [ "$gm" -ge 1 ] && gmp=1
   [ "$PORT_BAD" -eq 1 ] && notes+=("порт 5201 недоступен с RELAY — сырой TCP-тест (iperf3) пропущен")
   [ "$TLS_BAD" -eq 1 ] && problems+=("порт 8444 на BACKEND недоступен с RELAY: проверьте firewall хостера (в ufw порт уже открыт для RELAY)")
   echo
@@ -457,34 +501,56 @@ run_test() {
   if [ "${loss%.*}" -ge 5 ]; then res_line fail "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; problems+=("потери пакетов ${loss}% на пути до BACKEND")
   elif [ "${loss%.*}" -ge 1 ]; then res_line warn "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; warns+=("есть потери пакетов (${loss}%)")
   else res_line ok "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; fi
+  if [ "$pmtu" -ge 1500 ]; then res_line ok "MTU пути" "1500 (без фрагментации)"
+  elif [ "$pmtu" -gt 0 ]; then res_line warn "MTU пути" "$pmtu (меньше 1500)"
+  else res_line warn "MTU пути" "не определён (ICMP с запретом фрагментации не проходит)"; fi
   raw_line "Сырой TCP (iperf3)" "$p1" "$p1b" "$p1r" "$p1e"
-  tcp_line "TLS $SNI_W, 1 поток" "$g1" "$g1b" "-" "$g1e" 6 "$TLS_BAD"
-  tcp_line "TLS $SNI_W, 4 потока" "$g4" "$g4b" "-" "$g4e" 6 "$TLS_BAD"
-  tcp_line "TLS $SNI_W, отдача" "$gu" "$gub" "-" "$gue" 6 "$TLS_BAD"
-  if [ -n "$SNI_DOM" ]; then
-    if [ $g1ok -eq 1 ] && { [ -n "$d1e" ] || [ "$d1b" -lt 200000 ] || [ "$d1" -lt 1 ]; }; then
-      DOM_FROZEN=1
-      res_line warn "TLS $SNI_DOM, 1 поток" "замерзает (получено $((d1b / 1024)) КБ за 6 с)"
-    else
-      tcp_line "TLS $SNI_DOM, 1 поток" "$d1" "$d1b" "-" "$d1e" 6 "$TLS_BAD"
+  raw_line "Сырой TCP, MSS 1200" "$pm" "$pmb" "$pmr" "$pme"
+  tcp_line "TLS $SNI_W, 1 поток" "$g1" "$g1b" "-" "$g1e" 6 "$TLS_BAD" 1
+  tcp_line "TLS $SNI_W, MSS 1200" "$gm" "$gmb" "-" "$gme" 6 "$TLS_BAD" 1
+  if [ $g1p -eq 1 ] || [ $gmp -eq 1 ]; then
+    tcp_line "TLS $SNI_W, 4 потока" "$g4" "$g4b" "-" "$g4e" 6 "$TLS_BAD"
+    tcp_line "TLS $SNI_W, отдача" "$gu" "$gub" "-" "$gue" 6 "$TLS_BAD"
+    if [ -n "$SNI_DOM" ]; then
+      if [ $g1p -eq 1 ] && { [ -n "$d1e" ] || [ "$d1b" -lt 200000 ] || [ "$d1" -lt 1 ]; }; then
+        DOM_FROZEN=1
+        res_line warn "TLS $SNI_DOM, 1 поток" "встаёт (получено $((d1b / 1024)) КБ за 6 с)"
+      else
+        tcp_line "TLS $SNI_DOM, 1 поток" "$d1" "$d1b" "-" "$d1e" 6 "$TLS_BAD"
+      fi
     fi
   fi
   if [ "$cc_r" = bbr ] && [ "$cc_b" = bbr ]; then res_line ok "BBR / fq" "RELAY: $cc_r/$qd_r, BACKEND: $cc_b/$qd_b"
   else res_line warn "BBR / fq" "RELAY: ${cc_r:-?}/${qd_r:-?}, BACKEND: ${cc_b:-?}/${qd_b:-?}"; warns+=("BBR недоступен на одном из серверов (ядро или виртуализация хостера)"); fi
+  # главный вывод: есть ли блокировка по объёму (16–20 КБ)
+  local mtu_fix=1400
+  [ "$pmtu" -gt 0 ] && [ "$pmtu" -lt 1400 ] && mtu_fix="$pmtu"
+  if [ "$TLS_BAD" -eq 1 ]; then
+    res_line warn "Блокировка по 16 КБ" "не проверена: тестовый порт недоступен"
+  elif [ $g1p -eq 1 ]; then
+    res_line ok "Блокировка по 16 КБ" "нет: TLS-поток идёт полностью"
+  elif [ $gmp -eq 1 ]; then
+    res_line warn "Блокировка по 16 КБ" "нет, но проблема MTU/PMTUD"
+    problems+=("с обычным MSS поток встаёт (~$((g1b / 1024)) КБ), с MSS 1200 идёт: это не блокировка по объёму, а потеря крупных пакетов (MTU/PMTUD)")
+    notes+=("исправление: на ОБОИХ серверах уменьшить MTU, например: ip link set dev ${dev_r:-eth0} mtu ${mtu_fix} (RELAY) и ip link set dev ${dev_b:-eth0} mtu ${mtu_fix} (BACKEND); затем повторить тест (для постоянного эффекта — прописать MTU в netplan)")
+  else
+    res_line fail "Блокировка по 16 КБ" "ДА: поток встаёт после ~$((g1b / 1024)) КБ даже с MSS 1200"
+    problems+=("поток встаёт после ~$((g1b / 1024)) КБ и с обычным MSS, и с MSS 1200 — это блокировка/заморозка по объёму, не MTU (у хостера или на пути до него)")
+  fi
   rule
 
   # выводы
-  if [ $g1ok -eq 1 ]; then
-    [ "$RAW_FROZEN" -eq 1 ] && notes+=("сырой TCP без TLS режется, а TLS с SNI $SNI_W проходит — для VPN это нормально: трафик VLESS/Reality выглядит как TLS, и заморозка на него не действует")
+  if [ $g1p -eq 1 ] || [ $gmp -eq 1 ]; then
+    [ "$RAW_FROZEN" -eq 1 ] && [ $g1p -eq 1 ] && notes+=("сырой TCP без TLS режется, а TLS с SNI $SNI_W проходит — для VPN это нормально: трафик VLESS/Reality выглядит как TLS, и заморозка на него не действует")
     if [ "$DOM_FROZEN" -eq 1 ]; then
-      warns+=("SNI вашего домена ($SNI_DOM) замораживается, а $SNI_W проходит: туннелю rathole (TLS с SNI домена) может понадобиться «белый» SNI")
+      warns+=("SNI вашего домена ($SNI_DOM) встаёт, а $SNI_W проходит: туннелю rathole (TLS с SNI домена) может понадобиться «белый» SNI")
     fi
-    [ -z "$g4e" ] && [ "$g4" -ge $((g1 * 3)) ] && [ "$g1" -lt 200 ] && warns+=("один TLS-поток заметно медленнее четырёх: узким местом являются потери или окна TCP (используйте несколько соединений)")
-    [ -z "$gue" ] && [ "$gu" -ge 1 ] && [ "$gu" -lt $((g1 * 3 / 10)) ] && warns+=("отдача на BACKEND в разы медленнее скачивания: проверьте асимметрию канала/лимиты хостера")
+    [ -z "$g4e" ] && [ "$g4" -ge $((g1 * 3)) ] && [ "$g1" -ge 1 ] && [ "$g1" -lt 200 ] && warns+=("один TLS-поток заметно медленнее четырёх: узким местом являются потери или окна TCP (используйте несколько соединений)")
+    [ -z "$gue" ] && [ "$gu" -ge 1 ] && [ "$g1" -ge 1 ] && [ "$gu" -lt $((g1 * 3 / 10)) ] && warns+=("отдача на BACKEND в разы медленнее скачивания: проверьте асимметрию канала/лимиты хостера")
   fi
   local m
   if [ ${#problems[@]} -eq 0 ] && [ ${#warns[@]} -eq 0 ]; then
-    echo "  ${GRN}${B}Итог: всё в порядке.${R} Канал между серверами не ограничивает скорость."
+    echo "  ${GRN}${B}Итог: всё в порядке.${R} Блокировки по объёму нет, канал между серверами не ограничивает скорость."
   else
     if [ ${#problems[@]} -gt 0 ]; then echo "  ${RED}${B}Итог: найдены проблемы:${R}"; else echo "  ${YLW}${B}Итог: есть замечания:${R}"; fi
     for m in "${problems[@]}"; do echo "   ${RED}✖${R} $m"; done
@@ -1261,6 +1327,7 @@ EOF
   cat > "$D/tlstest-client.py" <<'EOF'
 import socket, ssl, sys, threading, time
 host, port, sni, mode, n, secs = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5]), float(sys.argv[6])
+mss = int(sys.argv[7]) if len(sys.argv) > 7 else 0
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
@@ -1268,10 +1335,17 @@ total = [0] * n
 errs = [""] * n
 
 def worker(i):
+    phase = "CONNECT"
     try:
-        s = socket.create_connection((host, port), timeout=8)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if mss:
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, mss)
+        s.settimeout(8)
+        s.connect((host, port))
+        phase = "HANDSHAKE"
         t = ctx.wrap_socket(s, server_hostname=sni)
         t.settimeout(5)
+        phase = "DATA"
         t.sendall(mode.encode())
         end = time.time() + secs
         buf = b"x" * 65536
@@ -1284,8 +1358,14 @@ def worker(i):
             else:
                 t.sendall(buf)
                 total[i] += len(buf)
+    except (socket.timeout, TimeoutError):
+        errs[i] = "STALL" if phase == "DATA" else phase + ": timeout"
     except Exception as e:
-        errs[i] = (type(e).__name__ + ": " + str(e))[:70].replace("\n", " ")
+        msg = str(e)
+        if phase == "DATA" and "timed out" in msg:
+            errs[i] = "STALL"
+        else:
+            errs[i] = phase + ": " + type(e).__name__ + " " + msg[:50].replace("\n", " ")
 
 th = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
 t0 = time.time()
