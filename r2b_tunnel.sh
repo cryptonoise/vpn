@@ -754,30 +754,20 @@ tls_probe() {  # tls_probe IP порт [SNI]
   else echo notls; fi
 }
 
-run_ipcheck() {
-  STEP=0; TOTAL=5
-  local ip ports=() p x i n_ok last_rc rc ms lastms
+# метка сервера в итогах: RELAY / BACKEND, если IP совпадает с известным
+srv_label() {
+  if [ "$1" = "${RELAY_IP:-}" ]; then echo "RELAY"
+  elif [ "$1" = "${BACKEND_IP:-}" ]; then echo "BACKEND"
+  fi
+}
+
+ipcheck_one() {  # ipcheck_one IP  (ports, SUM_* — из run_ipcheck)
+  local ip="$1"
+  STEP=0; TOTAL=4
+  local p x i n_ok last_rc rc ms lastms
   local -A LST=() OKP=()
   local problems=() warns=() notes=()
-  echo
-  echo "${B}Проверка IP на блокировки (без доступа к серверу)${R}"
-  thin
-  info "проверка идёт с этого сервера и со сторонних узлов check-host.net; на проверяемый сервер заходить не нужно"
-  while true; do
-    ask CHK_IP "IP-адрес для проверки"
-    valid_ip "$CHK_IP" && break
-    fail "некорректный IPv4-адрес"
-  done
-  ip="$CHK_IP"
-  [ "$ip" = "${RELAY_IP:-}" ] && warn "это IP самого RELAY — проверка не имеет смысла"
-  while true; do
-    ask CHK_PORTS "TCP-порты через запятую (до 4)" "22,443"
-    ports=(); x=1
-    IFS=',' read -ra arr <<< "${CHK_PORTS// /}"
-    for p in "${arr[@]}"; do valid_port "$p" && ports+=("$p") || x=0; done
-    [ $x -eq 1 ] && [ ${#ports[@]} -gt 0 ] && [ ${#ports[@]} -le 4 ] && break
-    fail "укажите от 1 до 4 портов (1–65535), например 22,443"
-  done
+  [ "$ip" = "${RELAY_IP:-}" ] && warn "это IP самого RELAY — проверка отсюда не имеет смысла"
   : > "$TMPD/ipcheck.log"
 
   # ── 1. ping и трассировка
@@ -905,10 +895,10 @@ PYEOF
   for p in "${ports[@]:0:3}"; do
     echo "  ${DIM}порт $p: опрашиваю узлы (около 20 секунд)…${R}"
     ru_ok=0; ru_tot=0; w_ok=0; w_tot=0
-    python3 "$TMPD/chk.py" "$ip" "$p" > "$TMPD/chk-$p.txt" 2>>"$LOG"
-    cat "$TMPD/chk-$p.txt" >>"$LOG"
-    if [ ! -s "$TMPD/chk-$p.txt" ] || grep -q '^ERR|' "$TMPD/chk-$p.txt"; then
-      res_line warn "check-host.net :$p" "недоступен: $(sed -n 's/^ERR|//p' "$TMPD/chk-$p.txt" | head -n1)"
+    python3 "$TMPD/chk.py" "$ip" "$p" > "$TMPD/chk-$ip-$p.txt" 2>>"$LOG"
+    cat "$TMPD/chk-$ip-$p.txt" >>"$LOG"
+    if [ ! -s "$TMPD/chk-$ip-$p.txt" ] || grep -q '^ERR|' "$TMPD/chk-$ip-$p.txt"; then
+      res_line warn "check-host.net :$p" "недоступен: $(sed -n 's/^ERR|//p' "$TMPD/chk-$ip-$p.txt" | head -n1)"
       continue
     fi
     CH_OK=1
@@ -918,28 +908,12 @@ PYEOF
       else w_tot=$((w_tot + 1)); [ "$st" = ok ] && w_ok=$((w_ok + 1)); fi
       if [ "$st" = ok ]; then res_line ok "$([ "$g" = RU ] && echo РФ || echo Мир) :$p, $pl" "$dt"
       else res_line fail "$([ "$g" = RU ] && echo РФ || echo Мир) :$p, $pl" "$dt"; fi
-    done < "$TMPD/chk-$p.txt"
+    done < "$TMPD/chk-$ip-$p.txt"
     RUOK[$p]=$ru_ok; RUT[$p]=$ru_tot; WOK[$p]=$w_ok; WT[$p]=$w_tot
     cnt=$((cnt + 1))
   done
 
-  # ── 5. реестр блокировок
-  section "Реестр блокировок (справочно)"
-  if curl -fsS --max-time 30 "https://reestr.rublacklist.net/api/v3/ips/" -o "$TMPD/rbl.json" 2>>"$LOG" && [ -s "$TMPD/rbl.json" ]; then
-    if grep -qF "\"$ip\"" "$TMPD/rbl.json"; then
-      res_line fail "Реестр РКН (rublacklist)" "IP найден в списке заблокированных"
-      problems+=("IP $ip есть в реестре заблокированных адресов")
-    else
-      res_line ok "Реестр РКН (rublacklist)" "IP отдельной записью не найден"
-      notes+=("реестр не показывает блокировки подсетей, по SNI/протоколу и динамические блокировки ТСПУ — доверяйте проверкам выше")
-    fi
-  else
-    res_line info "Реестр РКН (rublacklist)" "список получить не удалось — пропущено"
-  fi
-
-  # ── итог
-  echo
-  rule
+  # ── выводы по портам
   local st_p ro rt wo wt
   for p in "${ports[@]}"; do
     st_p="${LST[$p]}"; ro="${RUOK[$p]:-}"; rt="${RUT[$p]:-0}"; wo="${WOK[$p]:-0}"; wt="${WT[$p]:-0}"
@@ -965,21 +939,78 @@ PYEOF
         fi ;;
     esac
   done
-  [ $CH_OK -eq 0 ] && notes+=("check-host.net был недоступен: вывод сделан только по проверкам с этого сервера")
-  local m
+  # ── сохранить результат по серверу
   local nopen=0
   for p in "${ports[@]}"; do case "${LST[$p]}" in open | flaky) nopen=$((nopen + 1)) ;; esac; done
-  if [ ${#problems[@]} -eq 0 ] && [ ${#warns[@]} -eq 0 ] && [ $nopen -gt 0 ]; then
-    echo "  ${GRN}${B}Итог: признаков блокировки не найдено.${R} IP доступен, данные после подключения идут."
-  elif [ ${#problems[@]} -eq 0 ] && [ ${#warns[@]} -eq 0 ]; then
-    echo "  ${YLW}${B}Итог: блокировки не видно, но и проверять нечего:${R} ни один из указанных портов не открыт."
-  else
-    if [ ${#problems[@]} -gt 0 ]; then echo "  ${RED}${B}Итог: найдены проблемы:${R}"; else echo "  ${YLW}${B}Итог: есть замечания:${R}"; fi
-    for m in "${problems[@]}"; do echo "   ${RED}✖${R} $m"; done
-    for m in "${warns[@]}"; do echo "   ${YLW}▲${R} $m"; done
+  [ $CH_OK -eq 0 ] && notes+=("check-host.net был недоступен: вывод сделан только по проверкам с этого сервера")
+  SUM_P[$ip]=$(printf '%s\n' "${problems[@]}")
+  SUM_W[$ip]=$(printf '%s\n' "${warns[@]}")
+  SUM_N[$ip]=$(printf '%s\n' "${notes[@]}")
+  SUM_O[$ip]=$nopen
+}
+
+run_ipcheck() {
+  local ip ports=() IPS=() p x raw lab n
+  local -A SUM_P=() SUM_W=() SUM_N=() SUM_O=()
+  echo
+  echo "${B}Проверка IP на блокировки (без доступа к серверам)${R}"
+  thin
+  info "проверка идёт с этого сервера и со сторонних узлов check-host.net; на проверяемые серверы заходить не нужно"
+  info "можно указать несколько IP (до 4) через запятую или пробел, например RELAY и BACKEND"
+  while true; do
+    ask CHK_IP "IP-адреса для проверки"
+    raw="${CHK_IP//,/ }"; IPS=(); x=1
+    for p in $raw; do
+      if valid_ip "$p"; then
+        case " ${IPS[*]:-} " in *" $p "*) ;; *) IPS+=("$p") ;; esac
+      else x=0; fail "некорректный IPv4-адрес: $p"; fi
+    done
+    [ $x -eq 1 ] && [ ${#IPS[@]} -ge 1 ] && [ ${#IPS[@]} -le 4 ] && break
+    [ $x -eq 1 ] && fail "укажите от 1 до 4 адресов"
+  done
+  while true; do
+    ask CHK_PORTS "TCP-порты через запятую (до 4)" "22,443"
+    ports=(); x=1
+    IFS=',' read -ra arr <<< "${CHK_PORTS// /}"
+    for p in "${arr[@]}"; do valid_port "$p" && ports+=("$p") || x=0; done
+    [ $x -eq 1 ] && [ ${#ports[@]} -gt 0 ] && [ ${#ports[@]} -le 4 ] && break
+    fail "укажите от 1 до 4 портов (1–65535), например 22,443"
+  done
+
+  n=0
+  for ip in "${IPS[@]}"; do
+    n=$((n + 1)); lab=$(srv_label "$ip")
+    echo
+    rule
+    printf '  %sСервер %d из %d: %s%s%s\n' "$B" "$n" "${#IPS[@]}" "$ip" "${lab:+ ($lab)}" "$R"
+    rule
+    ipcheck_one "$ip"
+  done
+
+  # ── общий итог
+  echo
+  rule
+  echo "  ${B}Итог проверки${R}"
+  thin
+  local bad=() lvl m txt
+  for ip in "${IPS[@]}"; do
+    lab=$(srv_label "$ip"); lab="$ip${lab:+ ($lab)}"
+    if [ -n "${SUM_P[$ip]//[$'\n']/}" ]; then lvl=fail; txt="найдены проблемы"; bad+=("$lab")
+    elif [ -n "${SUM_W[$ip]//[$'\n']/}" ]; then lvl=warn; txt="есть замечания"; bad+=("$lab")
+    elif [ "${SUM_O[$ip]}" -gt 0 ]; then lvl=ok; txt="признаков блокировки не найдено"
+    else lvl=info; txt="блокировки не видно, но ни один из указанных портов не открыт"; fi
+    case "$lvl" in ok) m="${GRN}✔${R}" ;; warn) m="${YLW}▲${R}" ;; fail) m="${RED}✖${R}" ;; *) m="${BLU}•${R}" ;; esac
+    echo "  $m ${B}$lab${R} — $txt"
+    while IFS= read -r m; do [ -n "$m" ] && echo "      ${RED}✖${R} $m"; done <<< "${SUM_P[$ip]}"
+    while IFS= read -r m; do [ -n "$m" ] && echo "      ${YLW}▲${R} $m"; done <<< "${SUM_W[$ip]}"
+    while IFS= read -r m; do [ -n "$m" ] && echo "      ${BLU}•${R} $m"; done <<< "${SUM_N[$ip]}"
+  done
+  if [ ${#IPS[@]} -gt 1 ]; then
+    thin
+    if [ ${#bad[@]} -eq 0 ]; then echo "  ${GRN}${B}Проблем не найдено ни на одном сервере.${R}"
+    else echo "  ${B}Проблемы на: ${bad[*]}${R}"; fi
   fi
-  for m in "${notes[@]}"; do echo "   ${BLU}•${R} $m"; done
-  echo "  ${DIM}Результат зависит от того, откуда запущен скрипт: проверка отсюда показывает, как этот сервер видит $ip. Сырые ответы: $LOG${R}"
+  echo "  ${DIM}Результат зависит от места запуска: проверка «отсюда» показывает, как этот сервер видит проверяемые IP. Сырые ответы: $LOG${R}"
   echo
 }
 
