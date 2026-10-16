@@ -230,6 +230,7 @@ menu() {
   echo "  ${B}2${R}. Установить и настроить Relay + Backend сервер с 3X-UI панелью"
   echo "  ${B}3${R}. Протестировать BACKEND сервер"
   [ $has -eq 1 ] && echo "  ${B}4${R}. Отменить установку (удалить всё)"
+  echo "  ${B}5${R}. Проверить IP на блокировки (без доступа к серверу)"
   while true; do
     rd -r -p "${B}?${R} Выберите вариант: " c
     case "$c" in
@@ -237,7 +238,8 @@ menu() {
       2) MODE="install_relay"; return 0 ;;
       3) MODE="test"; return 0 ;;
       4) if [ $has -eq 1 ]; then MODE="uninstall"; return 0; fi; fail "вариант 4 доступен только после установки" ;;
-      *) if [ $has -eq 1 ]; then fail "введите 1, 2, 3 или 4"; else fail "введите 1, 2 или 3"; fi ;;
+      5) MODE="ipcheck"; return 0 ;;
+      *) if [ $has -eq 1 ]; then fail "введите число от 1 до 5"; else fail "введите 1, 2, 3 или 5"; fi ;;
     esac
   done
 }
@@ -720,6 +722,264 @@ run_test() {
   fi
   for m in "${notes[@]}"; do echo "   ${BLU}•${R} $m"; done
   echo "  ${DIM}Тест идёт напрямую RELAY→BACKEND, без туннеля rathole, на свободных портах. Сырые ответы: $LOG${R}"
+  echo
+}
+
+# ───────────────────────── проверка IP на блокировки (без доступа к серверу) ─────────────────────────
+# одна попытка TCP-подключения: → "код миллисекунды" (0 = успех, 124 = таймаут, 1 = отказ/нет маршрута)
+tcp_try() {  # tcp_try IP порт
+  local t0 t1 rc
+  t0=$(date +%s%N)
+  timeout 5 bash -c 'exec 3<>/dev/tcp/$0/$1' "$1" "$2" 2>/dev/null
+  rc=$?
+  t1=$(date +%s%N)
+  echo "$rc $(((t1 - t0) / 1000000))"
+}
+
+# первая строка, которую сервер присылает сам (SSH, SMTP, FTP…)
+first_line() {  # first_line IP порт секунд
+  timeout $(($3 + 2)) bash -c 'exec 3<>/dev/tcp/$0/$1; IFS= read -r -t "$2" l <&3 && printf "%s" "$l"' "$1" "$2" "$3" 2>/dev/null | head -c 80 | tr -d '\r\n'
+}
+
+# TLS-рукопожатие: → ok | reset | notls | stall
+tls_probe() {  # tls_probe IP порт [SNI]
+  local sni_opt out rc
+  if [ -n "${3:-}" ]; then sni_opt=(-servername "$3"); else sni_opt=(-noservername); fi
+  out=$(timeout 9 openssl s_client -connect "$1:$2" "${sni_opt[@]}" </dev/null 2>&1)
+  rc=$?
+  printf '%s\n' "$out" >>"$LOG"
+  if echo "$out" | grep -qE 'Cipher is [A-Za-z0-9_-]+|BEGIN CERTIFICATE'; then echo ok
+  elif [ $rc -eq 124 ]; then echo stall
+  elif echo "$out" | grep -qiE 'reset|errno=104'; then echo reset
+  else echo notls; fi
+}
+
+run_ipcheck() {
+  STEP=0; TOTAL=5
+  local ip ports=() p x i n_ok last_rc rc ms lastms
+  local -A LST=() OKP=()
+  local problems=() warns=() notes=()
+  echo
+  echo "${B}Проверка IP на блокировки (без доступа к серверу)${R}"
+  thin
+  info "проверка идёт с этого сервера и со сторонних узлов check-host.net; на проверяемый сервер заходить не нужно"
+  while true; do
+    ask CHK_IP "IP-адрес для проверки"
+    valid_ip "$CHK_IP" && break
+    fail "некорректный IPv4-адрес"
+  done
+  ip="$CHK_IP"
+  [ "$ip" = "${RELAY_IP:-}" ] && warn "это IP самого RELAY — проверка не имеет смысла"
+  while true; do
+    ask CHK_PORTS "TCP-порты через запятую (до 4)" "22,443"
+    ports=(); x=1
+    IFS=',' read -ra arr <<< "${CHK_PORTS// /}"
+    for p in "${arr[@]}"; do valid_port "$p" && ports+=("$p") || x=0; done
+    [ $x -eq 1 ] && [ ${#ports[@]} -gt 0 ] && [ ${#ports[@]} -le 4 ] && break
+    fail "укажите от 1 до 4 портов (1–65535), например 22,443"
+  done
+  : > "$TMPD/ipcheck.log"
+
+  # ── 1. ping и трассировка
+  section "Доступность отсюда: ping и трассировка"
+  local pg loss rtt
+  pg=$(ping -c 5 -W 2 -q "$ip" 2>&1)
+  echo "$pg" >>"$LOG"
+  loss=$(echo "$pg" | sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p')
+  rtt=$(echo "$pg" | sed -n 's/.*= [0-9.]*\/\([0-9.]*\)\/.*/\1/p')
+  if [ -z "$loss" ]; then res_line warn "Ping" "не удалось выполнить"
+  elif [ "${loss%.*}" -ge 100 ]; then res_line warn "Ping" "нет ответа (ICMP часто закрыт и у живых серверов — смотрите TCP)"
+  elif [ "${loss%.*}" -gt 0 ]; then res_line warn "Ping" "RTT ${rtt%.*} мс, потери ${loss}%"
+  else res_line ok "Ping" "RTT ${rtt%.*} мс, потери 0%"; fi
+  if ! command -v traceroute >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+    apt-get -o DPkg::Lock::Timeout=60 install -y traceroute >>"$LOG" 2>&1 || true
+  fi
+  if command -v traceroute >/dev/null 2>&1; then
+    local tr last hops
+    tr=$(timeout 45 traceroute -T -p "${ports[0]}" -n -w 1 -q 1 -m 18 "$ip" 2>&1)
+    echo "$tr" >>"$LOG"
+    hops=$(echo "$tr" | awk '$1 ~ /^[0-9]+$/ { n = $1 } END { print n + 0 }')
+    last=$(echo "$tr" | awk '$1 ~ /^[0-9]+$/ && $2 != "*" { h = $1; a = $2 } END { if (h) print h " (" a ")" }')
+    if echo "$tr" | awk -v ip="$ip" '$1 ~ /^[0-9]+$/ && $2 == ip { f = 1 } END { exit !f }'; then
+      res_line ok "Трасса (TCP :${ports[0]})" "дошла до цели"
+    else
+      res_line info "Трасса (TCP :${ports[0]})" "обрывается после прыжка ${last:-?} из $hops (справочно)"
+    fi
+  else
+    res_line info "Трасса" "traceroute не установлен — пропущено"
+  fi
+
+  # ── 2. TCP-подключение
+  section "TCP-подключение отсюда"
+  for p in "${ports[@]}"; do
+    n_ok=0; last_rc=0; lastms=0
+    for i in 1 2 3; do
+      read -r rc ms <<< "$(tcp_try "$ip" "$p")"
+      if [ "$rc" -eq 0 ]; then n_ok=$((n_ok + 1)); lastms=$ms; else last_rc=$rc; fi
+    done
+    if [ $n_ok -eq 3 ]; then LST[$p]=open; res_line ok "TCP :$p" "порт открыт (${lastms} мс)"
+    elif [ $n_ok -gt 0 ]; then LST[$p]=flaky; res_line warn "TCP :$p" "нестабильно: $n_ok из 3 попыток"
+    elif [ "$last_rc" -eq 124 ]; then LST[$p]=timeout; res_line fail "TCP :$p" "таймаут: пакеты SYN не доходят или ответ не возвращается"
+    else LST[$p]=refused; res_line info "TCP :$p" "отказ в соединении: сервер жив, но порт закрыт"; fi
+  done
+
+  # ── 3. баннер SSH / TLS
+  section "Данные после подключения: баннер и TLS"
+  local any=0 bl t1 t2
+  for p in "${ports[@]}"; do
+    case "${LST[$p]}" in open | flaky) ;; *) continue ;; esac
+    any=1
+    bl=$(first_line "$ip" "$p" 6)
+    if [[ "$bl" == SSH-* ]]; then
+      OKP[$p]=1; res_line ok "Баннер :$p" "$bl"; continue
+    elif [ -n "$bl" ]; then
+      OKP[$p]=1; res_line ok "Баннер :$p" "сервис ответил: $bl"; continue
+    fi
+    if [ "$p" -eq 22 ]; then
+      OKP[$p]=0; res_line fail "Баннер SSH :22" "TCP есть, баннера нет — «timed out during banner exchange»"
+      continue
+    fi
+    t1=$(tls_probe "$ip" "$p")
+    case "$t1" in
+      ok) OKP[$p]=1; res_line ok "TLS :$p, без SNI" "рукопожатие прошло" ;;
+      notls) OKP[$p]=1; res_line info "TLS :$p, без SNI" "сервис ответил, но это не TLS (обычный HTTP/иной протокол — нормально)" ;;
+      *)
+        t2=$(tls_probe "$ip" "$p" www.microsoft.com)
+        if [ "$t2" = ok ]; then
+          OKP[$p]=1; res_line warn "TLS :$p" "без SNI не проходит, с SNI www.microsoft.com — проходит"
+          warns+=("порт $p: TLS проходит только с SNI — похоже, фильтрация зависит от SNI")
+        else
+          OKP[$p]=0
+          if [ "$t1" = reset ]; then res_line fail "TLS :$p" "соединение сбрасывается после ClientHello (типично для DPI)"
+          else res_line fail "TLS :$p" "TCP есть, рукопожатие зависает — данные не идут"; fi
+        fi ;;
+    esac
+  done
+  [ $any -eq 0 ] && res_line info "Баннер / TLS" "нет открытых портов — проверять нечего"
+  info "постоянную «заморозку после ~16 КБ» этой проверкой не поймать: для неё нужен пункт 3 (тест BACKEND)"
+
+  # ── 4. взгляд со сторонних узлов
+  section "Взгляд из других сетей (check-host.net)"
+  cat > "$TMPD/chk.py" <<'PYEOF'
+import sys, json, time, urllib.request
+H = {"Accept": "application/json", "User-Agent": "relay-setup"}
+def get(u):
+    return json.load(urllib.request.urlopen(urllib.request.Request(u, headers=H), timeout=15))
+ip, port = sys.argv[1], sys.argv[2]
+try:
+    d = get("https://check-host.net/nodes/hosts")
+    nodes = d.get("nodes", d)
+    ru = [n for n, v in nodes.items() if v["location"][0] == "ru"][:4]
+    pref = ["de", "nl", "fi", "us", "fr", "se", "pl", "gb"]
+    seen, world = set(), []
+    for c in pref:
+        for n, v in nodes.items():
+            if v["location"][0] == c and c not in seen:
+                seen.add(c); world.append(n)
+    sel = ru + world[:4]
+    r = get("https://check-host.net/check-tcp?host=%s:%s&" % (ip, port) + "&".join("node=" + n for n in sel))
+    rid = r["request_id"]
+    res = {}
+    for _ in range(6):
+        time.sleep(4)
+        res = get("https://check-host.net/check-result/" + rid)
+        if all(res.get(n) is not None for n in sel):
+            break
+    for n in sel:
+        grp = "RU" if n in ru else "WORLD"
+        loc = nodes[n]["location"]
+        place = "%s, %s" % (loc[2] if len(loc) > 2 else "", loc[1])
+        v = res.get(n)
+        if not v:
+            print("%s|%s|%s|none|нет ответа от узла" % (grp, n.split(".")[0], place))
+        elif "time" in v[0]:
+            print("%s|%s|%s|ok|%.2f с" % (grp, n.split(".")[0], place, v[0]["time"]))
+        else:
+            print("%s|%s|%s|fail|%s" % (grp, n.split(".")[0], place, v[0].get("error", "ошибка")))
+except Exception as e:
+    print("ERR|%s" % e)
+PYEOF
+  local CH_OK=0 ru_ok ru_tot w_ok w_tot line g nm pl st dt cnt=0
+  local -A RUOK=() WOK=() RUT=() WT=()
+  for p in "${ports[@]:0:3}"; do
+    echo "  ${DIM}порт $p: опрашиваю узлы (около 20 секунд)…${R}"
+    ru_ok=0; ru_tot=0; w_ok=0; w_tot=0
+    python3 "$TMPD/chk.py" "$ip" "$p" > "$TMPD/chk-$p.txt" 2>>"$LOG"
+    cat "$TMPD/chk-$p.txt" >>"$LOG"
+    if [ ! -s "$TMPD/chk-$p.txt" ] || grep -q '^ERR|' "$TMPD/chk-$p.txt"; then
+      res_line warn "check-host.net :$p" "недоступен: $(sed -n 's/^ERR|//p' "$TMPD/chk-$p.txt" | head -n1)"
+      continue
+    fi
+    CH_OK=1
+    while IFS='|' read -r g nm pl st dt; do
+      [ -z "$nm" ] && continue
+      if [ "$g" = RU ]; then ru_tot=$((ru_tot + 1)); [ "$st" = ok ] && ru_ok=$((ru_ok + 1))
+      else w_tot=$((w_tot + 1)); [ "$st" = ok ] && w_ok=$((w_ok + 1)); fi
+      if [ "$st" = ok ]; then res_line ok "$([ "$g" = RU ] && echo РФ || echo Мир) :$p, $pl" "$dt"
+      else res_line fail "$([ "$g" = RU ] && echo РФ || echo Мир) :$p, $pl" "$dt"; fi
+    done < "$TMPD/chk-$p.txt"
+    RUOK[$p]=$ru_ok; RUT[$p]=$ru_tot; WOK[$p]=$w_ok; WT[$p]=$w_tot
+    cnt=$((cnt + 1))
+  done
+
+  # ── 5. реестр блокировок
+  section "Реестр блокировок (справочно)"
+  if curl -fsS --max-time 30 "https://reestr.rublacklist.net/api/v3/ips/" -o "$TMPD/rbl.json" 2>>"$LOG" && [ -s "$TMPD/rbl.json" ]; then
+    if grep -qF "\"$ip\"" "$TMPD/rbl.json"; then
+      res_line fail "Реестр РКН (rublacklist)" "IP найден в списке заблокированных"
+      problems+=("IP $ip есть в реестре заблокированных адресов")
+    else
+      res_line ok "Реестр РКН (rublacklist)" "IP отдельной записью не найден"
+      notes+=("реестр не показывает блокировки подсетей, по SNI/протоколу и динамические блокировки ТСПУ — доверяйте проверкам выше")
+    fi
+  else
+    res_line info "Реестр РКН (rublacklist)" "список получить не удалось — пропущено"
+  fi
+
+  # ── итог
+  echo
+  rule
+  local st_p ro rt wo wt
+  for p in "${ports[@]}"; do
+    st_p="${LST[$p]}"; ro="${RUOK[$p]:-}"; rt="${RUT[$p]:-0}"; wo="${WOK[$p]:-0}"; wt="${WT[$p]:-0}"
+    case "$st_p" in
+      timeout)
+        if [ "$wt" -gt 0 ] && [ "$wo" -gt 0 ] && [ "${ro:-0}" -eq 0 ]; then
+          problems+=("порт $p: из РФ не открывается, из-за рубежа открывается ($wo из $wt узлов) — блокировка на российской стороне (ТСПУ/РКН или фильтр оператора)")
+        elif [ "$wt" -gt 0 ] && [ "$wo" -eq 0 ]; then
+          warns+=("порт $p: недоступен отовсюду, в том числе из-за рубежа — это не блокировка РФ: сервер выключен, порт закрыт или режет firewall хостера")
+        elif [ "$wt" -eq 0 ]; then
+          warns+=("порт $p: таймаут отсюда; сторонние узлы недоступны, отличить блокировку от выключенного сервера нельзя")
+        else
+          warns+=("порт $p: таймаут отсюда, но часть российских узлов подключается — блокировка зависит от оператора")
+        fi ;;
+      refused) notes+=("порт $p: сервер отвечает отказом — он включён, просто на порту ничего не слушает") ;;
+      open | flaky)
+        [ "$st_p" = flaky ] && warns+=("порт $p: подключение нестабильно (часть пакетов теряется)")
+        if [ "${OKP[$p]:-1}" = 0 ]; then
+          problems+=("порт $p: TCP устанавливается, но данные не идут — так выглядит фильтрация DPI (как «timed out during banner exchange»)")
+        fi
+        if [ "$rt" -gt 0 ] && [ "${ro:-0}" -lt "$rt" ] && [ "${ro:-0}" -gt 0 ]; then
+          warns+=("порт $p: часть российских узлов не достучалась ($ro из $rt) — блокировка у отдельных операторов")
+        fi ;;
+    esac
+  done
+  [ $CH_OK -eq 0 ] && notes+=("check-host.net был недоступен: вывод сделан только по проверкам с этого сервера")
+  local m
+  local nopen=0
+  for p in "${ports[@]}"; do case "${LST[$p]}" in open | flaky) nopen=$((nopen + 1)) ;; esac; done
+  if [ ${#problems[@]} -eq 0 ] && [ ${#warns[@]} -eq 0 ] && [ $nopen -gt 0 ]; then
+    echo "  ${GRN}${B}Итог: признаков блокировки не найдено.${R} IP доступен, данные после подключения идут."
+  elif [ ${#problems[@]} -eq 0 ] && [ ${#warns[@]} -eq 0 ]; then
+    echo "  ${YLW}${B}Итог: блокировки не видно, но и проверять нечего:${R} ни один из указанных портов не открыт."
+  else
+    if [ ${#problems[@]} -gt 0 ]; then echo "  ${RED}${B}Итог: найдены проблемы:${R}"; else echo "  ${YLW}${B}Итог: есть замечания:${R}"; fi
+    for m in "${problems[@]}"; do echo "   ${RED}✖${R} $m"; done
+    for m in "${warns[@]}"; do echo "   ${YLW}▲${R} $m"; done
+  fi
+  for m in "${notes[@]}"; do echo "   ${BLU}•${R} $m"; done
+  echo "  ${DIM}Результат зависит от того, откуда запущен скрипт: проверка отсюда показывает, как этот сервер видит $ip. Сырые ответы: $LOG${R}"
   echo
 }
 
@@ -2274,6 +2534,7 @@ main() {
     install_backend) run_install_backend ;;
     install_relay) run_install ;;
     test) run_test ;;
+    ipcheck) run_ipcheck ;;
     uninstall) do_uninstall ;;
   esac
 }
