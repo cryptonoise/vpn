@@ -11,7 +11,7 @@
 # Туннель rathole работает по TLS (свой CA, SNI = домен панели). Noise-транспорт не используется:
 # поток из случайных байт сам по себе выглядит подозрительно.
 #
-VERSION="1.5.0"
+VERSION="1.7.0"
 NAME="RELAY·BACKEND Tunnel Setup"
 
 set -u
@@ -207,6 +207,7 @@ write_marker() {  # write_marker статус (in-progress | done)
 STATUS=$1
 INSTALLED_AT=$(date '+%F %T')
 VERSION=$VERSION
+KIND=${INSTALL_KIND:-relay}
 RELAY_IP=${RELAY_IP:-}
 BACKEND_IP=${BACKEND_IP:-}
 BACKEND_PORT=${BACKEND_PORT:-}
@@ -216,29 +217,27 @@ EOF
 marker_get() { sed -n "s/^$1=//p" "$MARKER_FILE" 2>/dev/null | head -n1; }
 
 menu() {
-  local has=0 c
+  local has=0 c k
   [ -f "$MARKER_FILE" ] && has=1
   echo
   echo "${B}Что делаем?${R}"
   thin
   if [ $has -eq 1 ]; then
-    info "найдена метка установки: $(marker_get INSTALLED_AT), статус: $(marker_get STATUS), BACKEND $(marker_get BACKEND_IP), домен $(marker_get DOMAIN)"
+    k=$(marker_get KIND); k="${k:-relay}"
+    info "найдена метка установки: $(marker_get INSTALLED_AT), статус: $(marker_get STATUS), режим: $k, сервер $(marker_get BACKEND_IP), домен $(marker_get DOMAIN)"
   fi
-  echo "  ${B}1${R}. Начать установку и настройку"
-  echo "  ${B}2${R}. Протестировать BACKEND сервер"
-  [ $has -eq 1 ] && echo "  ${B}3${R}. Отменить установку (удалить всё)"
+  echo "  ${B}1${R}. Установить и настроить Backend сервер с 3X-UI панелью (без relay)"
+  echo "  ${B}2${R}. Установить и настроить Relay + Backend сервер с 3X-UI панелью"
+  echo "  ${B}3${R}. Протестировать BACKEND сервер"
+  [ $has -eq 1 ] && echo "  ${B}4${R}. Отменить установку (удалить всё)"
   while true; do
-    if [ $has -eq 1 ]; then
-      rd -r -p "${B}?${R} Выберите вариант: " c
-    else
-      rd -r -p "${B}?${R} Выберите вариант ${DIM}[1]${R}: " c
-      c="${c:-1}"
-    fi
+    rd -r -p "${B}?${R} Выберите вариант: " c
     case "$c" in
-      1) MODE="install"; return 0 ;;
-      2) MODE="test"; return 0 ;;
-      3) if [ $has -eq 1 ]; then MODE="uninstall"; return 0; fi; fail "вариант 3 доступен только после установки" ;;
-      *) fail "введите 1 или 2$([ $has -eq 1 ] && echo ' или 3')" ;;
+      1) MODE="install_backend"; return 0 ;;
+      2) MODE="install_relay"; return 0 ;;
+      3) MODE="test"; return 0 ;;
+      4) if [ $has -eq 1 ]; then MODE="uninstall"; return 0; fi; fail "вариант 4 доступен только после установки" ;;
+      *) if [ $has -eq 1 ]; then fail "введите 1, 2, 3 или 4"; else fail "введите 1, 2 или 3"; fi ;;
     esac
   done
 }
@@ -264,36 +263,54 @@ relay_uninstall() {
 
 do_uninstall() {
   STEP=0; TOTAL=3
+  local kind
+  kind=$(marker_get KIND); kind="${kind:-relay}"
   echo
   echo "${B}Удаление установки${R}"
   thin
-  info "RELAY: туннель rathole, правила ufw (2333, 80, 443, 8443), NAT для UDP, служебные команды, сетевые твики"
-  info "BACKEND: rathole-client, правило 8443/udp, switch-relay, sync-sub-path, сетевые твики"
-  confirm "Удалить настройки туннеля на RELAY и BACKEND?" || { echo "  Отменено."; return 1; }
-  local rm_xui=0 rm_web=0 reach=0
+  if [ "$kind" = "backend" ]; then
+    info "BACKEND (режим без relay): правила ufw (80, 443, 8443), служебная команда sync-sub-path, сетевые твики"
+  else
+    info "RELAY: туннель rathole, правила ufw (2333, 80, 443, 8443), NAT для UDP, служебные команды, сетевые твики"
+    info "BACKEND: rathole-client, правило 8443/udp, switch-relay, sync-sub-path, сетевые твики"
+  fi
+  confirm "Удалить эти настройки?" || { echo "  Отменено."; return 1; }
+  local rm_xui=0 rm_web=0 reach=0 direct=0
+  [ "$kind" = "backend" ] && direct=1
   ask_backend
-  ssh_opts
-  if ssh "${SSH_OPTS[@]}" -o BatchMode=yes "root@$BACKEND_IP" true >/dev/null 2>"$TMPD/ssh.err"; then
+  if [ "${LOCAL_BACKEND:-0}" = 1 ]; then
     reach=1
-    ok "SSH: root@$BACKEND_IP:$BACKEND_PORT"
+  else
+    ssh_opts
+    if ssh "${SSH_OPTS[@]}" -o BatchMode=yes "root@$BACKEND_IP" true >/dev/null 2>"$TMPD/ssh.err"; then
+      reach=1
+      ok "SSH: root@$BACKEND_IP:$BACKEND_PORT"
+    else
+      fail "BACKEND недоступен: $(tail -n1 "$TMPD/ssh.err")"
+      confirm "Удалить только настройки RELAY (BACKEND останется как есть)?" || { echo "  Отменено."; return 1; }
+    fi
+  fi
+  if [ $reach -eq 1 ]; then
     confirm "Удалить на BACKEND также 3x-ui (панель, пользователи, инбаунды)?" && rm_xui=1
     confirm "Удалить на BACKEND также конфиг nginx и сертификат домена ${DOMAIN:-$(marker_get DOMAIN)}?" && rm_web=1
-  else
-    fail "BACKEND недоступен: $(tail -n1 "$TMPD/ssh.err")"
-    confirm "Удалить только настройки RELAY (BACKEND останется как есть)?" || { echo "  Отменено."; return 1; }
   fi
   make_remote_scripts
   section "BACKEND"
   if [ $reach -eq 1 ]; then
-    step_run "Удаление rathole-client, правил и служебных команд" rscript "$TMPD/uninstall-backend.sh" "${RELAY_IP:-$(marker_get RELAY_IP)}" "${DOMAIN:-$(marker_get DOMAIN)}" "$rm_xui" "$rm_web" || warn "часть действий на BACKEND не выполнена (см. лог)"
+    step_run "Удаление настроек, правил и служебных команд" rscript "$TMPD/uninstall-backend.sh" "${RELAY_IP:-$(marker_get RELAY_IP)}" "${DOMAIN:-$(marker_get DOMAIN)}" "$rm_xui" "$rm_web" "$direct" || warn "часть действий на BACKEND не выполнена (см. лог)"
   else
     warn "пропущено: BACKEND недоступен"
   fi
   section "RELAY"
-  step_run "Удаление rathole, правил ufw, NAT и настроек сети" relay_uninstall || warn "часть действий на RELAY не выполнена (см. лог)"
+  if [ "$kind" = "backend" ]; then
+    info "relay в этом режиме не использовался"
+    rm -f "$CONF_FILE" "$REPORT_FILE" "$MARKER_FILE"
+  else
+    step_run "Удаление rathole, правил ufw, NAT и настроек сети" relay_uninstall || warn "часть действий на RELAY не выполнена (см. лог)"
+  fi
   section "Готово"
   ok "метка установки удалена"
-  [ $reach -eq 1 ] && [ $rm_xui -eq 0 ] && info "панель 3x-ui на BACKEND оставлена (порты 80/443 на BACKEND закрыты ufw — при необходимости откройте: ufw allow 443/tcp)"
+  [ $reach -eq 1 ] && [ $rm_xui -eq 0 ] && [ "$kind" != "backend" ] && info "панель 3x-ui на BACKEND оставлена (порты 80/443 на BACKEND закрыты ufw — при необходимости откройте: ufw allow 443/tcp)"
   return 0
 }
 
@@ -372,16 +389,87 @@ raw_line() {  # raw_line "подпись" Мбит/с байт retr ошибка
   fi
 }
 
-tls_run() {  # tls_run имя sni D|U потоков [mss]
-  timeout 45 python3 "$TMPD/tlstest-client.py" "$BACKEND_IP" 8444 "$2" "$3" "$4" 6 "${5:-0}" > "$TMPD/tls-$1.txt" 2>>"$LOG" || true
-  echo "--- tls $1 (sni=$2 $3 x$4 mss=${5:-0}): $(cat "$TMPD/tls-$1.txt" 2>/dev/null)" >> "$LOG"
+probe() {  # probe имя вид порт аргументы...
+  local name="$1" kind="$2" port="$3"; shift 3
+  timeout 60 python3 "$TMPD/tlstest-client.py" "$kind" "$BACKEND_IP" "$port" "$@" > "$TMPD/pr-$name.txt" 2>>"$LOG" || true
+  echo "--- probe $name ($kind :$port $*): $(cat "$TMPD/pr-$name.txt" 2>/dev/null)" >> "$LOG"
 }
 
-tls_pass() {  # tls_pass имя → 0, если получено ≥200 КБ
-  local a b
-  read -r a b _ < "$TMPD/tls-$1.txt" 2>/dev/null || return 1
-  [ "${b:-0}" -ge 200000 ]
+probe_if() {  # probe_if имя вид порт ... — только если порт доступен
+  [ "${PS[$3]:-0}" = 1 ] || return 0
+  probe "$@"
 }
+
+pr_get() {  # → "Мбит/с байт ошибка"
+  local f="$TMPD/pr-$1.txt"
+  if [ -s "$f" ]; then head -n1 "$f"; else echo "0 0 нет ответа (таймаут или запуск не удался)"; fi
+}
+
+pr_state() {  # → 1 поток идёт, 0 встал/ошибка, -1 порт недоступен
+  local name="$1" port="$2" a b e
+  if [ "${PS[$port]:-0}" != 1 ]; then echo -1; return; fi
+  read -r a b e <<< "$(pr_get "$name")"
+  if [ -z "$e" ] && [ "${b:-0}" -ge 200000 ] && [ "${a:-0}" -ge 1 ]; then echo 1; else echo 0; fi
+}
+
+pr_line() {  # pr_line имя "подпись" порт секунд [тихо]
+  local n="$1" label="$2" port="$3" secs="$4" q="${5:-1}" mb by er
+  if [ "${PS[$port]:-0}" != 1 ]; then res_line info "$label" "пропущен: порт $port недоступен"; return 0; fi
+  read -r mb by er <<< "$(pr_get "$n")"
+  tcp_line "$label" "$mb" "$by" "-" "$er" "$secs" 0 "$q"
+}
+
+# варианты, которые можно гнать параллельно (определяют, ОТ ЧЕГО зависит блокировка)
+probe_batch() {
+  local w="dl.google.com"
+  probe_if ya tls 8444 yandex.ru D 1 4 &
+  probe_if vk tls 8444 vk.com D 1 4 &
+  probe_if ms tls 8444 www.microsoft.com D 1 4 &
+  probe_if ns tls 8444 - D 1 4 &
+  [ -n "$SNI_DOM" ] && probe_if dm tls 8444 "$SNI_DOM" D 1 4 &
+  probe_if gi tls 8444 "$w" D 1 4 0 8 &
+  probe_if t12 tls 8445 "$w" D 1 4 &
+  probe_if pa tls 2087 "$w" D 1 4 &
+  probe_if pb tls 9443 "$w" D 1 4 &
+  probe_if pc tls 4443 "$w" D 1 4 &
+  probe_if r8446 raw 8446 - D 1 4 &
+  probe_if h8447 http 8447 "$w" D 1 4 &
+  [ -n "$SNI_DOM" ] && probe_if h8447d http 8447 "$SNI_DOM" D 1 4 &
+  wait
+}
+
+# контроль: скачивание с RELAY с других зарубежных сайтов (нагрузки на VPN нет)
+ctl_run() {  # ctl_run имя URL [опции curl]
+  curl -s --max-time 8 "${@:3}" -o /dev/null -w '%{size_download} %{http_code}' "$2" > "$TMPD/ctl-$1.txt" 2>>"$LOG" || true
+}
+ctl_batch() {
+  ctl_run cf "https://speed.cloudflare.com/__down?bytes=4000000" &
+  ctl_run hz "https://speed.hetzner.de/100MB.bin" -r 0-3999999 &
+  ctl_run ovh "https://proof.ovh.net/files/10Mb.dat" -r 0-3999999 &
+  ctl_run gg "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" -r 0-3999999 &
+  wait
+}
+ctl_line() {  # ctl_line имя "подпись"
+  local sz code
+  read -r sz code < "$TMPD/ctl-$1.txt" 2>/dev/null || { sz=0; code=000; }
+  sz="${sz:-0}"; code="${code:-000}"
+  if [ "$sz" -ge 1000000 ]; then res_line ok "$2" "получено $((sz / 1048576)) МБ за 8 с"
+  elif [ "$sz" -ge 200000 ]; then res_line warn "$2" "получено $((sz / 1024)) КБ за 8 с (медленно)"
+  elif [ "$code" = "000" ] && [ "$sz" -eq 0 ]; then res_line fail "$2" "нет ответа (соединение не установилось или встало до заголовков)"
+  else res_line fail "$2" "получено $((sz / 1024)) КБ (код $code) — режется"
+  fi
+}
+
+asn_info() {  # "AS12345 название"
+  local rev a n
+  rev=$(echo "$BACKEND_IP" | awk -F. '{ print $4"."$3"."$2"."$1 }')
+  a=$(dig +short TXT "$rev.origin.asn.cymru.com" @8.8.8.8 2>/dev/null | head -n1 | tr -d '"' | awk -F'|' '{ print $1 }' | awk '{ print $1 }')
+  [ -n "$a" ] || return 0
+  n=$(dig +short TXT "AS${a}.asn.cymru.com" @8.8.8.8 2>/dev/null | head -n1 | tr -d '"' | awk -F'|' '{ print $NF }' | sed 's/^ *//')
+  echo "AS${a} ${n}"
+}
+
+joinl() { local out="" x; for x in "$@"; do out="${out:+$out; }$x"; done; echo "$out"; }
 
 # наибольший размер пакета, проходящий без фрагментации (MTU пути)
 mtu_probe() {
@@ -396,17 +484,14 @@ mtu_probe() {
   echo 0 > "$TMPD/mtu.txt"
 }
 
-tls_get() {  # tls_get имя → "Мбит/с байт ошибка"
-  local f="$TMPD/tls-$1.txt"
-  if [ -s "$f" ]; then head -n1 "$f"; else echo "0 0 нет ответа (таймаут или запуск не удался)"; fi
-}
-
 run_test() {
   STEP=0; TOTAL=6
   echo
-  echo "${B}Тест BACKEND (iperf3 + TLS)${R}"
+  echo "${B}Тест BACKEND: блокировки и скорость${R}"
   thin
+  info "тест идёт на свободных портах (8444, 2087, 9443, 4443, 8445–8448, 5201) и не трогает 443, 8443, 999 и работу VPN"
   ask_backend
+  [ "${LOCAL_BACKEND:-0}" = 1 ] && die "для теста IP BACKEND должен отличаться от IP этого сервера (тест идёт между двумя серверами)"
   make_remote_scripts
 
   section "Подключение к BACKEND"
@@ -430,10 +515,18 @@ run_test() {
   section "Тестовые серверы на BACKEND"
   IPERF_STARTED=1
   step_run "iperf3 -s (порт 5201 открыт только для RELAY)" rscript "$TMPD/iperf-server.sh" "$RELAY_IP" || die "не удалось запустить iperf3-сервер на BACKEND"
-  step_run "TLS-сервер для теста (порт 8444 открыт только для RELAY)" rscript "$TMPD/tlstest-start.sh" "$RELAY_IP" || die "не удалось запустить TLS-сервер на BACKEND"
-  PORT_BAD=0; TLS_BAD=0
-  if timeout 6 bash -c ">/dev/tcp/$BACKEND_IP/5201" 2>/dev/null; then ok "порт 5201 на BACKEND доступен с RELAY"; else warn "порт 5201 на BACKEND недоступен с RELAY"; PORT_BAD=1; fi
-  if timeout 6 bash -c ">/dev/tcp/$BACKEND_IP/8444" 2>/dev/null; then ok "порт 8444 на BACKEND доступен с RELAY"; else warn "порт 8444 на BACKEND недоступен с RELAY (firewall хостера?)"; TLS_BAD=1; fi
+  step_run "тестовый сервер: TLS 1.3/1.2, HTTP, сырой TCP, UDP (порты открыты только для RELAY)" rscript "$TMPD/tlstest-start.sh" "$RELAY_IP" || die "не удалось запустить тестовый сервер на BACKEND"
+  local -A PS=()
+  local pp bound unavailable="" busy=""
+  bound=$(bk 'cat /run/relay-test.ports' 2>>"$LOG")
+  for pp in 5201 8444 2087 9443 4443 8445 8446 8447; do
+    if [ "$pp" != 5201 ] && ! grep -q ":$pp:" <<< "$bound"; then busy="$busy $pp"; PS[$pp]=0; continue; fi
+    if timeout 4 bash -c ">/dev/tcp/$BACKEND_IP/$pp" 2>/dev/null; then PS[$pp]=1; else PS[$pp]=0; unavailable="$unavailable $pp"; fi
+  done
+  PS[8448]=1
+  ok "тестовые порты, доступные с RELAY:$(for pp in 5201 8444 2087 9443 4443 8445 8446 8447; do [ "${PS[$pp]}" = 1 ] && printf ' %s' "$pp"; done) (+ UDP 8448)"
+  [ -n "$unavailable" ] && warn "недоступны с RELAY (firewall хостера?):$unavailable"
+  [ -n "$busy" ] && info "заняты на BACKEND, пропущены:$busy"
 
   local SNI_W="dl.google.com" SNI_DOM="${DOMAIN:-}"
   [ -n "$SNI_DOM" ] || SNI_DOM=$(marker_get DOMAIN)
@@ -441,23 +534,22 @@ run_test() {
   section "Измерения (RELAY → BACKEND, напрямую, без туннеля)"
   step_run "ping, 10 пакетов" bash -c "ping -c 10 -i 0.3 -q '$BACKEND_IP' > '$TMPD/ping.txt' 2>&1 || true"
   step_run "MTU пути (ping с запретом фрагментации)" mtu_probe
-  if [ "$PORT_BAD" -eq 0 ]; then
+  if [ "${PS[5201]}" = 1 ]; then
     step_run "сырой TCP, iperf3, 1 поток (8 с)" iperf_run p1 -P 1
     step_run "сырой TCP, iperf3, MSS 1200 (8 с)" iperf_run pm -P 1 -M 1200
   fi
-  if [ "$TLS_BAD" -eq 0 ]; then
-    step_run "TLS, SNI $SNI_W, 1 поток (6 с)" tls_run g1 "$SNI_W" D 1
-    step_run "TLS, SNI $SNI_W, MSS 1200 (6 с)" tls_run gm "$SNI_W" D 1 1200
-    if tls_pass g1 || tls_pass gm; then
-      step_run "TLS, SNI $SNI_W, 4 потока (6 с)" tls_run g4 "$SNI_W" D 4
-      step_run "TLS, SNI $SNI_W, отдача на BACKEND (6 с)" tls_run gu "$SNI_W" U 1
-      [ -n "$SNI_DOM" ] && step_run "TLS, SNI $SNI_DOM, 1 поток (6 с)" tls_run d1 "$SNI_DOM" D 1
-    else
-      info "потоки не идут ни с обычным MSS, ни с MSS 1200 — остальные TLS-тесты пропущены"
-    fi
-  else
-    warn "TLS-тесты пропущены: порт 8444 недоступен"
+  if [ "${PS[8444]}" = 1 ]; then
+    step_run "TLS, SNI $SNI_W, 1 поток (6 с)" probe g1 tls 8444 "$SNI_W" D 1 6
+    step_run "TLS, SNI $SNI_W, MSS 1200 (6 с)" probe gm tls 8444 "$SNI_W" D 1 6 1200
   fi
+  step_run "варианты: SNI, порты, TLS 1.2, HTTP, сырой TCP, пауза (параллельно)" probe_batch
+  if [ "$(pr_state g1 8444)" = 1 ] || [ "$(pr_state gm 8444)" = 1 ]; then
+    step_run "TLS, SNI $SNI_W, 4 потока (6 с)" probe g4 tls 8444 "$SNI_W" D 4 6
+    step_run "TLS, SNI $SNI_W, отдача на BACKEND (6 с)" probe gu tls 8444 "$SNI_W" U 1 6
+  fi
+  step_run "UDP: эхо (20 пакетов)" probe uecho udp-echo 8448
+  step_run "UDP: поток ~48 Мбит/с (4 с)" probe ublast udp-blast 8448 4
+  step_run "контроль: скачивание с RELAY с Cloudflare, Hetzner, OVH, Google (8 с)" ctl_batch
 
   section "Сетевые параметры"
   local cc_r cc_b qd_r qd_b dev_r dev_b mtu_r mtu_b
@@ -474,75 +566,145 @@ run_test() {
 
   section "Результаты"
   iperf_stop
-  local p1 p1b p1r p1e pm pmb pmr pme g1 g1b g1e gm gmb gme g4 g4b g4e gu gub gue d1 d1b d1e loss rtt pmtu
+  local p1 p1b p1r p1e pm pmb pmr pme g1 g1b g1e gm gmb gme g4 g4b g4e gu gub gue loss rtt pmtu asn
   read -r p1 p1b p1r p1e <<< "$(iperf_parse "$TMPD/iperf-p1.json")"
   read -r pm pmb pmr pme <<< "$(iperf_parse "$TMPD/iperf-pm.json")"
-  read -r g1 g1b g1e <<< "$(tls_get g1)"
-  read -r gm gmb gme <<< "$(tls_get gm)"
-  read -r g4 g4b g4e <<< "$(tls_get g4)"
-  read -r gu gub gue <<< "$(tls_get gu)"
-  read -r d1 d1b d1e <<< "$(tls_get d1)"
+  read -r g1 g1b g1e <<< "$(pr_get g1)"
+  read -r gm gmb gme <<< "$(pr_get gm)"
+  read -r g4 g4b g4e <<< "$(pr_get g4)"
+  read -r gu gub gue <<< "$(pr_get gu)"
   loss=$(grep -oE '[0-9.]+% packet loss' "$TMPD/ping.txt" | head -n1 | cut -d% -f1)
   rtt=$(grep -oE '= [0-9.]+/[0-9.]+/' "$TMPD/ping.txt" | head -n1 | cut -d/ -f2)
   loss="${loss:-100}"; rtt="${rtt:-?}"; rtt="${rtt%.*}"
   pmtu=$(cat "$TMPD/mtu.txt" 2>/dev/null); pmtu="${pmtu:-0}"
+  asn=$(asn_info)
 
-  local problems=() warns=() notes=()
-  RAW_FROZEN=0; DOM_FROZEN=0
-  local g1p=0 gmp=0
-  [ "$TLS_BAD" -eq 0 ] && [ -z "$g1e" ] && [ "$g1b" -ge 200000 ] && [ "$g1" -ge 1 ] && g1p=1
-  [ "$TLS_BAD" -eq 0 ] && [ -z "$gme" ] && [ "$gmb" -ge 200000 ] && [ "$gm" -ge 1 ] && gmp=1
-  [ "$PORT_BAD" -eq 1 ] && notes+=("порт 5201 недоступен с RELAY — сырой TCP-тест (iperf3) пропущен")
-  [ "$TLS_BAD" -eq 1 ] && problems+=("порт 8444 на BACKEND недоступен с RELAY: проверьте firewall хостера (в ufw порт уже открыт для RELAY)")
+  # состояния всех вариантов
+  local -A ST=() SL=()
+  SL[g1]="TLS :8444, SNI $SNI_W"; SL[gm]="TLS :8444, SNI google, MSS 1200"
+  SL[ya]="TLS :8444, SNI yandex.ru"; SL[vk]="TLS :8444, SNI vk.com"; SL[ms]="TLS :8444, SNI www.microsoft.com"
+  SL[ns]="TLS :8444, без SNI"; SL[dm]="TLS :8444, SNI ${SNI_DOM}"; SL[gi]="TLS :8444, пауза 8 с, затем данные"
+  SL[t12]="TLS 1.2 :8445, SNI $SNI_W"; SL[pa]="TLS :2087, SNI $SNI_W"; SL[pb]="TLS :9443, SNI $SNI_W"; SL[pc]="TLS :4443, SNI $SNI_W"
+  SL[r8446]="Сырой TCP :8446 (без TLS)"; SL[h8447]="HTTP :8447, Host $SNI_W"; SL[h8447d]="HTTP :8447, Host ${SNI_DOM}"
+  local item n
+  for item in g1:8444 gm:8444 ya:8444 vk:8444 ms:8444 ns:8444 dm:8444 gi:8444 t12:8445 pa:2087 pb:9443 pc:4443 r8446:8446 h8447:8447 h8447d:8447; do
+    n="${item%%:*}"
+    { [ "$n" = dm ] || [ "$n" = h8447d ]; } && [ -z "$SNI_DOM" ] && continue
+    ST[$n]=$(pr_state "$n" "${item##*:}")
+  done
+
+  local problems=() warns=() notes=() pass_l=() fail_l=()
+  RAW_FROZEN=0
+  for item in g1 gm ya vk ms ns dm gi t12 pa pb pc r8446 h8447 h8447d; do
+    [ -n "${ST[$item]:-}" ] || continue
+    [ "${ST[$item]}" = 1 ] && pass_l+=("${SL[$item]}")
+    [ "${ST[$item]}" = 0 ] && fail_l+=("${SL[$item]}")
+  done
+  local cn=0 cp=0 c sz code
+  for c in cf hz ovh gg; do
+    read -r sz code < "$TMPD/ctl-$c.txt" 2>/dev/null || sz=0
+    cn=$((cn + 1)); [ "${sz:-0}" -ge 1000000 ] && cp=$((cp + 1))
+  done
+
   echo
   rule
   printf '  %sРезультаты теста BACKEND %s%s\n' "$B" "$BACKEND_IP" "$R"
   rule
+  printf '  %sКанал%s\n' "$B" "$R"
   if [ "${loss%.*}" -ge 5 ]; then res_line fail "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; problems+=("потери пакетов ${loss}% на пути до BACKEND")
   elif [ "${loss%.*}" -ge 1 ]; then res_line warn "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; warns+=("есть потери пакетов (${loss}%)")
   else res_line ok "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; fi
   if [ "$pmtu" -ge 1500 ]; then res_line ok "MTU пути" "1500 (без фрагментации)"
   elif [ "$pmtu" -gt 0 ]; then res_line warn "MTU пути" "$pmtu (меньше 1500)"
   else res_line warn "MTU пути" "не определён (ICMP с запретом фрагментации не проходит)"; fi
+  [ -n "$asn" ] && res_line info "Сеть BACKEND" "$asn"
+
+  printf '  %sСырой TCP и HTTP%s\n' "$B" "$R"
   raw_line "Сырой TCP (iperf3)" "$p1" "$p1b" "$p1r" "$p1e"
-  raw_line "Сырой TCP, MSS 1200" "$pm" "$pmb" "$pmr" "$pme"
-  tcp_line "TLS $SNI_W, 1 поток" "$g1" "$g1b" "-" "$g1e" 6 "$TLS_BAD" 1
-  tcp_line "TLS $SNI_W, MSS 1200" "$gm" "$gmb" "-" "$gme" 6 "$TLS_BAD" 1
-  if [ $g1p -eq 1 ] || [ $gmp -eq 1 ]; then
-    tcp_line "TLS $SNI_W, 4 потока" "$g4" "$g4b" "-" "$g4e" 6 "$TLS_BAD"
-    tcp_line "TLS $SNI_W, отдача" "$gu" "$gub" "-" "$gue" 6 "$TLS_BAD"
-    if [ -n "$SNI_DOM" ]; then
-      if [ $g1p -eq 1 ] && { [ -n "$d1e" ] || [ "$d1b" -lt 200000 ] || [ "$d1" -lt 1 ]; }; then
-        DOM_FROZEN=1
-        res_line warn "TLS $SNI_DOM, 1 поток" "встаёт (получено $((d1b / 1024)) КБ за 6 с)"
-      else
-        tcp_line "TLS $SNI_DOM, 1 поток" "$d1" "$d1b" "-" "$d1e" 6 "$TLS_BAD"
-      fi
-    fi
+  raw_line "Сырой TCP (iperf3), MSS 1200" "$pm" "$pmb" "$pmr" "$pme"
+  pr_line r8446 "${SL[r8446]}" 8446 4
+  pr_line h8447 "${SL[h8447]}" 8447 4
+  [ -n "$SNI_DOM" ] && pr_line h8447d "${SL[h8447d]}" 8447 4
+
+  printf '  %sTLS 1.3, порт 8444 (SNI и MSS)%s\n' "$B" "$R"
+  pr_line g1 "${SL[g1]}" 8444 6
+  pr_line gm "${SL[gm]}" 8444 6
+  pr_line ya "${SL[ya]}" 8444 4
+  pr_line vk "${SL[vk]}" 8444 4
+  pr_line ms "${SL[ms]}" 8444 4
+  pr_line ns "${SL[ns]}" 8444 4
+  [ -n "$SNI_DOM" ] && pr_line dm "${SL[dm]}" 8444 4
+  pr_line gi "${SL[gi]}" 8444 4
+
+  printf '  %sTLS: другие версии и порты%s\n' "$B" "$R"
+  pr_line t12 "${SL[t12]}" 8445 4
+  pr_line pa "${SL[pa]}" 2087 4
+  pr_line pb "${SL[pb]}" 9443 4
+  pr_line pc "${SL[pc]}" 4443 4
+
+  if [ "${ST[g1]:-0}" = 1 ] || [ "${ST[gm]:-0}" = 1 ]; then
+    printf '  %sСкорость (поток идёт)%s\n' "$B" "$R"
+    tcp_line "TLS, 1 поток" "$g1" "$g1b" "-" "$g1e" 6 0 1
+    tcp_line "TLS, 4 потока" "$g4" "$g4b" "-" "$g4e" 6 0
+    tcp_line "TLS, отдача на BACKEND" "$gu" "$gub" "-" "$gue" 6 0
   fi
+
+  printf '  %sUDP (порт 8448; важно для Hysteria2 / AmneziaWG)%s\n' "$B" "$R"
+  local ue ub uer um umb ume udp_ok=0
+  read -r ue ub uer <<< "$(pr_get uecho)"
+  if [ "${ub:-0}" -ge 18 ]; then res_line ok "UDP, эхо" "${ub}/20 ответов"
+  elif [ "${ub:-0}" -gt 0 ]; then res_line warn "UDP, эхо" "${ub}/20 ответов (потери)"
+  else res_line fail "UDP, эхо" "ответов нет"; fi
+  read -r um umb ume <<< "$(pr_get ublast)"
+  if [ "${umb:-0}" -ge 200000 ] && [ -z "$ume" ]; then res_line ok "UDP, поток" "~${um} Мбит/с, потерь < 5%"; udp_ok=1
+  elif [ "${umb:-0}" -gt 0 ]; then res_line warn "UDP, поток" "~${um} Мбит/с, $ume"
+  else res_line fail "UDP, поток" "данные не приходят"; fi
+
+  printf '  %sКонтроль: другие зарубежные сайты с RELAY%s\n' "$B" "$R"
+  ctl_line cf "Cloudflare (speed.cloudflare.com)"
+  ctl_line hz "Hetzner (speed.hetzner.de)"
+  ctl_line ovh "OVH (proof.ovh.net)"
+  ctl_line gg "Google (dl.google.com)"
+
+  printf '  %sСистема%s\n' "$B" "$R"
   if [ "$cc_r" = bbr ] && [ "$cc_b" = bbr ]; then res_line ok "BBR / fq" "RELAY: $cc_r/$qd_r, BACKEND: $cc_b/$qd_b"
   else res_line warn "BBR / fq" "RELAY: ${cc_r:-?}/${qd_r:-?}, BACKEND: ${cc_b:-?}/${qd_b:-?}"; warns+=("BBR недоступен на одном из серверов (ядро или виртуализация хостера)"); fi
-  # главный вывод: есть ли блокировка по объёму (16–20 КБ)
+  rule
+
+  # главный вывод: есть ли блокировка по объёму (16–20 КБ) и от чего она зависит
   local mtu_fix=1400
   [ "$pmtu" -gt 0 ] && [ "$pmtu" -lt 1400 ] && mtu_fix="$pmtu"
-  if [ "$TLS_BAD" -eq 1 ]; then
-    res_line warn "Блокировка по 16 КБ" "не проверена: тестовый порт недоступен"
-  elif [ $g1p -eq 1 ]; then
+  if [ "${PS[8444]:-0}" != 1 ]; then
+    res_line warn "Блокировка по 16 КБ" "не проверена: тестовый порт 8444 недоступен"
+    problems+=("порт 8444 на BACKEND недоступен с RELAY: проверьте firewall хостера (в ufw порт уже открыт для RELAY)")
+  elif [ "${ST[g1]}" = 1 ]; then
     res_line ok "Блокировка по 16 КБ" "нет: TLS-поток идёт полностью"
-  elif [ $gmp -eq 1 ]; then
+  elif [ "${ST[gm]}" = 1 ]; then
     res_line warn "Блокировка по 16 КБ" "нет, но проблема MTU/PMTUD"
     problems+=("с обычным MSS поток встаёт (~$((g1b / 1024)) КБ), с MSS 1200 идёт: это не блокировка по объёму, а потеря крупных пакетов (MTU/PMTUD)")
     notes+=("исправление: на ОБОИХ серверах уменьшить MTU, например: ip link set dev ${dev_r:-eth0} mtu ${mtu_fix} (RELAY) и ip link set dev ${dev_b:-eth0} mtu ${mtu_fix} (BACKEND); затем повторить тест (для постоянного эффекта — прописать MTU в netplan)")
+  elif [ ${#pass_l[@]} -gt 0 ]; then
+    res_line warn "Блокировка по 16 КБ" "частично: зависит от параметров"
+    warns+=("потоки с SNI $SNI_W на порту 8444 встают (~$((g1b / 1024)) КБ), но проходят: $(joinl "${pass_l[@]}")")
+    warns+=("режутся: $(joinl "${fail_l[@]}")")
+    notes+=("для туннеля/VPN на этом участке используйте проходящие параметры (порт, SNI, версию TLS)")
   else
-    res_line fail "Блокировка по 16 КБ" "ДА: поток встаёт после ~$((g1b / 1024)) КБ даже с MSS 1200"
-    problems+=("поток встаёт после ~$((g1b / 1024)) КБ и с обычным MSS, и с MSS 1200 — это блокировка/заморозка по объёму, не MTU (у хостера или на пути до него)")
+    res_line fail "Блокировка по 16 КБ" "ДА: потоки встают после ~$((g1b / 1024)) КБ при любых портах, SNI и версиях TLS"
+    problems+=("TCP встаёт после ~$((g1b / 1024)) КБ при любых портах, SNI и версиях TLS — это блокировка/заморозка по объёму, не MTU")
+    if [ "$cp" -gt 0 ]; then
+      problems+=("контрольные зарубежные сайты с RELAY открываются ($cp из $cn): режется именно путь до BACKEND — смените IP/подсеть/хостера BACKEND")
+    else
+      problems+=("контрольные зарубежные сайты с RELAY тоже режутся: заморозка действует на любой TCP из этого места (RELAY/хостер → зарубеж), а не только на BACKEND")
+    fi
+    if [ $udp_ok -eq 1 ]; then notes+=("UDP проходит: используйте UDP-ветку (Hysteria2 / AmneziaWG), TCP-путь для этой пары серверов не годится")
+    else notes+=("UDP тоже не проходит: этот путь между серверами для VPN не подходит"); fi
   fi
-  rule
 
-  # выводы
-  if [ $g1p -eq 1 ] || [ $gmp -eq 1 ]; then
-    [ "$RAW_FROZEN" -eq 1 ] && [ $g1p -eq 1 ] && notes+=("сырой TCP без TLS режется, а TLS с SNI $SNI_W проходит — для VPN это нормально: трафик VLESS/Reality выглядит как TLS, и заморозка на него не действует")
-    if [ "$DOM_FROZEN" -eq 1 ]; then
+  if [ "${ST[g1]:-0}" = 1 ]; then
+    if [ "$RAW_FROZEN" -eq 1 ] || [ "${ST[r8446]:-1}" = 0 ]; then
+      notes+=("сырой TCP без TLS режется, а TLS с SNI $SNI_W проходит — для VPN это нормально: трафик VLESS/Reality выглядит как TLS")
+    fi
+    if [ -n "$SNI_DOM" ] && [ "${ST[dm]:-1}" = 0 ]; then
       warns+=("SNI вашего домена ($SNI_DOM) встаёт, а $SNI_W проходит: туннелю rathole (TLS с SNI домена) может понадобиться «белый» SNI")
     fi
     [ -z "$g4e" ] && [ "$g4" -ge $((g1 * 3)) ] && [ "$g1" -ge 1 ] && [ "$g1" -lt 200 ] && warns+=("один TLS-поток заметно медленнее четырёх: узким местом являются потери или окна TCP (используйте несколько соединений)")
@@ -557,7 +719,7 @@ run_test() {
     for m in "${warns[@]}"; do echo "   ${YLW}▲${R} $m"; done
   fi
   for m in "${notes[@]}"; do echo "   ${BLU}•${R} $m"; done
-  echo "  ${DIM}Тест идёт напрямую RELAY→BACKEND, без туннеля rathole. Сырые ответы: $LOG${R}"
+  echo "  ${DIM}Тест идёт напрямую RELAY→BACKEND, без туннеля rathole, на свободных портах. Сырые ответы: $LOG${R}"
   echo
 }
 
@@ -784,13 +946,13 @@ dns_collect() {  # IPv4 из нескольких резолверов + сис�
 }
 
 dns_check() {
-  local all v6 x
+  local all v6 x tgt="${DNS_TARGET:-$RELAY_IP}"
   while true; do
     all=$(dns_collect | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u | tr '\n' ' ')
     all="${all% }"
     v6=$(dig +short +time=3 +tries=1 AAAA "$DOMAIN" @8.8.8.8 2>/dev/null | grep ':' | head -1)
-    if [ "$all" = "$RELAY_IP" ] && [ -z "$v6" ]; then
-      ok "DNS: $DOMAIN → $RELAY_IP"
+    if [ "$all" = "$tgt" ] && [ -z "$v6" ]; then
+      ok "DNS: $DOMAIN → $tgt"
       return 0
     fi
     echo
@@ -798,7 +960,7 @@ dns_check() {
     printf '  %s▲ Проблема с DNS%s\n' "$YLW" "$R"
     echo "  Домен:        $DOMAIN"
     echo "  Сейчас:       A: ${all:-нет}   AAAA: ${v6:-нет}"
-    echo "  Должно быть:  A = $RELAY_IP (IP RELAY, DNS only, TTL 1 мин), AAAA — удалить"
+    echo "  Должно быть:  A = $tgt (IP сервера, DNS only, TTL 1 мин), AAAA — удалить"
     echo "  ${DIM}(IPv6 через туннель не пробрасывается, а Let's Encrypt проверяет по IPv6 первым)${R}"
     rule
     rd -r -p "  Нажмите Enter, когда исправили (n — пропустить проверку): " x
@@ -862,6 +1024,12 @@ ask_backend() {
     fail "неверный IP"
     BACKEND_IP=""
   done
+  LOCAL_BACKEND=0
+  if [ "$BACKEND_IP" = "${RELAY_IP:-}" ]; then
+    LOCAL_BACKEND=1
+    ok "это текущий сервер: действия выполняются локально (без SSH)"
+    return 0
+  fi
   while true; do
     ask BACKEND_PORT "SSH-порт BACKEND" "${BACKEND_PORT:-1119}"
     valid_port "$BACKEND_PORT" && break
@@ -876,8 +1044,14 @@ ssh_opts() {
     -o ConnectTimeout=15 -o ControlMaster=auto -o "ControlPath=$TMPD/cm-%C" -o ControlPersist=1800)
 }
 
-bk()      { ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" "$@"; }
-rscript() { local f="$1"; shift; ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" bash -s -- "$@" < "$f"; }
+LOCAL_BACKEND=0
+bk() {
+  if [ "${LOCAL_BACKEND:-0}" = 1 ]; then bash -c "$*"; else ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" "$@"; fi
+}
+rscript() {
+  local f="$1"; shift
+  if [ "${LOCAL_BACKEND:-0}" = 1 ]; then bash -s -- "$@" < "$f"; else ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" bash -s -- "$@" < "$f"; fi
+}
 
 ssh_connect() {
   local err np
@@ -1268,43 +1442,50 @@ RELAY="$1"
 if [ -f /run/relay-iperf3.pid ]; then kill "$(cat /run/relay-iperf3.pid)" 2>/dev/null || true; rm -f /run/relay-iperf3.pid; fi
 if [ -f /run/relay-iperf.fw ]; then ufw delete allow from "$RELAY" to any port 5201 proto tcp >/dev/null 2>&1 || true; rm -f /run/relay-iperf.fw; fi
 if [ -f /run/relay-tls.pid ]; then kill "$(cat /run/relay-tls.pid)" 2>/dev/null || true; rm -f /run/relay-tls.pid /run/relay-tls-srv.py /run/relay-tls.key /run/relay-tls.crt; fi
-if [ -f /run/relay-tls.fw ]; then ufw delete allow from "$RELAY" to any port 8444 proto tcp >/dev/null 2>&1 || true; rm -f /run/relay-tls.fw; fi
+if [ -f /run/relay-tls.fw ]; then
+  while read -r spec; do
+    [ -n "$spec" ] && ufw delete allow from "$RELAY" to any port "${spec%/*}" proto "${spec#*/}" >/dev/null 2>&1 || true
+  done < /run/relay-tls.fw
+  rm -f /run/relay-tls.fw
+fi
+rm -f /run/relay-test.ports
 true
 EOF
 
   cat > "$D/tlstest-start.sh" <<'EOF'
 set -e
 RELAY="$1"
-rm -f /run/relay-tls.fw
-if ufw status 2>/dev/null | grep -q '^Status: active'; then
-  ufw allow from "$RELAY" to any port 8444 proto tcp >/dev/null
-  touch /run/relay-tls.fw
-fi
-if [ -f /run/relay-tls.pid ]; then kill "$(cat /run/relay-tls.pid)" 2>/dev/null || true; fi
+rm -f /run/relay-tls.fw /run/relay-test.ports
+if [ -f /run/relay-tls.pid ]; then kill "$(cat /run/relay-tls.pid)" 2>/dev/null || true; sleep 0.5; fi
 openssl req -x509 -newkey rsa:2048 -nodes -keyout /run/relay-tls.key -out /run/relay-tls.crt -days 1 -subj "/CN=localhost" >/dev/null 2>&1
 cat > /run/relay-tls-srv.py <<'PYEOF'
-import socket, ssl, threading, time
-ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-ctx.load_cert_chain("/run/relay-tls.crt", "/run/relay-tls.key")
-srv = socket.socket()
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("0.0.0.0", 8444))
-srv.listen(64)
-chunk = b"x" * 65536
+import socket, ssl, struct, threading, time
 
-def handle(c):
+CRT, KEY = "/run/relay-tls.crt", "/run/relay-tls.key"
+ctx13 = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx13.load_cert_chain(CRT, KEY)
+ctx12 = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx12.load_cert_chain(CRT, KEY)
+ctx12.maximum_version = ssl.TLSVersion.TLSv1_2
+chunk = b"x" * 65536
+bound = []
+
+def stream(c, mode):
+    end = time.time() + 12
+    if mode == b"D":
+        while time.time() < end:
+            c.sendall(chunk)
+    elif mode == b"U":
+        while time.time() < end:
+            if not c.recv(65536):
+                break
+
+def handle_stream(c, ctx):
     try:
-        c = ctx.wrap_socket(c, server_side=True)
+        if ctx is not None:
+            c = ctx.wrap_socket(c, server_side=True)
         c.settimeout(15)
-        mode = c.recv(1)
-        end = time.time() + 12
-        if mode == b"D":
-            while time.time() < end:
-                c.sendall(chunk)
-        elif mode == b"U":
-            while time.time() < end:
-                if not c.recv(65536):
-                    break
+        stream(c, c.recv(1))
     except Exception:
         pass
     finally:
@@ -1313,73 +1494,213 @@ def handle(c):
         except Exception:
             pass
 
+def handle_http(c):
+    try:
+        c.settimeout(15)
+        data = b""
+        while b"\r\n\r\n" not in data and len(data) < 8192:
+            d = c.recv(4096)
+            if not d:
+                break
+            data += d
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 1073741824\r\nConnection: close\r\n\r\n")
+        end = time.time() + 12
+        while time.time() < end:
+            c.sendall(chunk)
+    except Exception:
+        pass
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+def listen(port, handler, kind):
+    try:
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", port))
+        srv.listen(64)
+    except OSError:
+        return
+    bound.append("tcp:%d:%s" % (port, kind))
+    def loop():
+        while True:
+            c, _ = srv.accept()
+            threading.Thread(target=handler, args=(c,), daemon=True).start()
+    threading.Thread(target=loop, daemon=True).start()
+
+def blast(u, addr):
+    seq = 0
+    end = time.time() + 4
+    body = b"y" * 1196
+    while time.time() < end:
+        for _ in range(50):
+            u.sendto(struct.pack(">I", seq) + body, addr)
+            seq += 1
+        time.sleep(0.01)
+    for _ in range(5):
+        u.sendto(b"Z" + struct.pack(">I", seq), addr)
+
+def udp_loop():
+    try:
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.bind(("0.0.0.0", 8448))
+    except OSError:
+        return
+    bound.append("udp:8448:udp")
+    while True:
+        data, addr = u.recvfrom(2048)
+        if data[:1] == b"E":
+            u.sendto(data, addr)
+        elif data[:1] == b"D":
+            threading.Thread(target=blast, args=(u, addr), daemon=True).start()
+
+for prt in (8444, 2087, 9443, 4443):
+    listen(prt, lambda c: handle_stream(c, ctx13), "tls13")
+listen(8445, lambda c: handle_stream(c, ctx12), "tls12")
+listen(8446, lambda c: handle_stream(c, None), "raw")
+listen(8447, handle_http, "http")
+threading.Thread(target=udp_loop, daemon=True).start()
+time.sleep(0.5)
+open("/run/relay-test.ports", "w").write("\n".join(bound) + "\n")
 while True:
-    conn, _ = srv.accept()
-    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+    time.sleep(3600)
 PYEOF
 nohup python3 /run/relay-tls-srv.py >/dev/null 2>&1 &
 echo $! > /run/relay-tls.pid
-sleep 1
-ss -tlnH | grep -q ':8444 '
+sleep 1.5
+[ -s /run/relay-test.ports ]
+if ufw status 2>/dev/null | grep -q '^Status: active'; then
+  while IFS=: read -r proto port kind; do
+    [ -n "$port" ] || continue
+    ufw allow from "$RELAY" to any port "$port" proto "$proto" >/dev/null
+    echo "$port/$proto" >> /run/relay-tls.fw
+  done < /run/relay-test.ports
+fi
 EOF
 
   # клиент TLS-теста (запускается на RELAY): "Мбит/с байт ошибка"
   cat > "$D/tlstest-client.py" <<'EOF'
-import socket, ssl, sys, threading, time
-host, port, sni, mode, n, secs = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5]), float(sys.argv[6])
-mss = int(sys.argv[7]) if len(sys.argv) > 7 else 0
-ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
-total = [0] * n
-errs = [""] * n
+import socket, ssl, struct, sys, threading, time
 
-def worker(i):
-    phase = "CONNECT"
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        if mss:
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, mss)
-        s.settimeout(8)
-        s.connect((host, port))
-        phase = "HANDSHAKE"
-        t = ctx.wrap_socket(s, server_hostname=sni)
-        t.settimeout(5)
-        phase = "DATA"
-        t.sendall(mode.encode())
-        end = time.time() + secs
-        buf = b"x" * 65536
-        while time.time() < end:
-            if mode == "D":
-                d = t.recv(262144)
-                if not d:
-                    break
-                total[i] += len(d)
+kind = sys.argv[1]
+
+def tcp_run():
+    host, port, sni, mode, n, secs = sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], int(sys.argv[6]), float(sys.argv[7])
+    mss = int(sys.argv[8]) if len(sys.argv) > 8 else 0
+    idle = float(sys.argv[9]) if len(sys.argv) > 9 else 0
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    total = [0] * n
+    errs = [""] * n
+    host_hdr = host if sni == "-" else sni
+    req = ("GET /big.bin HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n" % host_hdr).encode()
+
+    def worker(i):
+        phase = "CONNECT"
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if mss:
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, mss)
+            s.settimeout(8)
+            s.connect((host, port))
+            conn = s
+            if kind == "tls":
+                phase = "HANDSHAKE"
+                conn = ctx.wrap_socket(s, server_hostname=None if sni == "-" else sni)
+            conn.settimeout(5)
+            phase = "DATA"
+            if idle:
+                time.sleep(idle)
+            if kind == "http":
+                conn.sendall(req)
+                m = "D"
             else:
-                t.sendall(buf)
-                total[i] += len(buf)
-    except (socket.timeout, TimeoutError):
-        errs[i] = "STALL" if phase == "DATA" else phase + ": timeout"
-    except Exception as e:
-        msg = str(e)
-        if phase == "DATA" and "timed out" in msg:
-            errs[i] = "STALL"
-        else:
-            errs[i] = phase + ": " + type(e).__name__ + " " + msg[:50].replace("\n", " ")
+                conn.sendall(mode.encode())
+                m = mode
+            end = time.time() + secs
+            buf = b"x" * 65536
+            while time.time() < end:
+                if m == "D":
+                    d = conn.recv(262144)
+                    if not d:
+                        break
+                    total[i] += len(d)
+                else:
+                    conn.sendall(buf)
+                    total[i] += len(buf)
+        except (socket.timeout, TimeoutError):
+            errs[i] = "STALL" if phase == "DATA" else phase + ": timeout"
+        except Exception as e:
+            msg = str(e)
+            if phase == "DATA" and "timed out" in msg:
+                errs[i] = "STALL"
+            else:
+                errs[i] = phase + ": " + type(e).__name__ + " " + msg[:50].replace("\n", " ")
 
-th = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
-t0 = time.time()
-for x in th:
-    x.start()
-for x in th:
-    x.join(secs + 12)
-el = max(time.time() - t0, 0.001)
-b = sum(total)
-print(int(b * 8 / el / 1e6), b, next((e for e in errs if e), ""))
+    th = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    t0 = time.time()
+    for x in th:
+        x.start()
+    for x in th:
+        x.join(secs + idle + 12)
+    el = max(time.time() - t0 - idle, 0.001)
+    b = sum(total)
+    print(int(b * 8 / el / 1e6), b, next((e for e in errs if e), ""))
+
+def udp_echo():
+    host, port = sys.argv[2], int(sys.argv[3])
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0.3)
+    got = 0
+    for i in range(20):
+        s.sendto(b"E" + struct.pack(">I", i) + b"p" * 60, (host, port))
+        try:
+            d, _ = s.recvfrom(2048)
+            if d[:1] == b"E":
+                got += 1
+        except socket.timeout:
+            pass
+        time.sleep(0.05)
+    print(0, got, "")
+
+def udp_blast():
+    host, port, secs = sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(1.0)
+    for _ in range(3):
+        s.sendto(b"D", (host, port))
+    seqs = set()
+    total_hint = 0
+    t0 = time.time()
+    last = t0
+    while time.time() < t0 + secs + 2:
+        try:
+            d, _ = s.recvfrom(2048)
+        except socket.timeout:
+            if seqs and time.time() - last > 1.5:
+                break
+            if not seqs and time.time() - t0 > 3:
+                break
+            continue
+        last = time.time()
+        if d[:1] == b"Z":
+            total_hint = struct.unpack(">I", d[1:5])[0]
+            break
+        seqs.add(struct.unpack(">I", d[:4])[0])
+    recv = len(seqs)
+    sent = max(total_hint, (max(seqs) + 1) if seqs else 0)
+    dur = max(time.time() - t0, 0.001)
+    loss = int(100 * (1 - recv / sent)) if sent else 100
+    print(int(recv * 1200 * 8 / dur / 1e6), recv * 1200, "" if recv and loss < 5 else "loss %d%%" % loss)
+
+{"udp-echo": udp_echo, "udp-blast": udp_blast}.get(kind, tcp_run)()
 EOF
 
   cat > "$D/uninstall-backend.sh" <<'EOF'
-RELAY="$1"; DOMAIN="$2"; RM_XUI="$3"; RM_WEB="$4"
+RELAY="$1"; DOMAIN="$2"; RM_XUI="$3"; RM_WEB="$4"; DIRECT="${5:-0}"
 systemctl disable --now rathole >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/rathole.service /usr/local/bin/rathole /usr/local/bin/switch-relay
 rm -rf /etc/rathole
@@ -1388,6 +1709,9 @@ rm -f /etc/systemd/system/sync-sub-path.service /etc/systemd/system/sync-sub-pat
 rm -f /etc/sysctl.d/99-relay-network-tuning.conf /etc/modules-load.d/relay-bbr.conf
 systemctl daemon-reload
 [ -n "$RELAY" ] && ufw delete allow from "$RELAY" to any port 8443 proto udp >/dev/null 2>&1 || true
+if [ "$DIRECT" = 1 ]; then
+  for r in 80/tcp 443/tcp 8443/tcp 8443/udp; do ufw delete allow "$r" >/dev/null 2>&1 || true; done
+fi
 if [ "$RM_XUI" = 1 ]; then
   systemctl disable --now x-ui >/dev/null 2>&1 || true
   rm -rf /usr/local/x-ui /etc/x-ui /usr/bin/x-ui /etc/systemd/system/x-ui.service
@@ -1401,6 +1725,28 @@ if [ "$RM_WEB" = 1 ]; then
 fi
 true
 EOF
+
+  # firewall для режима «Backend без relay»: порты открыты для всех
+  cat > "$D/ufw-backend-direct.sh" <<'EOF'
+set -e
+ports=$( {
+  ss -tlnp 2>/dev/null | awk '/"sshd"/ { n = split($4, a, ":"); print a[n] }'
+  sshd -T 2>/dev/null | awk '/^port / { print $2 }'
+  systemctl show ssh.socket -p Listen 2>/dev/null | sed -n 's/^Listen=.*:\([0-9][0-9]*\) (Stream)$/\1/p'
+  [ -n "${SSH_CONNECTION:-}" ] && echo "$SSH_CONNECTION" | awk '{ print $4 }'
+} | grep -E '^[0-9]+$' | sort -un || true )
+[ -n "$ports" ] || { echo "sshd port not found" >&2; exit 1; }
+for p in $ports; do ufw allow "$p/tcp"; done
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw allow 8443/tcp
+ufw allow 8443/udp
+ufw --force enable
+ufw status
+EOF
+
+  # служебная команда без switch-relay (режим без relay): только sync-sub-path и таймер
+  sed '/^cat > \/usr\/local\/bin\/switch-relay/,/^chmod +x \/usr\/local\/bin\/switch-relay/d' "$D/helper-backend.sh" > "$D/helper-sub.sh"
 
   # тест данных через туннель: временный TCP-сервер на BACKEND 127.0.0.1:8443 отдаёт 256 КБ
   cat > "$D/tuntest.py" <<'EOF'
@@ -1450,12 +1796,12 @@ load_conf() {
 save_conf() {
   umask 077
   cat > "$CONF_FILE" <<EOF
-RELAY_IP=$RELAY_IP
-BACKEND_IP=$BACKEND_IP
-BACKEND_PORT=$BACKEND_PORT
-DOMAIN=$DOMAIN
-EMAIL=$EMAIL
-SECRET=$SECRET
+RELAY_IP=${RELAY_IP:-}
+BACKEND_IP=${BACKEND_IP:-}
+BACKEND_PORT=${BACKEND_PORT:-}
+DOMAIN=${DOMAIN:-}
+EMAIL=${EMAIL:-}
+SECRET=${SECRET:-}
 KEY_PATH=${KEY_PATH:-}
 EOF
   chmod 600 "$CONF_FILE"
@@ -1492,14 +1838,213 @@ preflight() {
 
 }
 
-run_install() {
-  STEP=0; TOTAL=14
+check_reinstall() {
   if [ -f "$MARKER_FILE" ]; then
     warn "установка уже выполнялась (метка: $(marker_get INSTALLED_AT), статус: $(marker_get STATUS))"
     confirm "Удалить всё и установить заново?" || { echo "  Отменено."; exit 0; }
     do_uninstall || exit 0
-    STEP=0; TOTAL=14
   fi
+}
+
+# установка 3x-ui и вывод данных панели (глобальные xu xp xw xt)
+xui_stage() {
+  step_run "Установка 3x-ui (SQLite, порт $PANEL_PORT, панель на 127.0.0.1)" rscript "$TMPD/xui.sh" "$PANEL_PORT" || die "3x-ui не установился"
+  local res
+  res=$(bk 'cat /etc/x-ui/install-result.env' 2>>"$LOG")
+  getv() { printf '%s\n' "$res" | sed -n "s/^$1=//p" | head -1 | sed "s/^'//; s/'$//"; }
+  xu=$(getv XUI_USERNAME); xp=$(getv XUI_PASSWORD); xw=$(getv XUI_WEB_BASE_PATH); xt=$(getv XUI_API_TOKEN)
+  if ! { [ -n "$xu" ] && [ -n "$xp" ] && [ -n "$xw" ]; }; then
+    warn "файл данных установщика не найден (панель уже была установлена?) — задаю новые данные входа"
+    xu=$(openssl rand -hex 5); xp=$(openssl rand -hex 5); xw=$(openssl rand -hex 9)
+    bk "/usr/local/x-ui/x-ui setting -username '$xu' -password '$xp' -port $PANEL_PORT -webBasePath '$xw' -listenIP 127.0.0.1 && systemctl restart x-ui" >>"$LOG" 2>&1 || die "не удалось задать данные панели"
+    xt=$(bk "/usr/local/x-ui/x-ui setting -getApiToken" 2>>"$LOG" | grep -Eo 'apiToken: .+' | awk '{print $2}')
+  fi
+  echo
+  rule
+  printf '  %sPanel Installation Complete!%s\n' "$GRN" "$R"
+  rule
+  printf '%sUsername:    %s%s\n' "$GRN" "$xu" "$R"
+  printf '%sPassword:    %s%s\n' "$GRN" "$xp" "$R"
+  printf '%sPort:        %s%s\n' "$GRN" "$PANEL_PORT" "$R"
+  printf '%sWebBasePath: %s%s\n' "$GRN" "$xw" "$R"
+  printf '%sDatabase:    SQLite (/etc/x-ui/x-ui.db)%s\n' "$GRN" "$R"
+  printf '%sAccess URL:  http://127.0.0.1:%s/%s%s\n' "$GRN" "$PANEL_PORT" "$xw" "$R"
+  printf '%sAPI Token:   %s%s\n' "$GRN" "${xt:-—}" "$R"
+  rule
+
+}
+
+backend_os_check() {
+  local bos
+  bos=$(bk '. /etc/os-release; echo "$ID $VERSION_ID"' 2>>"$LOG")
+  case "$bos" in
+    ubuntu\ *) if version_ge "${bos#ubuntu }" 22.04; then ok "ОС: Ubuntu ${bos#ubuntu }"; else die "нужна Ubuntu 22.04 или новее (найдена ${bos#ubuntu })"; fi ;;
+    debian\ *) warn "ОС: $bos (скрипт рассчитан на Ubuntu 22.04+)" ;;
+    *) warn "ОС не определена: ${bos:-?}" ;;
+  esac
+}
+
+# ───────────────────────── режим 1: Backend без relay ─────────────────────────
+run_install_backend() {
+  INSTALL_KIND="backend"
+  STEP=0; TOTAL=9
+  check_reinstall
+  STEP=0; TOTAL=9
+  SECRET="${SECRET:-}"
+
+  echo
+  echo "${B}Параметры${R}"
+  thin
+  while true; do
+    ask BACKEND_IP "IP сервера (этот сервер или удалённый, настраивается по SSH)" ""
+    valid_ip "$BACKEND_IP" && break
+    fail "неверный IP"
+    BACKEND_IP=""
+  done
+  LOCAL_BACKEND=0
+  if [ "$BACKEND_IP" = "$RELAY_IP" ]; then
+    LOCAL_BACKEND=1
+    ok "это текущий сервер: установка выполняется локально (без SSH)"
+  else
+    while true; do
+      ask BACKEND_PORT "SSH-порт сервера" "${BACKEND_PORT:-1119}"
+      valid_port "$BACKEND_PORT" && break
+      fail "неверный порт"
+    done
+    [ -n "${KEY_FILE:-}" ] || read_key
+  fi
+  while true; do
+    ask DOMAIN "Домен панели (A-запись → IP сервера)" "${DOMAIN:-}"
+    valid_dom "$DOMAIN" && break
+    fail "неверный домен"
+    DOMAIN=""
+  done
+  EMAIL="admin@$DOMAIN"   # e-mail для Let's Encrypt: не спрашиваем
+  DNS_TARGET="$BACKEND_IP"
+  echo
+  dns_check
+  DNS_OK=$?
+
+  echo
+  rule
+  printf '  %sПлан установки (Backend без relay)%s\n' "$B" "$R"
+  rule
+  if [ $LOCAL_BACKEND -eq 1 ]; then kv "Server" "$BACKEND_IP (этот сервер, локально)"; else kv "Server" "$BACKEND_IP (SSH :$BACKEND_PORT)"; fi
+  kv "Domain" "$DOMAIN → https://$DOMAIN/<WebBasePath>"
+  kv "E-mail" "$EMAIL"
+  kv "Ports" "открываются 80, 443, 8443/tcp, 8443/udp; SSH сохраняется (ufw)"
+  kv "Panel" "3x-ui на 127.0.0.1:$PANEL_PORT (SQLite), nginx + Let's Encrypt"
+  kv "Network" "BBR, буферы TCP/UDP, MTU probing"
+  rule
+  echo
+  confirm "Всё верно, начать установку?" || { echo "  Отменено."; exit 0; }
+  write_marker in-progress
+  make_remote_scripts
+
+  # [1]
+  section "Подключение к серверу"
+  if [ $LOCAL_BACKEND -eq 1 ]; then ok "локальный режим (SSH не нужен)"; else ssh_connect; fi
+  backend_os_check
+
+  # [2]
+  section "Сетевая оптимизация"
+  step_run "BBR, буферы TCP/UDP, MTU probing, keepalive" rscript "$TMPD/tune.sh" || warn "твики применены не полностью"
+  local cc
+  cc=$(bk 'sysctl -n net.ipv4.tcp_congestion_control' 2>>"$LOG")
+  if [ "$cc" = bbr ]; then ok "congestion control = bbr"; else warn "congestion control = ${cc:-?} (BBR недоступен: ядро или виртуализация)"; fi
+
+  # [3]
+  section "Пакеты и обновление системы"
+  step_run "apt update/upgrade, nginx, certbot, ufw" rscript "$TMPD/pkgs.sh" || die "не удалось подготовить сервер"
+
+  # [4] firewall до выпуска сертификата
+  section "Firewall"
+  step_run "ufw: SSH сохранён, открыты 80, 443, 8443/tcp, 8443/udp" rscript "$TMPD/ufw-backend-direct.sh" || die "не удалось настроить firewall"
+
+  # [5]
+  section "3x-ui"
+  xui_stage
+
+  # [6]
+  section "nginx (временный конфиг)"
+  step_run "nginx: порт 80 → панель" rscript "$TMPD/nginx-temp.sh" "$DOMAIN" || die "nginx не настроился"
+  local code
+  code=$(bk "curl -s -o /dev/null --max-time 15 -w '%{http_code}' -H 'Host: $DOMAIN' http://127.0.0.1:80/" 2>>"$LOG")
+  if [ -n "$code" ] && [ "$code" != "000" ]; then ok "nginx отвечает на порту 80 (HTTP $code)"; else warn "nginx не отвечает на порту 80"; fi
+
+  # [7]
+  section "Сертификат Let's Encrypt"
+  CERT_OK=0
+  if [ "$DNS_OK" -ne 0 ]; then warn "DNS не подтверждён — попытка выпуска может не удаться"; fi
+  while true; do
+    if step_run "certbot --webroot для $DOMAIN" rscript "$TMPD/cert.sh" "$DOMAIN" "$EMAIL"; then CERT_OK=1; break; fi
+    warn "не удалось выпустить сертификат (DNS ещё не разошёлся? порт 80 недоступен?)"
+    confirm "Повторить?" || break
+  done
+
+  # [8]
+  section "nginx (финальный конфиг), подписка, автопродление"
+  step_run "Служебная команда sync-sub-path (автосинхронизация подписки)" rscript "$TMPD/helper-sub.sh" || warn "sync-sub-path не установлен"
+  local scheme=http
+  [ $CERT_OK -eq 1 ] && scheme=https
+  SUB_PATHS=$(rscript "$TMPD/sub-setup.sh" "$DOMAIN" "$scheme" 2>>"$LOG" | tail -n1)
+  bk "/usr/local/bin/sync-sub-path" >>"$LOG" 2>&1 || true
+  if [ -n "$SUB_PATHS" ]; then ok "подписка: путь из панели $SUB_PATHS внесён в nginx (смена пути в панели подхватывается за ~15 с)"; else warn "не удалось настроить подписку (см. лог)"; fi
+  if [ $CERT_OK -eq 1 ]; then
+    step_run "nginx: сертификат, пути подписки из панели, автопродление" rscript "$TMPD/nginx-final.sh" "$DOMAIN" || die "не удалось включить финальный конфиг nginx"
+  else
+    warn "без сертификата оставлен временный конфиг: панель доступна по http://$DOMAIN/$xw"
+  fi
+
+  # [9]
+  section "Проверка и итог"
+  save_conf
+  write_marker "done"
+  ok "настройки сохранены: $CONF_FILE, метка установки: $MARKER_FILE"
+  local final_url final_code
+  if [ $CERT_OK -eq 1 ]; then
+    final_url="https://$DOMAIN/$xw"
+    final_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' "$final_url" 2>/dev/null)
+    if [ "$final_code" = "200" ]; then ok "HTTPS: $final_url → HTTP 200 (сертификат валиден)"; else warn "HTTPS-проверка вернула HTTP ${final_code:-000} (DNS мог ещё не разойтись)"; fi
+  else
+    final_url="http://$DOMAIN/$xw"
+  fi
+  {
+    echo "Backend Setup (без relay) v$VERSION — $(date '+%F %T')"
+    echo "Server:       $BACKEND_IP"
+    echo "Domain:       $DOMAIN"
+    echo "Panel URL:    $final_url"
+    echo "Username:     $xu"
+    echo "Password:     $xp"
+    echo "API Token:    ${xt:-—}"
+  } > "$REPORT_FILE"
+  chmod 600 "$REPORT_FILE"
+
+  echo
+  rule
+  printf '  %sДоступ к панели%s\n' "$GRN" "$R"
+  rule
+  printf '%s%s%s\n' "$B" "$final_url" "$R"
+  printf '%sUsername:    %s%s\n' "$GRN" "$xu" "$R"
+  printf '%sPassword:    %s%s\n' "$GRN" "$xp" "$R"
+  rule
+  echo "  ${DIM}Отчёт с этими данными: $REPORT_FILE (права 600)${R}"
+  echo "  ${DIM}Лог установки:         $LOG${R}"
+  echo
+  echo "  ${B}Дальше — в панели:${R}"
+  echo "   • VLESS Reality: Listen IP пусто (все интерфейсы), порт 8443, пользовательский адрес $DOMAIN"
+  echo "   • Hysteria2: Listen пусто, порт 8443/udp, SNI $DOMAIN, сертификат /etc/letsencrypt/live/$DOMAIN/"
+  echo "   • Подписка уже настроена: путь ${SUB_PATHS:-?}, ссылки вида $scheme://$DOMAIN${SUB_PATHS:-/}<subId>."
+  echo "     Если смените путь в панели — nginx подхватит сам за ~15 секунд (вручную: sync-sub-path)"
+  echo "   • Панель безопаснее открывать через SSH-туннель: ssh -L 9999:127.0.0.1:$PANEL_PORT root@$BACKEND_IP → http://127.0.0.1:9999/$xw"
+  echo
+}
+
+run_install() {
+  INSTALL_KIND="relay"
+  STEP=0; TOTAL=14
+  check_reinstall
+  STEP=0; TOTAL=14
 
   # ── вопросы
   echo
@@ -1623,29 +2168,7 @@ run_install() {
 
   # [8] 3x-ui
   section "BACKEND: 3x-ui"
-  step_run "Установка 3x-ui (SQLite, порт $PANEL_PORT, панель на 127.0.0.1)" rscript "$TMPD/xui.sh" "$PANEL_PORT" || die "3x-ui не установился"
-  local res xu xp xw xt
-  res=$(bk 'cat /etc/x-ui/install-result.env' 2>>"$LOG")
-  getv() { printf '%s\n' "$res" | sed -n "s/^$1=//p" | head -1 | sed "s/^'//; s/'$//"; }
-  xu=$(getv XUI_USERNAME); xp=$(getv XUI_PASSWORD); xw=$(getv XUI_WEB_BASE_PATH); xt=$(getv XUI_API_TOKEN)
-  if ! { [ -n "$xu" ] && [ -n "$xp" ] && [ -n "$xw" ]; }; then
-    warn "файл данных установщика не найден (панель уже была установлена?) — задаю новые данные входа"
-    xu=$(openssl rand -hex 5); xp=$(openssl rand -hex 5); xw=$(openssl rand -hex 9)
-    bk "/usr/local/x-ui/x-ui setting -username '$xu' -password '$xp' -port $PANEL_PORT -webBasePath '$xw' -listenIP 127.0.0.1 && systemctl restart x-ui" >>"$LOG" 2>&1 || die "не удалось задать данные панели"
-    xt=$(bk "/usr/local/x-ui/x-ui setting -getApiToken" 2>>"$LOG" | grep -Eo 'apiToken: .+' | awk '{print $2}')
-  fi
-  echo
-  rule
-  printf '  %sPanel Installation Complete!%s\n' "$GRN" "$R"
-  rule
-  printf '%sUsername:    %s%s\n' "$GRN" "$xu" "$R"
-  printf '%sPassword:    %s%s\n' "$GRN" "$xp" "$R"
-  printf '%sPort:        %s%s\n' "$GRN" "$PANEL_PORT" "$R"
-  printf '%sWebBasePath: %s%s\n' "$GRN" "$xw" "$R"
-  printf '%sDatabase:    SQLite (/etc/x-ui/x-ui.db)%s\n' "$GRN" "$R"
-  printf '%sAccess URL:  http://127.0.0.1:%s/%s%s\n' "$GRN" "$PANEL_PORT" "$xw" "$R"
-  printf '%sAPI Token:   %s%s\n' "$GRN" "${xt:-—}" "$R"
-  rule
+  xui_stage
 
   # [9] nginx временный
   section "BACKEND: nginx (временный конфиг)"
@@ -1748,7 +2271,8 @@ main() {
   preflight
   menu
   case "$MODE" in
-    install) run_install ;;
+    install_backend) run_install_backend ;;
+    install_relay) run_install ;;
     test) run_test ;;
     uninstall) do_uninstall ;;
   esac
