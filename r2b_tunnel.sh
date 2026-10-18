@@ -11,8 +11,8 @@
 # Туннель rathole работает по TLS (свой CA, SNI = домен панели). Noise-транспорт не используется:
 # поток из случайных байт сам по себе выглядит подозрительно.
 #
-VERSION="1.7.0"
-NAME="RELAY·BACKEND Tunnel Setup"
+VERSION="2.0.0"
+NAME="Server Setup Toolkit"
 
 set -u
 set -o pipefail
@@ -61,10 +61,11 @@ banner() {
   printf '  %s%s%s\n' "$B" "$NAME" "$R"
   printf '  %sверсия %s%s\n' "$DIM" "$VERSION" "$R"
   rule
-  echo "  Настройка связки «РФ-реле + обратный туннель + запасной UDP»:"
-  echo "   • RELAY (этот сервер): rathole-server, firewall, пересылка UDP"
-  echo "   • BACKEND (по SSH): 3x-ui, nginx, сертификат, firewall"
-  echo "   • в конце — данные для входа в панель по домену (https)"
+  echo "  Всё для серверов в одном скрипте:"
+  echo "   • подготовка сервера: обновление, SSH-порт и ключ, fail2ban, автообновления"
+  echo "   • Backend с 3x-ui, nginx и сертификатом (с relay или без)"
+  echo "   • Relay: обратный туннель rathole (TLS), firewall, пересылка UDP"
+  echo "   • тест блокировок (16 КБ, SNI, порты, UDP) и скорости между серверами"
   rule
   echo
   rd -r -p "  Нажмите Enter, чтобы начать." _
@@ -95,8 +96,17 @@ ask() {  # ask VAR "Вопрос" "по умолчанию"
   printf -v "$__v" '%s' "$a"
 }
 
+# сбрасываем всё, что накопилось в буфере терминала (случайные Enter, хвост вставленного ключа),
+# иначе «залежавшийся» Enter мгновенно ответит «да» на следующий вопрос
+drain_tty() {
+  ( : < /dev/tty ) 2>/dev/null || return 0
+  local _j
+  while IFS= read -r -t 0.05 -n 1 _j < /dev/tty; do :; done
+}
+
 confirm() {  # Enter / y = да, n = нет
   local a
+  drain_tty
   while true; do
     rd -r -p "${B}?${R} $1 ${DIM}[Enter или y — да / n — нет]${R}: " a
     case "${a:-y}" in
@@ -113,7 +123,9 @@ version_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ];
 valid_dom()  { [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; }
 
 # ───────────────────────── выполнение шагов с анимацией ─────────────────────────
-step_run() {  # step_run "Описание" команда args...
+step_run() {  # step_run [-s] "Описание" команда args...   (-s: при ошибке только предупреждение)
+  local soft=0
+  if [ "${1:-}" = "-s" ]; then soft=1; shift; fi
   local label="$1"
   shift
   local t0=$SECONDS pid rc i=0
@@ -131,6 +143,8 @@ step_run() {  # step_run "Описание" команда args...
   rc=$?
   if [ $rc -eq 0 ]; then
     ok "$label ${DIM}($((SECONDS - t0))с)${R}"
+  elif [ $soft -eq 1 ]; then
+    warn "$label — пропущено"
   else
     fail "$label"
     echo "${DIM}    ── последние строки лога ($LOG) ──${R}"
@@ -222,24 +236,27 @@ menu() {
   echo
   echo "${B}Что делаем?${R}"
   thin
+  if [ -f "$PREP_MARKER_FILE" ]; then
+    info "подготовка сервера уже выполнена: $(awk -F= '/^ran_at=/{print $2}' "$PREP_MARKER_FILE"), SSH-порт $(awk -F= '/^ssh_port=/{print $2}' "$PREP_MARKER_FILE") (повторный выбор пункта 1 предложит откат)"
+  fi
   if [ $has -eq 1 ]; then
     k=$(marker_get KIND); k="${k:-relay}"
     info "найдена метка установки: $(marker_get INSTALLED_AT), статус: $(marker_get STATUS), режим: $k, сервер $(marker_get BACKEND_IP), домен $(marker_get DOMAIN)"
   fi
-  echo "  ${B}1${R}. Установить и настроить Backend сервер с 3X-UI панелью (без relay)"
-  echo "  ${B}2${R}. Установить и настроить Relay + Backend сервер с 3X-UI панелью"
-  echo "  ${B}3${R}. Протестировать BACKEND сервер"
-  [ $has -eq 1 ] && echo "  ${B}4${R}. Отменить установку (удалить всё)"
-  echo "  ${B}5${R}. Проверить IP на блокировки (без доступа к серверу)"
+  echo "  ${B}1${R}. Подготовить сервер"
+  echo "  ${B}2${R}. Установить и настроить Backend сервер с 3X-UI панелью (без relay)"
+  echo "  ${B}3${R}. Установить и настроить Relay + Backend сервер с 3X-UI панелью"
+  echo "  ${B}4${R}. Протестировать BACKEND сервер"
+  [ $has -eq 1 ] && echo "  ${B}5${R}. Отменить установку (удалить всё)"
   while true; do
     rd -r -p "${B}?${R} Выберите вариант: " c
     case "$c" in
-      1) MODE="install_backend"; return 0 ;;
-      2) MODE="install_relay"; return 0 ;;
-      3) MODE="test"; return 0 ;;
-      4) if [ $has -eq 1 ]; then MODE="uninstall"; return 0; fi; fail "вариант 4 доступен только после установки" ;;
-      5) MODE="ipcheck"; return 0 ;;
-      *) if [ $has -eq 1 ]; then fail "введите число от 1 до 5"; else fail "введите 1, 2, 3 или 5"; fi ;;
+      1) MODE="prepare"; return 0 ;;
+      2) MODE="install_backend"; return 0 ;;
+      3) MODE="install_relay"; return 0 ;;
+      4) MODE="test"; return 0 ;;
+      5) if [ $has -eq 1 ]; then MODE="uninstall"; return 0; fi; fail "вариант 5 доступен только после установки" ;;
+      *) if [ $has -eq 1 ]; then fail "введите от 1 до 5"; else fail "введите от 1 до 4"; fi ;;
     esac
   done
 }
@@ -498,6 +515,7 @@ run_test() {
 
   section "Подключение к BACKEND"
   ssh_connect
+  rscript "$TMPD/f2b-ignore.sh" "$RELAY_IP" >>"$LOG" 2>&1 || true
 
   section "Подготовка: iperf3 и сетевые настройки"
   if command -v iperf3 >/dev/null 2>&1; then
@@ -722,295 +740,6 @@ run_test() {
   fi
   for m in "${notes[@]}"; do echo "   ${BLU}•${R} $m"; done
   echo "  ${DIM}Тест идёт напрямую RELAY→BACKEND, без туннеля rathole, на свободных портах. Сырые ответы: $LOG${R}"
-  echo
-}
-
-# ───────────────────────── проверка IP на блокировки (без доступа к серверу) ─────────────────────────
-# одна попытка TCP-подключения: → "код миллисекунды" (0 = успех, 124 = таймаут, 1 = отказ/нет маршрута)
-tcp_try() {  # tcp_try IP порт
-  local t0 t1 rc
-  t0=$(date +%s%N)
-  timeout 5 bash -c 'exec 3<>/dev/tcp/$0/$1' "$1" "$2" 2>/dev/null
-  rc=$?
-  t1=$(date +%s%N)
-  echo "$rc $(((t1 - t0) / 1000000))"
-}
-
-# первая строка, которую сервер присылает сам (SSH, SMTP, FTP…)
-first_line() {  # first_line IP порт секунд
-  timeout $(($3 + 2)) bash -c 'exec 3<>/dev/tcp/$0/$1; IFS= read -r -t "$2" l <&3 && printf "%s" "$l"' "$1" "$2" "$3" 2>/dev/null | head -c 80 | tr -d '\r\n'
-}
-
-# TLS-рукопожатие: → ok | reset | notls | stall
-tls_probe() {  # tls_probe IP порт [SNI]
-  local sni_opt out rc
-  if [ -n "${3:-}" ]; then sni_opt=(-servername "$3"); else sni_opt=(-noservername); fi
-  out=$(timeout 9 openssl s_client -connect "$1:$2" "${sni_opt[@]}" </dev/null 2>&1)
-  rc=$?
-  printf '%s\n' "$out" >>"$LOG"
-  if echo "$out" | grep -qE 'Cipher is [A-Za-z0-9_-]+|BEGIN CERTIFICATE'; then echo ok
-  elif [ $rc -eq 124 ]; then echo stall
-  elif echo "$out" | grep -qiE 'reset|errno=104'; then echo reset
-  else echo notls; fi
-}
-
-# метка сервера в итогах: RELAY / BACKEND, если IP совпадает с известным
-srv_label() {
-  if [ "$1" = "${RELAY_IP:-}" ]; then echo "RELAY"
-  elif [ "$1" = "${BACKEND_IP:-}" ]; then echo "BACKEND"
-  fi
-}
-
-ipcheck_one() {  # ipcheck_one IP  (ports, SUM_* — из run_ipcheck)
-  local ip="$1"
-  STEP=0; TOTAL=4
-  local p x i n_ok last_rc rc ms lastms
-  local -A LST=() OKP=()
-  local problems=() warns=() notes=()
-  [ "$ip" = "${RELAY_IP:-}" ] && warn "это IP самого RELAY — проверка отсюда не имеет смысла"
-  : > "$TMPD/ipcheck.log"
-
-  # ── 1. ping и трассировка
-  section "Доступность отсюда: ping и трассировка"
-  local pg loss rtt
-  pg=$(ping -c 5 -W 2 -q "$ip" 2>&1)
-  echo "$pg" >>"$LOG"
-  loss=$(echo "$pg" | sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p')
-  rtt=$(echo "$pg" | sed -n 's/.*= [0-9.]*\/\([0-9.]*\)\/.*/\1/p')
-  if [ -z "$loss" ]; then res_line warn "Ping" "не удалось выполнить"
-  elif [ "${loss%.*}" -ge 100 ]; then res_line warn "Ping" "нет ответа (ICMP часто закрыт и у живых серверов — смотрите TCP)"
-  elif [ "${loss%.*}" -gt 0 ]; then res_line warn "Ping" "RTT ${rtt%.*} мс, потери ${loss}%"
-  else res_line ok "Ping" "RTT ${rtt%.*} мс, потери 0%"; fi
-  if ! command -v traceroute >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-    apt-get -o DPkg::Lock::Timeout=60 install -y traceroute >>"$LOG" 2>&1 || true
-  fi
-  if command -v traceroute >/dev/null 2>&1; then
-    local tr last hops
-    tr=$(timeout 45 traceroute -T -p "${ports[0]}" -n -w 1 -q 1 -m 18 "$ip" 2>&1)
-    echo "$tr" >>"$LOG"
-    hops=$(echo "$tr" | awk '$1 ~ /^[0-9]+$/ { n = $1 } END { print n + 0 }')
-    last=$(echo "$tr" | awk '$1 ~ /^[0-9]+$/ && $2 != "*" { h = $1; a = $2 } END { if (h) print h " (" a ")" }')
-    if echo "$tr" | awk -v ip="$ip" '$1 ~ /^[0-9]+$/ && $2 == ip { f = 1 } END { exit !f }'; then
-      res_line ok "Трасса (TCP :${ports[0]})" "дошла до цели"
-    else
-      res_line info "Трасса (TCP :${ports[0]})" "обрывается после прыжка ${last:-?} из $hops (справочно)"
-    fi
-  else
-    res_line info "Трасса" "traceroute не установлен — пропущено"
-  fi
-
-  # ── 2. TCP-подключение
-  section "TCP-подключение отсюда"
-  for p in "${ports[@]}"; do
-    n_ok=0; last_rc=0; lastms=0
-    for i in 1 2 3; do
-      read -r rc ms <<< "$(tcp_try "$ip" "$p")"
-      if [ "$rc" -eq 0 ]; then n_ok=$((n_ok + 1)); lastms=$ms; else last_rc=$rc; fi
-    done
-    if [ $n_ok -eq 3 ]; then LST[$p]=open; res_line ok "TCP :$p" "порт открыт (${lastms} мс)"
-    elif [ $n_ok -gt 0 ]; then LST[$p]=flaky; res_line warn "TCP :$p" "нестабильно: $n_ok из 3 попыток"
-    elif [ "$last_rc" -eq 124 ]; then LST[$p]=timeout; res_line fail "TCP :$p" "таймаут: пакеты SYN не доходят или ответ не возвращается"
-    else LST[$p]=refused; res_line info "TCP :$p" "отказ в соединении: сервер жив, но порт закрыт"; fi
-  done
-
-  # ── 3. баннер SSH / TLS
-  section "Данные после подключения: баннер и TLS"
-  local any=0 bl t1 t2
-  for p in "${ports[@]}"; do
-    case "${LST[$p]}" in open | flaky) ;; *) continue ;; esac
-    any=1
-    bl=$(first_line "$ip" "$p" 6)
-    if [[ "$bl" == SSH-* ]]; then
-      OKP[$p]=1; res_line ok "Баннер :$p" "$bl"; continue
-    elif [ -n "$bl" ]; then
-      OKP[$p]=1; res_line ok "Баннер :$p" "сервис ответил: $bl"; continue
-    fi
-    if [ "$p" -eq 22 ]; then
-      OKP[$p]=0; res_line fail "Баннер SSH :22" "TCP есть, баннера нет — «timed out during banner exchange»"
-      continue
-    fi
-    t1=$(tls_probe "$ip" "$p")
-    case "$t1" in
-      ok) OKP[$p]=1; res_line ok "TLS :$p, без SNI" "рукопожатие прошло" ;;
-      notls) OKP[$p]=1; res_line info "TLS :$p, без SNI" "сервис ответил, но это не TLS (обычный HTTP/иной протокол — нормально)" ;;
-      *)
-        t2=$(tls_probe "$ip" "$p" www.microsoft.com)
-        if [ "$t2" = ok ]; then
-          OKP[$p]=1; res_line warn "TLS :$p" "без SNI не проходит, с SNI www.microsoft.com — проходит"
-          warns+=("порт $p: TLS проходит только с SNI — похоже, фильтрация зависит от SNI")
-        else
-          OKP[$p]=0
-          if [ "$t1" = reset ]; then res_line fail "TLS :$p" "соединение сбрасывается после ClientHello (типично для DPI)"
-          else res_line fail "TLS :$p" "TCP есть, рукопожатие зависает — данные не идут"; fi
-        fi ;;
-    esac
-  done
-  [ $any -eq 0 ] && res_line info "Баннер / TLS" "нет открытых портов — проверять нечего"
-  info "постоянную «заморозку после ~16 КБ» этой проверкой не поймать: для неё нужен пункт 3 (тест BACKEND)"
-
-  # ── 4. взгляд со сторонних узлов
-  section "Взгляд из других сетей (check-host.net)"
-  cat > "$TMPD/chk.py" <<'PYEOF'
-import sys, json, time, urllib.request
-H = {"Accept": "application/json", "User-Agent": "relay-setup"}
-def get(u):
-    return json.load(urllib.request.urlopen(urllib.request.Request(u, headers=H), timeout=15))
-ip, port = sys.argv[1], sys.argv[2]
-try:
-    d = get("https://check-host.net/nodes/hosts")
-    nodes = d.get("nodes", d)
-    ru = [n for n, v in nodes.items() if v["location"][0] == "ru"][:4]
-    pref = ["de", "nl", "fi", "us", "fr", "se", "pl", "gb"]
-    seen, world = set(), []
-    for c in pref:
-        for n, v in nodes.items():
-            if v["location"][0] == c and c not in seen:
-                seen.add(c); world.append(n)
-    sel = ru + world[:4]
-    r = get("https://check-host.net/check-tcp?host=%s:%s&" % (ip, port) + "&".join("node=" + n for n in sel))
-    rid = r["request_id"]
-    res = {}
-    for _ in range(6):
-        time.sleep(4)
-        res = get("https://check-host.net/check-result/" + rid)
-        if all(res.get(n) is not None for n in sel):
-            break
-    for n in sel:
-        grp = "RU" if n in ru else "WORLD"
-        loc = nodes[n]["location"]
-        place = "%s, %s" % (loc[2] if len(loc) > 2 else "", loc[1])
-        v = res.get(n)
-        if not v:
-            print("%s|%s|%s|none|нет ответа от узла" % (grp, n.split(".")[0], place))
-        elif "time" in v[0]:
-            print("%s|%s|%s|ok|%.2f с" % (grp, n.split(".")[0], place, v[0]["time"]))
-        else:
-            print("%s|%s|%s|fail|%s" % (grp, n.split(".")[0], place, v[0].get("error", "ошибка")))
-except Exception as e:
-    print("ERR|%s" % e)
-PYEOF
-  local CH_OK=0 ru_ok ru_tot w_ok w_tot line g nm pl st dt cnt=0
-  local -A RUOK=() WOK=() RUT=() WT=()
-  for p in "${ports[@]:0:3}"; do
-    echo "  ${DIM}порт $p: опрашиваю узлы (около 20 секунд)…${R}"
-    ru_ok=0; ru_tot=0; w_ok=0; w_tot=0
-    python3 "$TMPD/chk.py" "$ip" "$p" > "$TMPD/chk-$ip-$p.txt" 2>>"$LOG"
-    cat "$TMPD/chk-$ip-$p.txt" >>"$LOG"
-    if [ ! -s "$TMPD/chk-$ip-$p.txt" ] || grep -q '^ERR|' "$TMPD/chk-$ip-$p.txt"; then
-      res_line warn "check-host.net :$p" "недоступен: $(sed -n 's/^ERR|//p' "$TMPD/chk-$ip-$p.txt" | head -n1)"
-      continue
-    fi
-    CH_OK=1
-    while IFS='|' read -r g nm pl st dt; do
-      [ -z "$nm" ] && continue
-      if [ "$g" = RU ]; then ru_tot=$((ru_tot + 1)); [ "$st" = ok ] && ru_ok=$((ru_ok + 1))
-      else w_tot=$((w_tot + 1)); [ "$st" = ok ] && w_ok=$((w_ok + 1)); fi
-      if [ "$st" = ok ]; then res_line ok "$([ "$g" = RU ] && echo РФ || echo Мир) :$p, $pl" "$dt"
-      else res_line fail "$([ "$g" = RU ] && echo РФ || echo Мир) :$p, $pl" "$dt"; fi
-    done < "$TMPD/chk-$ip-$p.txt"
-    RUOK[$p]=$ru_ok; RUT[$p]=$ru_tot; WOK[$p]=$w_ok; WT[$p]=$w_tot
-    cnt=$((cnt + 1))
-  done
-
-  # ── выводы по портам
-  local st_p ro rt wo wt
-  for p in "${ports[@]}"; do
-    st_p="${LST[$p]}"; ro="${RUOK[$p]:-}"; rt="${RUT[$p]:-0}"; wo="${WOK[$p]:-0}"; wt="${WT[$p]:-0}"
-    case "$st_p" in
-      timeout)
-        if [ "$wt" -gt 0 ] && [ "$wo" -gt 0 ] && [ "${ro:-0}" -eq 0 ]; then
-          problems+=("порт $p: из РФ не открывается, из-за рубежа открывается ($wo из $wt узлов) — блокировка на российской стороне (ТСПУ/РКН или фильтр оператора)")
-        elif [ "$wt" -gt 0 ] && [ "$wo" -eq 0 ]; then
-          warns+=("порт $p: недоступен отовсюду, в том числе из-за рубежа — это не блокировка РФ: сервер выключен, порт закрыт или режет firewall хостера")
-        elif [ "$wt" -eq 0 ]; then
-          warns+=("порт $p: таймаут отсюда; сторонние узлы недоступны, отличить блокировку от выключенного сервера нельзя")
-        else
-          warns+=("порт $p: таймаут отсюда, но часть российских узлов подключается — блокировка зависит от оператора")
-        fi ;;
-      refused) notes+=("порт $p: сервер отвечает отказом — он включён, просто на порту ничего не слушает") ;;
-      open | flaky)
-        [ "$st_p" = flaky ] && warns+=("порт $p: подключение нестабильно (часть пакетов теряется)")
-        if [ "${OKP[$p]:-1}" = 0 ]; then
-          problems+=("порт $p: TCP устанавливается, но данные не идут — так выглядит фильтрация DPI (как «timed out during banner exchange»)")
-        fi
-        if [ "$rt" -gt 0 ] && [ "${ro:-0}" -lt "$rt" ] && [ "${ro:-0}" -gt 0 ]; then
-          warns+=("порт $p: часть российских узлов не достучалась ($ro из $rt) — блокировка у отдельных операторов")
-        fi ;;
-    esac
-  done
-  # ── сохранить результат по серверу
-  local nopen=0
-  for p in "${ports[@]}"; do case "${LST[$p]}" in open | flaky) nopen=$((nopen + 1)) ;; esac; done
-  [ $CH_OK -eq 0 ] && notes+=("check-host.net был недоступен: вывод сделан только по проверкам с этого сервера")
-  SUM_P[$ip]=$(printf '%s\n' "${problems[@]}")
-  SUM_W[$ip]=$(printf '%s\n' "${warns[@]}")
-  SUM_N[$ip]=$(printf '%s\n' "${notes[@]}")
-  SUM_O[$ip]=$nopen
-}
-
-run_ipcheck() {
-  local ip ports=() IPS=() p x raw lab n
-  local -A SUM_P=() SUM_W=() SUM_N=() SUM_O=()
-  echo
-  echo "${B}Проверка IP на блокировки (без доступа к серверам)${R}"
-  thin
-  info "проверка идёт с этого сервера и со сторонних узлов check-host.net; на проверяемые серверы заходить не нужно"
-  info "можно указать несколько IP (до 4) через запятую или пробел, например RELAY и BACKEND"
-  while true; do
-    ask CHK_IP "IP-адреса для проверки"
-    raw="${CHK_IP//,/ }"; IPS=(); x=1
-    for p in $raw; do
-      if valid_ip "$p"; then
-        case " ${IPS[*]:-} " in *" $p "*) ;; *) IPS+=("$p") ;; esac
-      else x=0; fail "некорректный IPv4-адрес: $p"; fi
-    done
-    [ $x -eq 1 ] && [ ${#IPS[@]} -ge 1 ] && [ ${#IPS[@]} -le 4 ] && break
-    [ $x -eq 1 ] && fail "укажите от 1 до 4 адресов"
-  done
-  while true; do
-    ask CHK_PORTS "TCP-порты через запятую (до 4)" "22,443"
-    ports=(); x=1
-    IFS=',' read -ra arr <<< "${CHK_PORTS// /}"
-    for p in "${arr[@]}"; do valid_port "$p" && ports+=("$p") || x=0; done
-    [ $x -eq 1 ] && [ ${#ports[@]} -gt 0 ] && [ ${#ports[@]} -le 4 ] && break
-    fail "укажите от 1 до 4 портов (1–65535), например 22,443"
-  done
-
-  n=0
-  for ip in "${IPS[@]}"; do
-    n=$((n + 1)); lab=$(srv_label "$ip")
-    echo
-    rule
-    printf '  %sСервер %d из %d: %s%s%s\n' "$B" "$n" "${#IPS[@]}" "$ip" "${lab:+ ($lab)}" "$R"
-    rule
-    ipcheck_one "$ip"
-  done
-
-  # ── общий итог
-  echo
-  rule
-  echo "  ${B}Итог проверки${R}"
-  thin
-  local bad=() lvl m txt
-  for ip in "${IPS[@]}"; do
-    lab=$(srv_label "$ip"); lab="$ip${lab:+ ($lab)}"
-    if [ -n "${SUM_P[$ip]//[$'\n']/}" ]; then lvl=fail; txt="найдены проблемы"; bad+=("$lab")
-    elif [ -n "${SUM_W[$ip]//[$'\n']/}" ]; then lvl=warn; txt="есть замечания"; bad+=("$lab")
-    elif [ "${SUM_O[$ip]}" -gt 0 ]; then lvl=ok; txt="признаков блокировки не найдено"
-    else lvl=info; txt="блокировки не видно, но ни один из указанных портов не открыт"; fi
-    case "$lvl" in ok) m="${GRN}✔${R}" ;; warn) m="${YLW}▲${R}" ;; fail) m="${RED}✖${R}" ;; *) m="${BLU}•${R}" ;; esac
-    echo "  $m ${B}$lab${R} — $txt"
-    while IFS= read -r m; do [ -n "$m" ] && echo "      ${RED}✖${R} $m"; done <<< "${SUM_P[$ip]}"
-    while IFS= read -r m; do [ -n "$m" ] && echo "      ${YLW}▲${R} $m"; done <<< "${SUM_W[$ip]}"
-    while IFS= read -r m; do [ -n "$m" ] && echo "      ${BLU}•${R} $m"; done <<< "${SUM_N[$ip]}"
-  done
-  if [ ${#IPS[@]} -gt 1 ]; then
-    thin
-    if [ ${#bad[@]} -eq 0 ]; then echo "  ${GRN}${B}Проблем не найдено ни на одном сервере.${R}"
-    else echo "  ${B}Проблемы на: ${bad[*]}${R}"; fi
-  fi
-  echo "  ${DIM}Результат зависит от места запуска: проверка «отсюда» показывает, как этот сервер видит проверяемые IP. Сырые ответы: $LOG${R}"
   echo
 }
 
@@ -2017,6 +1746,20 @@ fi
 true
 EOF
 
+  # fail2ban (из «Подготовить сервер») не должен банить RELAY при повторных SSH-подключениях скрипта
+  cat > "$D/f2b-ignore.sh" <<'EOF'
+IP="$1"
+J=/etc/fail2ban/jail.local
+[ -f "$J" ] || exit 0
+if grep -q '^ignoreip' "$J"; then
+  grep -q "$IP" "$J" || sed -i "s|^ignoreip.*|& $IP|" "$J"
+else
+  sed -i "/^\[sshd\]/a ignoreip = 127.0.0.1/8 ::1 $IP" "$J"
+fi
+systemctl restart fail2ban >/dev/null 2>&1 || true
+exit 0
+EOF
+
   # firewall для режима «Backend без relay»: порты открыты для всех
   cat > "$D/ufw-backend-direct.sh" <<'EOF'
 set -e
@@ -2127,6 +1870,468 @@ preflight() {
   ok "IP RELAY: $RELAY_IP"
   load_conf
 
+}
+
+# ───────────────────────── подготовка сервера (бывший preServer.sh) ─────────────────────────
+# Выполняется на ЭТОМ сервере. PREP_ROOT — только для тестов (префикс путей).
+PR="${PREP_ROOT:-}"
+PREP_MARKER_DIR="$PR/var/lib/preserver"
+PREP_MARKER_FILE="$PREP_MARKER_DIR/.preserver-ran"   # тот же путь, что у автономного preServer.sh
+
+# Убираем противоречащие настройки в drop-in конфигах sshd: Include стоит в начале sshd_config,
+# и sshd берёт ПЕРВОЕ встреченное значение — правки в основном файле иначе молча игнорируются.
+neutralize_sshd_dropins() {
+  local f
+  for f in "$PR"/etc/ssh/sshd_config.d/*.conf; do
+    [ -f "$f" ] || continue
+    [ "$(basename "$f")" = "99-preserver.conf" ] && continue
+    sed -i -E 's/^[[:space:]]*(Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication)\b/# [preServer disabled] \1/' "$f"
+    if ! grep -qE '^[^#[:space:]]' "$f" 2>/dev/null; then
+      rm -f "$f"
+      info "удалён пустой drop-in конфиг: $f"
+    fi
+  done
+}
+
+disable_ssh_socket_activation() {
+  if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.socket'; then
+    if systemctl is-enabled ssh.socket &>/dev/null || systemctl is-active ssh.socket &>/dev/null; then
+      systemctl stop ssh.socket >/dev/null 2>&1 || true
+      systemctl disable ssh.socket >/dev/null 2>&1 || true
+      info "обнаружена socket activation (ssh.socket) — отключена, чтобы смена порта применялась без перезагрузки"
+    fi
+  fi
+}
+
+verify_and_restart_sshd() {
+  local want_port="$1" want_pwauth="$2" want_rootlogin="$3"
+  mkdir -p /run/sshd
+  chmod 0755 /run/sshd
+
+  local eff
+  eff="$(sshd -T 2>&1)" || {
+    fail "sshd -T завершился с ошибкой, перезапуск отменён"
+    printf '    Вывод sshd -T:\n%s\n' "$eff"
+    return 1
+  }
+
+  local eff_port eff_pwauth eff_rootlogin eff_ports
+  eff_ports=$(awk '/^port /{print $2}' <<< "$eff")
+  eff_port=$(tr '\n' ',' <<< "$eff_ports")
+  eff_port="${eff_port%,}"
+  eff_pwauth=$(awk '/^passwordauthentication /{print $2; exit}' <<< "$eff")
+  eff_rootlogin=$(awk '/^permitrootlogin /{print $2; exit}' <<< "$eff")
+
+  local nw="$want_rootlogin" ne="$eff_rootlogin"
+  [ "$nw" = "prohibit-password" ] && nw="without-password"
+  [ "$ne" = "prohibit-password" ] && ne="without-password"
+
+  if ! grep -qx "$want_port" <<< "$eff_ports" || [ "$eff_pwauth" != "$want_pwauth" ] || [ "$ne" != "$nw" ]; then
+    fail "эффективный конфиг sshd НЕ совпадает с ожидаемым (port=$eff_port pwauth=$eff_pwauth rootlogin=$eff_rootlogin)"
+    echo "    Проверьте /etc/ssh/sshd_config.d/*.conf вручную. Перезапуск sshd ОТМЕНЁН."
+    return 1
+  fi
+
+  local svc="ssh"
+  systemctl list-unit-files | grep -q "sshd.service" && svc="sshd"
+
+  disable_ssh_socket_activation
+
+  # остановка ssh.socket/ssh.service удаляет /run/sshd — создаём заново перед sshd -t
+  mkdir -p /run/sshd
+  chmod 0755 /run/sshd
+
+  if ! sshd -t 2>&1; then
+    fail "sshd -t: синтаксическая ошибка, перезапуск отменён"
+    return 1
+  fi
+
+  systemctl enable "$svc" >/dev/null 2>&1 || true
+  systemctl restart "$svc" 2>/dev/null || systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+  ok "sshd перезапущен, эффективный конфиг подтверждён (port=$eff_port pwauth=$eff_pwauth rootlogin=$eff_rootlogin)"
+  return 0
+}
+
+prep_rollback() {
+  local cfg="$PR/etc/ssh/sshd_config" old_port=""
+  echo
+  echo "${B}Откат настроек подготовки сервера${R}"
+  thin
+  [ -f "$PREP_MARKER_FILE" ] && old_port="$(awk -F= '/^ssh_port=/{print $2; exit}' "$PREP_MARKER_FILE" 2>/dev/null || true)"
+
+  mkdir -p /run/sshd
+  chmod 0755 /run/sshd
+
+  if [ -f "$cfg" ]; then
+    cp "$cfg" "${cfg}.bak.$(date +%s)"
+    neutralize_sshd_dropins
+
+    if grep -qE '^\s*#?\s*Port\b' "$cfg"; then
+      sed -i -E 's/^\s*#?\s*Port\b.*/Port 22/' "$cfg"
+    else
+      echo "Port 22" >> "$cfg"
+    fi
+    sed -i -E 's/^\s*#?\s*PermitRootLogin\b.*/PermitRootLogin yes/' "$cfg"
+    sed -i -E 's/^\s*#?\s*PasswordAuthentication\b.*/PasswordAuthentication yes/' "$cfg"
+    sed -i -E 's/^\s*#?\s*PrintMotd\b.*/PrintMotd yes/' "$cfg"
+    sed -i -E 's/^\s*#?\s*PrintLastLog\b.*/PrintLastLog yes/' "$cfg"
+
+    if passwd -S root 2>/dev/null | awk '{print $2}' | grep -qE '^(L|LK|NP)$'; then
+      warn "у root не задан пароль. Вход по паролю не заработает без: passwd root"
+    fi
+
+    if command -v ufw &>/dev/null; then
+      ufw allow 22/tcp comment 'SSH (preServer rollback)' >/dev/null 2>&1 || true
+      if [[ "$old_port" =~ ^[0-9]+$ ]] && [ "$old_port" != "22" ]; then
+        ufw --force delete allow "${old_port}/tcp" >/dev/null 2>&1 || true
+        info "правило ufw для порта $old_port (подготовка) удалено, остальные правила не тронуты"
+      fi
+    fi
+
+    verify_and_restart_sshd 22 yes yes || warn "порт/пароль отредактированы, но перезапуск не выполнен — проверьте вручную!"
+  fi
+
+  if dpkg -s fail2ban &>/dev/null; then
+    systemctl stop fail2ban >/dev/null 2>&1 || true
+    systemctl disable fail2ban >/dev/null 2>&1 || true
+    apt-get purge -y fail2ban >/dev/null 2>&1 || true
+    rm -f "$PR/etc/fail2ban/jail.local"
+    ok "fail2ban удалён"
+  fi
+
+  if dpkg -s fastfetch &>/dev/null; then
+    apt-get purge -y fastfetch >/dev/null 2>&1 || true
+    ok "fastfetch удалён"
+  elif command -v fastfetch &>/dev/null; then
+    rm -f "$(command -v fastfetch)"
+  fi
+  rm -rf "$PR/root/.config/fastfetch"
+  rm -f "$PR/etc/profile.d/fastfetch-ssh.sh"
+  if [ -d "$PR/etc/update-motd.d" ]; then
+    chmod +x "$PR"/etc/update-motd.d/* 2>/dev/null || true
+  fi
+
+  rm -f "$PR/usr/local/sbin/daily-security-update.sh"
+  rm -f "$PR/etc/cron.d/daily-security-update"
+  rm -f "$PREP_MARKER_FILE"
+
+  echo
+  ok "откат завершён"
+  [ -f "$MARKER_FILE" ] && info "установка туннеля/панели этим откатом не затрагивается (для неё — пункт «Отменить установку»)"
+  return 0
+}
+
+prep_fastfetch_ppa() {
+  add-apt-repository -y ppa:zhangsongcui3371/fastfetch &&
+    apt-get -o DPkg::Lock::Timeout=300 update -qq &&
+    apt-get -o DPkg::Lock::Timeout=300 install -y fastfetch
+}
+
+prep_fastfetch_deb() {
+  local arch url tmp
+  arch=$(dpkg --print-architecture)
+  url=$(curl -fsSL "https://api.github.com/repos/fastfetch-cli/fastfetch/releases/latest" |
+    grep "browser_download_url" | grep "linux-${arch}.deb" | head -1 | cut -d '"' -f 4) || true
+  [ -n "$url" ] || return 1
+  tmp=$(mktemp)
+  curl -fsSL "$url" -o "$tmp"
+  dpkg -i "$tmp" || apt-get install -f -y
+  rm -f "$tmp"
+}
+
+run_prepare() {
+  STEP=0; TOTAL=7
+  if [ -f "$PREP_MARKER_FILE" ]; then
+    echo
+    warn "обнаружена метка предыдущей подготовки сервера:"
+    sed 's/^/     /' "$PREP_MARKER_FILE"
+    echo
+    if confirm "Выполнить откат настроек подготовки?"; then
+      prep_rollback
+    else
+      echo "  Отменено."
+    fi
+    return 0
+  fi
+
+  echo
+  echo "${B}Подготовка сервера${R}"
+  thin
+  info "обновление системы, fail2ban, SSH (свой порт, вход только по ключу), автообновления, fastfetch"
+  info "выполняется на ЭТОМ сервере: запустите скрипт отдельно на RELAY и на BACKEND"
+  [ -f "$MARKER_FILE" ] && warn "установка туннеля/панели уже выполнена: после смены SSH-порта укажите новый порт при следующих запусках"
+  confirm "Начать подготовку?" || { echo "  Отменено."; return 0; }
+
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 APT_LISTCHANGES_FRONTEND=none
+  export PYTHONWARNINGS="ignore::SyntaxWarning"
+  local APT_OPTS=(-o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+  # [1] пакетная база
+  section "Проверка пакетной базы"
+  if [ -d "$PR/var/lib/dpkg/updates" ] && ls "$PR"/var/lib/dpkg/updates/* >/dev/null 2>&1; then
+    warn "обнаружены незавершённые операции dpkg, восстанавливаю..."
+    if pgrep -x dpkg >/dev/null 2>&1 || pgrep -x apt-get >/dev/null 2>&1; then
+      info "apt/dpkg сейчас занят другим процессом — блокировки не трогаю, ждём освобождения"
+    else
+      rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock /var/lib/apt/lists/lock
+    fi
+    step_run -s "dpkg --configure -a" dpkg --configure -a --force-confdef --force-confold
+    rm -f "$PR"/var/lib/dpkg/updates/*
+    step_run -s "dpkg --configure -a (повторно)" dpkg --configure -a
+  fi
+  ok "пакетная база в порядке"
+
+  # [2] обновление системы
+  section "Обновление системы"
+  step_run "Обновление списков пакетов" apt-get "${APT_OPTS[@]}" update -qq || die "apt update не удался"
+  step_run "Обновление пакетов (upgrade)" apt-get "${APT_OPTS[@]}" upgrade -y || die "apt upgrade не удался"
+  step_run "Обновление дистрибутива (dist-upgrade)" apt-get "${APT_OPTS[@]}" dist-upgrade -y || die "apt dist-upgrade не удался"
+  step_run "Удаление ненужных пакетов" apt-get "${APT_OPTS[@]}" autoremove -y || warn "autoremove не выполнен"
+
+  # [3] утилиты и fail2ban
+  section "Установка утилит"
+  local PACKAGES=(unattended-upgrades fail2ban htop iotop nethogs curl wget git cron ripgrep)
+  local missing=() pkg
+  for pkg in "${PACKAGES[@]}"; do
+    dpkg -s "$pkg" &>/dev/null || missing+=("$pkg")
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    step_run "Установка пакетов: ${missing[*]}" apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "${missing[@]}" || die "не удалось установить пакеты"
+  else
+    ok "все утилиты уже установлены"
+  fi
+  mkdir -p "$PR/etc/fail2ban"
+  cat > "$PR/etc/fail2ban/jail.local" << 'F2BEOF'
+[sshd]
+enabled = true
+port = 1119
+backend = systemd
+maxretry = 5
+bantime = 1h
+findtime = 10m
+F2BEOF
+  systemctl enable fail2ban >/dev/null 2>&1 || true
+  systemctl restart fail2ban >/dev/null 2>&1 || true
+  systemctl enable cron >/dev/null 2>&1 || true
+  systemctl start cron >/dev/null 2>&1 || true
+  ok "fail2ban и утилиты настроены"
+
+  # [4] SSH
+  section "Настройка SSH"
+  mkdir -p /run/sshd
+  chmod 0755 /run/sshd
+  local cfg="$PR/etc/ssh/sshd_config" in_port ssh_port key tmpf p
+  while true; do
+    ask in_port "Введите внутренний порт SSH" "1119"
+    ssh_port="$in_port"
+    if [[ "$ssh_port" =~ ^[0-9]+$ ]] && [ "$ssh_port" -ge 1 ] && [ "$ssh_port" -le 65535 ]; then
+      if command -v ss &>/dev/null && ss -tulnp | grep ":${ssh_port} " | grep -vq sshd; then
+        warn "порт $ssh_port занят."
+        confirm "Продолжить?" && break || continue
+      fi
+      break
+    else
+      fail "порт должен быть числом 1-65535"
+    fi
+  done
+  ok "выбран порт SSH: $ssh_port"
+
+  while true; do
+    rd -r -p "${B}?${R} Введите SSH публичный ключ: " key
+    if [[ "$key" =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521)\  ]]; then
+      break
+    else
+      fail "неверный формат ключа"
+    fi
+  done
+  ok "ключ принят"
+
+  if [ -f "$cfg" ]; then
+    info "sshd будет слушать только порт: $ssh_port (старые порты, включая 22, не сохраняются)"
+    cp "$cfg" "${cfg}.bak.$(date +%s)"
+    ls -1t "${cfg}".bak.* 2>/dev/null | tail -n +6 | xargs -r rm -f
+    neutralize_sshd_dropins
+
+    # Port-строка — в начало файла (чтобы не попасть внутрь блока Match)
+    sed -i -E '/^[[:space:]]*#?[[:space:]]*Port[[:space:]]/d' "$cfg"
+    tmpf=$(mktemp)
+    echo "Port $ssh_port" | cat - "$cfg" > "$tmpf"
+    cat "$tmpf" > "$cfg"
+    rm -f "$tmpf"
+
+    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "$cfg"
+    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$cfg"
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$cfg"
+    sed -i 's/^#\?UseDNS.*/UseDNS no/' "$cfg"
+
+    mkdir -p "$PR/root/.ssh" && chmod 700 "$PR/root/.ssh"
+    grep -qF "$key" "$PR/root/.ssh/authorized_keys" 2>/dev/null || echo "$key" >> "$PR/root/.ssh/authorized_keys"
+    chmod 600 "$PR/root/.ssh/authorized_keys"
+
+    if [ -f "$PR/etc/fail2ban/jail.local" ]; then
+      sed -i "s/^port = .*/port = $ssh_port/" "$PR/etc/fail2ban/jail.local"
+      systemctl restart fail2ban >/dev/null 2>&1 || true
+    fi
+
+    if command -v ufw &>/dev/null; then
+      ufw allow "${ssh_port}/tcp" comment 'SSH (preServer)' >/dev/null 2>&1 || true
+      ok "порт $ssh_port открыт в ufw"
+    fi
+
+    verify_and_restart_sshd "$ssh_port" no prohibit-password || die "ошибка применения настроек SSH: проверьте конфиги вручную"
+  else
+    warn "файл $cfg не найден — настройка SSH пропущена"
+  fi
+
+  # [5] автообновления
+  section "Автообновления"
+  local UPDATE_SCRIPT="$PR/usr/local/sbin/daily-security-update.sh"
+  mkdir -p "$(dirname "$UPDATE_SCRIPT")" "$PR/etc/cron.d"
+  cat > "$UPDATE_SCRIPT" << 'EOF'
+#!/bin/bash
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+LOG_FILE="/var/log/auto-update.log"
+{
+    echo "===== $(date '+%F %T') start ====="
+    apt-get -o DPkg::Lock::Timeout=600 update -qq
+    apt-get -o DPkg::Lock::Timeout=600 upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+    apt-get autoremove -y
+    echo "===== $(date '+%F %T') done ====="
+} >> "$LOG_FILE" 2>&1
+EOF
+  chmod 0755 "$UPDATE_SCRIPT"
+  cat > "$PR/etc/cron.d/daily-security-update" << EOF
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 3 * * * root /usr/local/sbin/daily-security-update.sh
+EOF
+  chmod 0644 "$PR/etc/cron.d/daily-security-update"
+  systemctl is-active --quiet cron || systemctl start cron >/dev/null 2>&1 || true
+  ok "автообновления настроены (ежедневно в 03:00)"
+
+  # [6] fastfetch
+  section "Fastfetch"
+  local ff=false
+  if command -v fastfetch &>/dev/null; then
+    ff=true
+    ok "fastfetch уже установлен"
+  else
+    if command -v add-apt-repository &>/dev/null; then
+      step_run -s "Установка Fastfetch (PPA)" prep_fastfetch_ppa && ff=true
+    fi
+    if ! $ff; then
+      step_run -s "Установка Fastfetch (.deb с GitHub)" prep_fastfetch_deb && ff=true
+    fi
+  fi
+
+  if $ff; then
+    mkdir -p "$PR/root/.config/fastfetch"
+    cat > "$PR/root/.config/fastfetch/logo.txt" << 'ASCII_LOGO'
++------------------------------+
+| +--------------------------+ |
+| | +----------------------+ | |
+| | | +------------------+ | | |
+| | | | +--------------+ | | | |
+| | | | | +----------+ | | | | |
+| | | | | |          | | | | | |
+| | | | | |    ●●    | | | | | |
+| | | | | |          | | | | | |
+| | | | | +----------+ | | | | |
+| | | | +--------------+ | | | |
+| | | +------------------+ | | |
+| | +----------------------+ | |
+| +--------------------------+ |
++------------------------------+
+ASCII_LOGO
+
+    cat > "$PR/root/.config/fastfetch/config.jsonc" << 'FFCONFIG'
+{
+    "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+    "logo": {
+        "type": "file",
+        "source": "/root/.config/fastfetch/logo.txt",
+        "padding": { "top": 1, "left": 2, "right": 4 }
+    },
+    "display": {
+        "color": { "keys": "blue", "title": "bright_magenta", "separator": "white" }
+    },
+    "modules": [
+        { "type": "custom", "format": "\u001b[97m┌──────────────────────────────────────Hardware──────────────────────────────────────┐\u001b[0m" },
+        { "type": "host", "key": "▣ PC : ", "keyColor": "green" },
+        { "type": "cpu", "key": "   ├▢ CPU: ", "keyColor": "green" },
+        { "type": "cpuusage", "key": "   ├▢ Usage: ", "keyColor": "green" },
+        { "type": "loadavg", "key": "   ├▢ Load: ", "keyColor": "green" },
+        { "type": "gpu", "key": "   ├▢ GPU: ", "keyColor": "green" },
+        { "type": "memory", "key": "   ├▢ RAM: ", "keyColor": "green" },
+        { "type": "swap", "key": "   ├▢ Swap: ", "keyColor": "green" },
+        { "type": "disk", "key": "   ├▢ Disk: ", "keyColor": "green" },
+        { "type": "custom", "format": "\u001b[97m└────────────────────────────────────────────────────────────────────────────────────┘\u001b[0m" },
+        "break",
+        { "type": "custom", "format": "\u001b[97m┌──────────────────────────────────────Software──────────────────────────────────────┐\u001b[0m" },
+        { "type": "os", "key": "▣ OS : ", "keyColor": "yellow" },
+        { "type": "kernel", "key": "   ├▢ Kernel: ", "keyColor": "yellow" },
+        { "type": "packages", "key": "   ├▢ Packages: ", "keyColor": "yellow" },
+        { "type": "shell", "key": "   ├▢ Shell: ", "keyColor": "yellow" },
+        { "type": "custom", "format": "\u001b[97m└────────────────────────────────────────────────────────────────────────────────────┘\u001b[0m" },
+        "break",
+        { "type": "custom", "format": "\u001b[97m┌───────────────────────────────────────Network──────────────────────────────────────┐\u001b[0m" },
+        { "type": "localip", "key": "▣ IP : ", "keyColor": "cyan" },
+        { "type": "command", "key": "   └▢ Location: ", "keyColor": "cyan", "text": "curl -s --max-time 2 https://ipinfo.io/city" },
+        { "type": "custom", "format": "\u001b[97m└────────────────────────────────────────────────────────────────────────────────────┘\u001b[0m" },
+        "break",
+        { "type": "uptime", "key": "▣ UP : ", "keyColor": "magenta" },
+        { "type": "datetime", "key": "   └⏰ : ", "keyColor": "magenta" },
+        { "type": "colors", "paddingLeft": 2, "symbol": "circle" }
+    ]
+}
+FFCONFIG
+
+    if [ -d "$PR/etc/update-motd.d" ]; then
+      chmod -x "$PR"/etc/update-motd.d/* 2>/dev/null || true
+    fi
+    truncate -s 0 "$PR/etc/motd" 2>/dev/null || true
+    if [ -f "$cfg" ]; then
+      if grep -q "^PrintMotd" "$cfg" 2>/dev/null; then
+        sed -i 's/^PrintMotd.*/PrintMotd no/' "$cfg"
+      else
+        echo "PrintMotd no" >> "$cfg"
+      fi
+    fi
+
+    mkdir -p "$PR/etc/profile.d"
+    cat > "$PR/etc/profile.d/fastfetch-ssh.sh" << 'PROFEOF'
+if [ -n "${FASTFETCH_RAN:-}" ]; then return 0; fi
+if [ -n "$SSH_CONNECTION" ] && command -v fastfetch >/dev/null 2>&1; then
+    fastfetch
+    export FASTFETCH_RAN=1
+fi
+PROFEOF
+    chmod 0644 "$PR/etc/profile.d/fastfetch-ssh.sh"
+    ok "fastfetch настроен"
+  fi
+
+  # [7] итог
+  section "Завершение"
+  ok "подготовка сервера завершена"
+  kv "SSH port" "${ssh_port:-пропущено}"
+  kv "Fail2ban" "активен"
+  kv "Fastfetch" "$($ff && echo 'установлен' || echo 'пропущен')"
+  kv "Log" "$LOG"
+  mkdir -p "$PREP_MARKER_DIR"
+  {
+    echo "version=$VERSION"
+    echo "ran_at=$(date '+%F %T')"
+    echo "ssh_port=${ssh_port:-skipped}"
+  } > "$PREP_MARKER_FILE"
+  warn "проверьте вход по ключу на новом порту ($ssh_port) ДО перезагрузки!"
+
+  if [ -z "$PR" ] && [ -t 1 ] && [ -e /dev/tty ]; then
+    echo
+    if confirm "Перезагрузить сейчас?"; then
+      reboot
+    fi
+  fi
+  return 0
 }
 
 check_reinstall() {
@@ -2401,6 +2606,8 @@ run_install() {
     *) warn "ОС BACKEND не определена: ${bos:-?}" ;;
   esac
 
+  rscript "$TMPD/f2b-ignore.sh" "$RELAY_IP" >>"$LOG" 2>&1 || true
+
   # [2] подготовка RELAY
   section "RELAY: пакеты и rathole"
   step_run "Установка пакетов и rathole" relay_prepare || die "не удалось подготовить RELAY"
@@ -2562,10 +2769,10 @@ main() {
   preflight
   menu
   case "$MODE" in
+    prepare) run_prepare ;;
     install_backend) run_install_backend ;;
     install_relay) run_install ;;
     test) run_test ;;
-    ipcheck) run_ipcheck ;;
     uninstall) do_uninstall ;;
   esac
 }
