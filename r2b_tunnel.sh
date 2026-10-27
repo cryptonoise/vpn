@@ -248,7 +248,6 @@ menu() {
   echo "  ${B}1${R}. Подготовить сервер"
   echo "  ${B}2${R}. Установить Backend + 3X-UI + Honeypot (без relay)"
   echo "  ${B}3${R}. Установить Relay + Backend + 3X-UI + Honeypot"
-  info "При выборе 2 или 3 на корне указанного домена будет создан сайт Honeypot; панель 3x-ui — по /<WebBasePath>."
   echo "  ${B}4${R}. Протестировать BACKEND сервер"
   [ $has -eq 1 ] && echo "  ${B}5${R}. Отменить установку (удалить всё)"
   while true; do
