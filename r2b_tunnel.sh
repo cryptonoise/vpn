@@ -11,7 +11,7 @@
 # Туннель rathole работает по TLS (свой CA, SNI = домен панели). Noise-транспорт не используется:
 # поток из случайных байт сам по себе выглядит подозрительно.
 #
-VERSION="2.1.0"
+VERSION="2.2.0"
 NAME="Server Setup Toolkit"
 
 set -u
@@ -64,6 +64,8 @@ banner() {
   echo "  Всё для серверов в одном скрипте:"
   echo "   • подготовка сервера: обновление, SSH-порт и ключ, fail2ban, автообновления"
   echo "   • Backend с 3x-ui, nginx и сертификатом (с relay или без)"
+  echo "   • Honeypot: автоматически генерируемый сайт на корневом адресе указанного домена"
+  echo "   • Панель 3x-ui остаётся доступна по https://домен/<WebBasePath>"
   echo "   • Relay: обратный туннель rathole (TLS), firewall, пересылка UDP"
   echo "   • тест блокировок (16 КБ, SNI, порты, UDP) и скорости между серверами"
   rule
@@ -244,8 +246,9 @@ menu() {
     info "найдена метка установки: $(marker_get INSTALLED_AT), статус: $(marker_get STATUS), режим: $k, сервер $(marker_get BACKEND_IP), домен $(marker_get DOMAIN)"
   fi
   echo "  ${B}1${R}. Подготовить сервер"
-  echo "  ${B}2${R}. Установить и настроить Backend сервер с 3X-UI панелью (без relay)"
-  echo "  ${B}3${R}. Установить и настроить Relay + Backend сервер с 3X-UI панелью"
+  echo "  ${B}2${R}. Установить Backend + 3X-UI + Honeypot (без relay)"
+  echo "  ${B}3${R}. Установить Relay + Backend + 3X-UI + Honeypot"
+  info "При выборе 2 или 3 на корне указанного домена будет создан сайт Honeypot; панель 3x-ui — по /<WebBasePath>."
   echo "  ${B}4${R}. Протестировать BACKEND сервер"
   [ $has -eq 1 ] && echo "  ${B}5${R}. Отменить установку (удалить всё)"
   while true; do
@@ -2977,6 +2980,10 @@ EOF
   cat > "$D/nginx-temp.sh" <<'EOF'
 set -e
 DOMAIN="$1"
+XUI_PATH="${2:-}"
+XUI_PATH="${XUI_PATH#/}"
+XUI_PATH="${XUI_PATH%/}"
+[ -n "$XUI_PATH" ] || { echo "WebBasePath пустой" >&2; exit 1; }
 mkdir -p /var/www/certbot
 cat > /etc/nginx/sites-available/apex.conf <<EOT
 server {
@@ -2993,15 +3000,22 @@ server {
         root /var/www/certbot;
     }
 
-    # BEGIN sub-paths
-    # END sub-paths
-
-    location / {
-        proxy_pass http://127.0.0.1:999/;
+    # Временный HTTP-конфиг уже публикует Honeypot на корне домена.
+    root /var/www/honeypot/$DOMAIN;
+    index index.html;
+    location = /$XUI_PATH { return 301 /$XUI_PATH/; }
+    location ^~ /$XUI_PATH/ {
+        proxy_pass http://127.0.0.1:999;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
     }
+    location ~ /\.(?!well-known) { return 404; }
+    location / { try_files \$uri \$uri/ =404; }
 }
 EOT
 ln -sf /etc/nginx/sites-available/apex.conf /etc/nginx/sites-enabled/apex.conf
@@ -4241,7 +4255,9 @@ run_install_backend() {
   printf '  %sПлан установки (Backend без relay)%s\n' "$B" "$R"
   rule
   if [ $LOCAL_BACKEND -eq 1 ]; then kv "Server" "$BACKEND_IP (этот сервер, локально)"; else kv "Server" "$BACKEND_IP (SSH :$BACKEND_PORT)"; fi
-  kv "Domain" "$DOMAIN → https://$DOMAIN/<WebBasePath>"
+  kv "Domain" "$DOMAIN"
+  kv "Honeypot" "https://$DOMAIN/ → сайт в /var/www/honeypot/$DOMAIN"
+  kv "3x-ui panel" "https://$DOMAIN/<WebBasePath> → 127.0.0.1:$PANEL_PORT"
   kv "E-mail" "$EMAIL"
   kv "Ports" "открываются 80, 443, 8443/tcp, 8443/udp; SSH сохраняется (ufw)"
   kv "Panel" "3x-ui на 127.0.0.1:$PANEL_PORT (SQLite), nginx + Let's Encrypt"
@@ -4276,13 +4292,22 @@ run_install_backend() {
   section "3x-ui"
   xui_stage
 
-  # [6] Генерация реального сайта для корня домена
-  section "Honeypot: генерация сайта"
-  step_run "Генерация сайта в /var/www/honeypot/$DOMAIN" rscript "$TMPD/honeypot.sh" "$DOMAIN" || die "не удалось сгенерировать Honeypot"
+  # [6] Полноценный отдельный этап установки Honeypot
+  section "Отдельный этап: установка и настройка Honeypot"
+  info "Публичный сайт: https://$DOMAIN/"
+  info "Каталог сайта: /var/www/honeypot/$DOMAIN"
+  info "Панель 3x-ui будет доступна отдельно: https://$DOMAIN/<WebBasePath>"
+  step_run "Генерация файлов Honeypot" rscript "$TMPD/honeypot.sh" "$DOMAIN" || die "не удалось сгенерировать Honeypot"
+  if bk "test -s '/var/www/honeypot/$DOMAIN/index.html'" 2>>"$LOG"; then
+    ok "Главная страница создана: /var/www/honeypot/$DOMAIN/index.html"
+  else
+    die "Honeypot не создал index.html в /var/www/honeypot/$DOMAIN"
+  fi
+  ok "Этап Honeypot завершён; сайт будет опубликован на https://$DOMAIN/ после настройки nginx и сертификата"
 
   # [7]
   section "nginx (временный конфиг)"
-  step_run "nginx: порт 80 → панель" rscript "$TMPD/nginx-temp.sh" "$DOMAIN" || die "nginx не настроился"
+  step_run "nginx: временный HTTP-конфиг для выпуска сертификата" rscript "$TMPD/nginx-temp.sh" "$DOMAIN" "$xw" || die "nginx не настроился"
   local code
   code=$(bk "curl -s -o /dev/null --max-time 15 -w '%{http_code}' -H 'Host: $DOMAIN' http://127.0.0.1:80/" 2>>"$LOG")
   if [ -n "$code" ] && [ "$code" != "000" ]; then ok "nginx отвечает на порту 80 (HTTP $code)"; else warn "nginx не отвечает на порту 80"; fi
@@ -4298,7 +4323,7 @@ run_install_backend() {
   done
 
   # [8]
-  section "nginx (финальный конфиг), подписка, автопродление"
+  section "Honeypot + nginx: публикация сайта, панель и подписка"
   step_run "Служебная команда sync-sub-path (автосинхронизация подписки)" rscript "$TMPD/helper-sub.sh" || warn "sync-sub-path не установлен"
   local scheme=http
   [ $CERT_OK -eq 1 ] && scheme=https
@@ -4324,10 +4349,21 @@ run_install_backend() {
   else
     final_url="http://$DOMAIN/$xw"
   fi
+  local site_url site_code
+  if [ "$CERT_OK" -eq 1 ]; then
+    site_url="https://$DOMAIN/"
+    site_code=$(bk "curl -s -o /dev/null --max-time 15 -w '%{http_code}' --resolve '$DOMAIN:443:127.0.0.1' '$site_url'" 2>>"$LOG" || true)
+  else
+    site_url="http://$DOMAIN/"
+    site_code=$(bk "curl -s -o /dev/null --max-time 15 -w '%{http_code}' -H 'Host: $DOMAIN' http://127.0.0.1:80/" 2>>"$LOG" || true)
+  fi
   {
     echo "Backend Setup (без relay) v$VERSION — $(date '+%F %T')"
     echo "Server:       $BACKEND_IP"
     echo "Domain:       $DOMAIN"
+    echo "Honeypot URL: $site_url"
+    echo "Honeypot dir: /var/www/honeypot/$DOMAIN"
+    echo "Honeypot HTTP: ${site_code:-000}"
     echo "Panel URL:    $final_url"
     echo "Username:     $xu"
     echo "Password:     $xp"
@@ -4337,13 +4373,20 @@ run_install_backend() {
 
   echo
   rule
-  printf '  %sДоступ к панели%s\n' "$GRN" "$R"
+  printf '  %sУСТАНОВКА ЗАВЕРШЕНА%s\n' "$GRN" "$R"
   rule
-  printf '%s%s%s\n' "$B" "$final_url" "$R"
-  printf '%sUsername:    %s%s\n' "$GRN" "$xu" "$R"
-  printf '%sPassword:    %s%s\n' "$GRN" "$xp" "$R"
+  printf '  %sСАЙТ HONEYPOT%s\n' "$B" "$R"
+  printf '  URL:       %s%s%s\n' "$B" "$site_url" "$R"
+  printf '  Каталог:   %s/var/www/honeypot/%s%s\n' "$DIM" "$DOMAIN" "$R"
+  if [ "$site_code" = "200" ]; then ok "Проверка сайта: HTTP 200"; else warn "Проверка сайта вернула HTTP ${site_code:-000}; проверьте DNS, nginx и лог"; fi
+  echo
+  printf '  %sПАНЕЛЬ 3X-UI%s\n' "$B" "$R"
+  printf '  URL:       %s%s%s\n' "$B" "$final_url" "$R"
+  printf '  Username:  %s%s%s\n' "$GRN" "$xu" "$R"
+  printf '  Password:  %s%s%s\n' "$GRN" "$xp" "$R"
   rule
-  echo "  ${DIM}Отчёт с этими данными: $REPORT_FILE (права 600)${R}"
+  echo "  ${DIM}Отчёт: $REPORT_FILE (права 600)${R}"
+  echo "  ${DIM}Лог:   $LOG${R}"
   echo "  ${DIM}Лог установки:         $LOG${R}"
   echo
   echo "  ${B}Дальше — в панели:${R}"
@@ -4400,7 +4443,9 @@ run_install() {
   rule
   kv "RELAY" "$RELAY_IP  (rathole-server, ufw, UDP 8443 → BACKEND)"
   kv "BACKEND" "$BACKEND_IP  (SSH :$BACKEND_PORT)"
-  kv "Domain" "$DOMAIN → https://$DOMAIN/<WebBasePath>"
+  kv "Domain" "$DOMAIN"
+  kv "Honeypot" "https://$DOMAIN/ → сайт на BACKEND: /var/www/honeypot/$DOMAIN"
+  kv "3x-ui panel" "https://$DOMAIN/<WebBasePath> → BACKEND 127.0.0.1:$PANEL_PORT"
   kv "E-mail" "$EMAIL"
   kv "RELAY ports" "443, 80, 8443/tcp → туннель; 2333 (только с BACKEND); 8443/udp → DNAT; прочее входящее закрывается (ufw)"
   kv "BACKEND ports" "входящие TCP 443/80/8443 закрываются; 8443/udp только от RELAY"
@@ -4487,13 +4532,22 @@ run_install() {
   section "BACKEND: 3x-ui"
   xui_stage
 
-  # [9] Генерация реального сайта для корня домена
-  section "BACKEND: Honeypot"
-  step_run "Генерация сайта в /var/www/honeypot/$DOMAIN" rscript "$TMPD/honeypot.sh" "$DOMAIN" || die "не удалось сгенерировать Honeypot"
+  # [9] Полноценный отдельный этап установки Honeypot
+  section "BACKEND: отдельный этап установки и настройки Honeypot"
+  info "Публичный сайт: https://$DOMAIN/"
+  info "Каталог сайта на BACKEND: /var/www/honeypot/$DOMAIN"
+  info "Панель 3x-ui будет доступна отдельно: https://$DOMAIN/<WebBasePath>"
+  step_run "Генерация файлов Honeypot на BACKEND" rscript "$TMPD/honeypot.sh" "$DOMAIN" || die "не удалось сгенерировать Honeypot"
+  if bk "test -s '/var/www/honeypot/$DOMAIN/index.html'" 2>>"$LOG"; then
+    ok "Главная страница создана на BACKEND: /var/www/honeypot/$DOMAIN/index.html"
+  else
+    die "Honeypot не создал index.html в /var/www/honeypot/$DOMAIN на BACKEND"
+  fi
+  ok "Этап Honeypot завершён; публикация на https://$DOMAIN/ будет активирована финальным nginx-конфигом"
 
   # [10] nginx временный
   section "BACKEND: nginx (временный конфиг)"
-  step_run "nginx: порт 80 → панель" rscript "$TMPD/nginx-temp.sh" "$DOMAIN" || die "nginx не настроился"
+  step_run "nginx: временный HTTP-конфиг для выпуска сертификата" rscript "$TMPD/nginx-temp.sh" "$DOMAIN" "$xw" || die "nginx не настроился"
   local code
   code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' -H "Host: $DOMAIN" http://127.0.0.1:80/ 2>/dev/null)
   if [ "$code" != "000" ] && [ -n "$code" ]; then ok "порт 80 доходит до BACKEND через туннель (HTTP $code)"; else warn "порт 80 через туннель не отвечает — сертификат, скорее всего, не выпустится"; fi
@@ -4509,7 +4563,7 @@ run_install() {
   done
 
   # [12] nginx финальный, служебные команды и подписка
-  section "BACKEND: nginx (финальный конфиг), подписка, автопродление"
+  section "BACKEND: Honeypot + nginx — публикация сайта, панель и подписка"
   step_run "Служебные команды: switch-relay, sync-sub-path (автосинхронизация подписки)" rscript "$TMPD/helper-backend.sh" || warn "служебные команды не установлены"
   local scheme=http
   [ $CERT_OK -eq 1 ] && scheme=https
@@ -4546,11 +4600,22 @@ run_install() {
     warn "IP $BACKEND_IP не назначен на интерфейсе BACKEND (общий IP/NAT): пересылка UDP 8443 на него работать не будет — Hysteria2 через RELAY недоступна"
   fi
 
+  local site_url site_code
+  if [ "$CERT_OK" -eq 1 ]; then
+    site_url="https://$DOMAIN/"
+    site_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' --resolve "$DOMAIN:443:127.0.0.1" "$site_url" 2>/dev/null || true)
+  else
+    site_url="http://$DOMAIN/"
+    site_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' -H "Host: $DOMAIN" http://127.0.0.1:80/ 2>/dev/null || true)
+  fi
   {
     echo "RELAY·BACKEND Tunnel Setup v$VERSION — $(date '+%F %T')"
     echo "RELAY:        $RELAY_IP"
     echo "BACKEND:      $BACKEND_IP (SSH :$BACKEND_PORT)"
     echo "Domain:       $DOMAIN"
+    echo "Honeypot URL: $site_url"
+    echo "Honeypot dir: /var/www/honeypot/$DOMAIN (BACKEND)"
+    echo "Honeypot HTTP: ${site_code:-000}"
     echo "Panel URL:    $final_url"
     echo "Username:     $xu"
     echo "Password:     $xp"
@@ -4561,13 +4626,24 @@ run_install() {
 
   echo
   rule
-  printf '  %sДоступ к панели%s\n' "$GRN" "$R"
+  printf '  %sУСТАНОВКА ЗАВЕРШЕНА%s\n' "$GRN" "$R"
   rule
-  printf '%s%s%s\n' "$B" "$final_url" "$R"
-  printf '%sUsername:    %s%s\n' "$GRN" "$xu" "$R"
-  printf '%sPassword:    %s%s\n' "$GRN" "$xp" "$R"
+  printf '  %sСАЙТ HONEYPOT%s\n' "$B" "$R"
+  printf '  URL:       %s%s%s\n' "$B" "$site_url" "$R"
+  printf '  Каталог:   %s/var/www/honeypot/%s%s\n' "$DIM" "$DOMAIN" "$R"
+  printf '  Размещение: BACKEND%s\n' "$R"
+  if [ "$site_code" = "200" ]; then ok "Проверка сайта через RELAY: HTTP 200"; else warn "Проверка сайта вернула HTTP ${site_code:-000}; проверьте DNS, туннель, nginx и лог"; fi
+  echo
+  printf '  %sПАНЕЛЬ 3X-UI%s\n' "$B" "$R"
+  printf '  URL:       %s%s%s\n' "$B" "$final_url" "$R"
+  printf '  Username:  %s%s%s\n' "$GRN" "$xu" "$R"
+  printf '  Password:  %s%s%s\n' "$GRN" "$xp" "$R"
+  echo
+  printf '  %sТУННЕЛЬ%s\n' "$B" "$R"
+  ok "RELAY ↔ BACKEND: rathole подключён"
   rule
-  echo "  ${DIM}Отчёт с этими данными: $REPORT_FILE (права 600)${R}"
+  echo "  ${DIM}Отчёт: $REPORT_FILE (права 600)${R}"
+  echo "  ${DIM}Лог:   $LOG${R}"
   echo "  ${DIM}Лог установки:         $LOG${R}"
   echo "  ${DIM}Служебные команды:     switch-relay (BACKEND), switch-backend (RELAY), sync-sub-path (BACKEND)${R}"
   echo
