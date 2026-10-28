@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# relay-setup.sh — RELAY·BACKEND Tunnel Setup
-# Запускать на RELAY (РФ-сервер) от root:  bash relay-setup.sh
+# Burrow — RELAY·BACKEND tunnel & server setup toolkit
+# Запускать от root: на RELAY (режим 3) или на самом сервере (режимы 1, 2, 4):  bash burrow.sh
 #
 # Что делает:
 #   RELAY   — rathole-server, ufw, пересылка UDP 8443 (Hysteria2)
@@ -11,8 +11,8 @@
 # Туннель rathole работает по TLS (свой CA, SNI = домен панели). Noise-транспорт не используется:
 # поток из случайных байт сам по себе выглядит подозрительно.
 #
-VERSION="2.2.0"
-NAME="Server Setup Toolkit"
+VERSION="2.4.0"
+NAME="Burrow"
 
 set -u
 set -o pipefail
@@ -83,7 +83,7 @@ rd() {
   rc=$?
   if [ $rc -ne 0 ]; then
     echo
-    die "ввод недоступен (терминал закрыт). Запустите скрипт в интерактивной сессии: bash relay-setup.sh"
+    die "ввод недоступен (терминал закрыт). Запустите скрипт в интерактивной сессии: bash burrow.sh"
   fi
 }
 
@@ -106,12 +106,13 @@ drain_tty() {
   while IFS= read -r -t 0.05 -n 1 _j < /dev/tty; do :; done
 }
 
-confirm() {  # Enter / y = да, n = нет
-  local a
+confirm() {  # confirm "вопрос" [y|n] — что значит Enter (по умолчанию y; для опасных действий передавайте n)
+  local a def="${2:-y}" hint
+  if [ "$def" = n ]; then hint="Enter или n — нет / y — да"; else hint="Enter или y — да / n — нет"; fi
   drain_tty
   while true; do
-    rd -r -p "${B}?${R} $1 ${DIM}[Enter или y — да / n — нет]${R}: " a
-    case "${a:-y}" in
+    rd -r -p "${B}?${R} $1 ${DIM}[$hint]${R}: " a
+    case "${a:-$def}" in
       y | Y | yes | YES | д | Д) return 0 ;;
       n | N | no | NO | н | Н | нет) return 1 ;;
       *) printf '  %sВведите Enter или y (да) / n (нет)%s\n' "$DIM" "$R" ;;
@@ -186,6 +187,7 @@ rathole_install() {
 tune_network() {
   local f=/etc/sysctl.d/99-relay-network-tuning.conf
   modprobe tcp_bbr 2>/dev/null || true
+  modprobe nf_conntrack 2>/dev/null || true   # чтобы nf_conntrack_max применился и на RELAY с NAT
   echo tcp_bbr > /etc/modules-load.d/relay-bbr.conf
   {
     echo "# relay-setup: сетевые твики"
@@ -212,13 +214,13 @@ tune_network() {
     if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then echo "net.netfilter.nf_conntrack_max=262144"; fi
   } > "$f"
   sysctl -q -p "$f" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
-  systemctl try-restart rathole >/dev/null 2>&1 || true
+  [ "${1:-}" = norestart ] || systemctl try-restart rathole >/dev/null 2>&1 || true
   return 0
 }
 
 # ───────────────────────── метка установки ─────────────────────────
 write_marker() {  # write_marker статус (in-progress | done)
-  umask 077
+  : > "$MARKER_FILE"; chmod 600 "$MARKER_FILE"
   cat > "$MARKER_FILE" <<EOF
 STATUS=$1
 INSTALLED_AT=$(date '+%F %T')
@@ -295,7 +297,7 @@ do_uninstall() {
     info "RELAY: туннель rathole, правила ufw (2333, 80, 443, 8443), NAT для UDP, служебные команды, сетевые твики"
     info "BACKEND: rathole-client, правило 8443/udp, switch-relay, sync-sub-path, сетевые твики"
   fi
-  confirm "Удалить эти настройки?" || { echo "  Отменено."; return 1; }
+  confirm "Удалить эти настройки?" n || { echo "  Отменено."; return 1; }
   local rm_xui=0 rm_web=0 reach=0 direct=0
   [ "$kind" = "backend" ] && direct=1
   ask_backend
@@ -308,12 +310,12 @@ do_uninstall() {
       ok "SSH: root@$BACKEND_IP:$BACKEND_PORT"
     else
       fail "BACKEND недоступен: $(tail -n1 "$TMPD/ssh.err")"
-      confirm "Удалить только настройки RELAY (BACKEND останется как есть)?" || { echo "  Отменено."; return 1; }
+      confirm "Удалить только настройки RELAY (BACKEND останется как есть)?" n || { echo "  Отменено."; return 1; }
     fi
   fi
   if [ $reach -eq 1 ]; then
-    confirm "Удалить на BACKEND также 3x-ui (панель, пользователи, инбаунды)?" && rm_xui=1
-    confirm "Удалить на BACKEND также конфиг nginx и сертификат домена ${DOMAIN:-$(marker_get DOMAIN)}?" && rm_web=1
+    confirm "Удалить на BACKEND также 3x-ui (панель, пользователи, инбаунды)?" n && rm_xui=1
+    confirm "Удалить на BACKEND также конфиг nginx и сертификат домена ${DOMAIN:-$(marker_get DOMAIN)}?" n && rm_web=1
   fi
   make_remote_scripts
   section "BACKEND"
@@ -531,8 +533,8 @@ run_test() {
     step_run "iperf3 на BACKEND" rscript "$TMPD/iperf-install.sh" || die "не удалось установить iperf3 на BACKEND"
   fi
   # BBR/fq нужны для честного измерения — применяем скрыто на обоих серверах
-  tune_network >>"$LOG" 2>&1
-  rscript "$TMPD/tune.sh" >>"$LOG" 2>&1 || true
+  tune_network norestart >>"$LOG" 2>&1   # без рестарта rathole: тест не должен рвать туннель
+  rscript "$TMPD/tune.sh" norestart >>"$LOG" 2>&1 || true
 
   section "Тестовые серверы на BACKEND"
   IPERF_STARTED=1
@@ -1041,7 +1043,7 @@ read_key() {
 # IP, SSH-порт и ключ для доступа к BACKEND (используется в тесте и удалении)
 ask_backend() {
   while true; do
-    ask BACKEND_IP "IP BACKEND" ""
+    ask BACKEND_IP "IP BACKEND" "${BACKEND_IP:-}"
     valid_ip "$BACKEND_IP" && break
     fail "неверный IP"
     BACKEND_IP=""
@@ -1086,7 +1088,7 @@ ssh_connect() {
     err=$(cat "$TMPD/ssh.err")
     if echo "$err" | grep -q 'REMOTE HOST IDENTIFICATION HAS CHANGED'; then
       warn "ключ хоста BACKEND изменился (сервер переустанавливали?)"
-      confirm "Удалить старую запись из known_hosts и продолжить?" || die "подключение отменено"
+      confirm "Удалить старую запись из known_hosts и продолжить?" n || die "подключение отменено"
       ssh-keygen -R "$BACKEND_IP" >/dev/null 2>&1 || true
       ssh-keygen -R "[$BACKEND_IP]:$BACKEND_PORT" >/dev/null 2>&1 || true
     elif echo "$err" | grep -qi 'permission denied'; then
@@ -1878,6 +1880,35 @@ chance 60
 if [ "$R" -eq 1 ]; then pick WORDS; else gen_brand; fi
 W1="$R"
 pick PRE; P1="$R"; pick POST; P2="$R"
+# Основа названия — левая «значимая» метка домена (rescorp.norest.art → Rescorp);
+# варианты: «Rescorp Consulting» (суффикс темы), «Rescorp Group», «Rescorp & Co.», «Rescorp».
+# HONEYPOT_RANDOM_NAME=1 — вернуть полностью случайные названия.
+BRAND_GENERIC=(www mail smtp imap pop ftp vpn panel admin app api web cdn static portal login secure sub new old test dev stage)
+BRAND_TAILS=(Group Partners Holdings Associates Collective Works)
+domain_brand() {   # → R = «Rescorp» (или пусто, если подходящей метки нет)
+    local -a labels; local i n l w out=""
+    IFS='.' read -ra labels <<< "$DOMAIN"
+    n=$(( ${#labels[@]} - 1 ))          # последняя метка — TLD
+    for (( i=0; i<n; i++ )); do
+        l="${labels[i]}"
+        if [ "${#l}" -lt 3 ]; then continue; fi
+        case " ${BRAND_GENERIC[*]} " in *" $l "*) continue ;; esac
+        for w in ${l//-/ }; do out+="${out:+ }${w^}"; done
+        break
+    done
+    R="$out"
+}
+BRAND=""
+if [ "${HONEYPOT_RANDOM_NAME:-0}" != "1" ]; then domain_brand; BRAND="$R"; fi
+pick BRAND_TAILS; TAIL="$R"
+if [ -n "$BRAND" ]; then
+    rnd 0 4
+    case "$R" in
+        0|1) COMPANY="$BRAND $SUF" ;;
+        2|4) COMPANY="$BRAND $TAIL" ;;
+        *)   COMPANY="$BRAND" ;;
+    esac
+else
 rnd 0 4
 case "$R" in
     0) COMPANY="$S1 & $S2"
@@ -1892,6 +1923,7 @@ case "$R" in
        chance 80
        if [ "$R" -eq 1 ]; then COMPANY="$COMPANY $SUF"; fi ;;
 esac
+fi
 html_esc "$COMPANY"; COMPANY_H="$R"
 INITIAL="${COMPANY:0:1}"
 
@@ -2984,10 +3016,16 @@ XUI_PATH="${XUI_PATH#/}"
 XUI_PATH="${XUI_PATH%/}"
 [ -n "$XUI_PATH" ] || { echo "WebBasePath пустой" >&2; exit 1; }
 mkdir -p /var/www/certbot
+# стандартная страница «Welcome to nginx» выдаёт сервер при обращении по IP и ломает маскировку — убираем
+rm -f /etc/nginx/sites-enabled/default
+V6=""
+if [ -e /proc/net/if_inet6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" = 0 ]; then V6=1; fi
+L6_80=""
+[ -n "$V6" ] && L6_80="listen [::]:80;"
 cat > /etc/nginx/sites-available/apex.conf <<EOT
 server {
     listen 80;
-    listen [::]:80;
+    $L6_80
     server_name $DOMAIN;
 
     server_tokens off;
@@ -3035,10 +3073,26 @@ DOMAIN="$1"
 XUI_PATH="${2:-}"
 XUI_PATH="${XUI_PATH#/}"
 XUI_PATH="${XUI_PATH%/}"
+V6=""
+if [ -e /proc/net/if_inet6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" = 0 ]; then V6=1; fi
+L6_80=""
+[ -n "$V6" ] && L6_80="listen [::]:80;"
+NGINX_VER="$(nginx -v 2>&1 | sed 's/.*nginx\///; s/[^0-9.].*//')"
+if [ "$(printf '%s\n1.25.1\n' "$NGINX_VER" | sort -V | head -n1)" = "1.25.1" ]; then
+  LISTEN_SSL="listen 443 ssl;"
+  [ -n "$V6" ] && LISTEN_SSL="$LISTEN_SSL
+    listen [::]:443 ssl;"
+  LISTEN_SSL="$LISTEN_SSL
+    http2 on;"
+else
+  LISTEN_SSL="listen 443 ssl http2;"
+  [ -n "$V6" ] && LISTEN_SSL="$LISTEN_SSL
+    listen [::]:443 ssl http2;"
+fi
 cat > /etc/nginx/sites-available/apex.conf <<EOT
 server {
     listen 80;
-    listen [::]:80;
+    $L6_80
     server_name $DOMAIN;
 
     location ^~ /.well-known/acme-challenge/ {
@@ -3051,8 +3105,7 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    $LISTEN_SSL
     server_name $DOMAIN;
 
     ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
@@ -3145,7 +3198,7 @@ chmod +x /usr/local/bin/switch-relay
 cat > /usr/local/bin/sync-sub-path <<'EOT2'
 #!/usr/bin/env python3
 # Берёт пути подписки из базы 3x-ui и прописывает их в nginx (apex.conf, блок sub-paths).
-# Запускается таймером раз в минуту: если путь в панели изменили, nginx подхватит сам.
+# Запускается таймером каждые 15 секунд: если путь в панели изменили, nginx подхватит сам.
 import re, sqlite3, subprocess, sys
 
 DB = "/etc/x-ui/x-ui.db"
@@ -3221,7 +3274,7 @@ systemctl enable --now sync-sub-path.timer >/dev/null 2>&1
 EOF
 
   # сетевые твики на BACKEND (та же функция, что и на RELAY)
-  { declare -f tune_network; echo "tune_network"; } > "$D/tune.sh"
+  { declare -f tune_network; echo 'tune_network "$@"'; } > "$D/tune.sh"
 
   # подписка: включить, слушать только локально, прописать URI обратного прокси; печатает пути из панели
   cat > "$D/sub-setup.sh" <<'EOF'
@@ -3554,7 +3607,9 @@ rm -f /etc/sysctl.d/99-relay-network-tuning.conf /etc/modules-load.d/relay-bbr.c
 systemctl daemon-reload
 [ -n "$RELAY" ] && ufw delete allow from "$RELAY" to any port 8443 proto udp >/dev/null 2>&1 || true
 if [ "$DIRECT" = 1 ]; then
-  for r in 80/tcp 443/tcp 8443/tcp 8443/udp; do ufw delete allow "$r" >/dev/null 2>&1 || true; done
+  # если на сервере стоит KeyMaster (server4keymaster.sh), его 80/443 не закрываем
+  if [ -f /etc/keymaster-server.conf ]; then rules="8443/tcp 8443/udp"; else rules="80/tcp 443/tcp 8443/tcp 8443/udp"; fi
+  for r in $rules; do ufw delete allow "$r" >/dev/null 2>&1 || true; done
 fi
 if [ "$RM_XUI" = 1 ]; then
   systemctl disable --now x-ui >/dev/null 2>&1 || true
@@ -3563,6 +3618,7 @@ if [ "$RM_XUI" = 1 ]; then
 fi
 if [ "$RM_WEB" = 1 ]; then
   rm -f /etc/nginx/sites-enabled/apex.conf /etc/nginx/sites-available/apex.conf
+  [ -n "$DOMAIN" ] && rm -rf "/var/www/honeypot/$DOMAIN"
   [ -n "$DOMAIN" ] && certbot delete --cert-name "$DOMAIN" --non-interactive >/dev/null 2>&1 || true
   rm -f /etc/letsencrypt/renewal-hooks/pre/stop-nginx.sh /etc/letsencrypt/renewal-hooks/post/start-nginx.sh
   nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
@@ -3652,7 +3708,7 @@ load_conf() {
 }
 
 save_conf() {
-  umask 077
+  : > "$CONF_FILE"; chmod 600 "$CONF_FILE"
   cat > "$CONF_FILE" <<EOF
 RELAY_IP=${RELAY_IP:-}
 BACKEND_IP=${BACKEND_IP:-}
@@ -3870,7 +3926,7 @@ run_prepare() {
     warn "обнаружена метка предыдущей подготовки сервера:"
     sed 's/^/     /' "$PREP_MARKER_FILE"
     echo
-    if confirm "Выполнить откат настроек подготовки?"; then
+    if confirm "Выполнить откат настроек подготовки?" n; then
       prep_rollback
     else
       echo "  Отменено."
@@ -4155,7 +4211,7 @@ PROFEOF
 
   if [ -z "$PR" ] && [ -t 1 ] && [ -e /dev/tty ]; then
     echo
-    if confirm "Перезагрузить сейчас?"; then
+    if confirm "Перезагрузить сейчас?" n; then
       reboot
     fi
   fi
@@ -4165,8 +4221,9 @@ PROFEOF
 check_reinstall() {
   if [ -f "$MARKER_FILE" ]; then
     warn "установка уже выполнялась (метка: $(marker_get INSTALLED_AT), статус: $(marker_get STATUS))"
-    confirm "Удалить всё и установить заново?" || { echo "  Отменено."; exit 0; }
+    confirm "Удалить всё и установить заново?" n || { echo "  Отменено."; exit 0; }
     do_uninstall || exit 0
+    SECRET=""   # новая установка — новый ключ туннеля
   fi
 }
 
@@ -4211,9 +4268,9 @@ backend_os_check() {
 # ───────────────────────── режим 1: Backend без relay ─────────────────────────
 run_install_backend() {
   INSTALL_KIND="backend"
-  STEP=0; TOTAL=9
+  STEP=0; TOTAL=10
   check_reinstall
-  STEP=0; TOTAL=9
+  STEP=0; TOTAL=10
   SECRET="${SECRET:-}"
 
   echo
@@ -4343,7 +4400,7 @@ run_install_backend() {
   local final_url final_code
   if [ $CERT_OK -eq 1 ]; then
     final_url="https://$DOMAIN/$xw"
-    final_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' "$final_url" 2>/dev/null)
+    final_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' "${final_url%/}/" 2>/dev/null)
     if [ "$final_code" = "200" ]; then ok "HTTPS: $final_url → HTTP 200 (сертификат валиден)"; else warn "HTTPS-проверка вернула HTTP ${final_code:-000} (DNS мог ещё не разойтись)"; fi
   else
     final_url="http://$DOMAIN/$xw"
@@ -4386,29 +4443,29 @@ run_install_backend() {
   rule
   echo "  ${DIM}Отчёт: $REPORT_FILE (права 600)${R}"
   echo "  ${DIM}Лог:   $LOG${R}"
-  echo "  ${DIM}Лог установки:         $LOG${R}"
   echo
   echo "  ${B}Дальше — в панели:${R}"
   echo "   • VLESS Reality: Listen IP пусто (все интерфейсы), порт 8443, пользовательский адрес $DOMAIN"
   echo "   • Hysteria2: Listen пусто, порт 8443/udp, SNI $DOMAIN, сертификат /etc/letsencrypt/live/$DOMAIN/"
   echo "   • Подписка уже настроена: путь ${SUB_PATHS:-?}, ссылки вида $scheme://$DOMAIN${SUB_PATHS:-/}<subId>."
   echo "     Если смените путь в панели — nginx подхватит сам за ~15 секунд (вручную: sync-sub-path)"
+  echo "   • KeyMaster (если нужен): запустите server4keymaster.sh на этом сервере; A-запись его домена (например keygen.$DOMAIN) → $BACKEND_IP"
   echo "   • Панель безопаснее открывать через SSH-туннель: ssh -L 9999:127.0.0.1:$PANEL_PORT root@$BACKEND_IP → http://127.0.0.1:9999/$xw"
   echo
 }
 
 run_install() {
   INSTALL_KIND="relay"
-  STEP=0; TOTAL=14
+  STEP=0; TOTAL=15
   check_reinstall
-  STEP=0; TOTAL=14
+  STEP=0; TOTAL=15
 
   # ── вопросы
   echo
   echo "${B}Параметры${R}"
   thin
   while true; do
-    ask BACKEND_IP "IP BACKEND" ""
+    ask BACKEND_IP "IP BACKEND" "${BACKEND_IP:-}"
     if [ "$BACKEND_IP" = "$RELAY_IP" ]; then fail "IP BACKEND совпадает с IP этого сервера"; BACKEND_IP=""; continue; fi
     valid_ip "$BACKEND_IP" && break
     fail "неверный IP"
@@ -4588,7 +4645,7 @@ run_install() {
   local final_url final_code
   if [ $CERT_OK -eq 1 ]; then
     final_url="https://$DOMAIN/$xw"
-    final_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' --resolve "$DOMAIN:443:127.0.0.1" "$final_url" 2>/dev/null)
+    final_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' --resolve "$DOMAIN:443:127.0.0.1" "${final_url%/}/" 2>/dev/null)
     if [ "$final_code" = "200" ]; then ok "HTTPS через туннель: $final_url → HTTP 200 (сертификат валиден)"; else warn "HTTPS-проверка вернула HTTP ${final_code:-000}: проверьте nginx и сертификат на BACKEND"; fi
   else
     final_url="http://$DOMAIN/$xw"
@@ -4608,7 +4665,7 @@ run_install() {
     site_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' -H "Host: $DOMAIN" http://127.0.0.1:80/ 2>/dev/null || true)
   fi
   {
-    echo "RELAY·BACKEND Tunnel Setup v$VERSION — $(date '+%F %T')"
+    echo "Burrow v$VERSION — $(date '+%F %T')"
     echo "RELAY:        $RELAY_IP"
     echo "BACKEND:      $BACKEND_IP (SSH :$BACKEND_PORT)"
     echo "Domain:       $DOMAIN"
@@ -4643,7 +4700,6 @@ run_install() {
   rule
   echo "  ${DIM}Отчёт: $REPORT_FILE (права 600)${R}"
   echo "  ${DIM}Лог:   $LOG${R}"
-  echo "  ${DIM}Лог установки:         $LOG${R}"
   echo "  ${DIM}Служебные команды:     switch-relay (BACKEND), switch-backend (RELAY), sync-sub-path (BACKEND)${R}"
   echo
   echo "  ${B}Дальше — в панели:${R}"
@@ -4651,13 +4707,14 @@ run_install() {
   echo "   • Hysteria2: Listen пусто, порт 8443/udp, SNI $DOMAIN, сертификат /etc/letsencrypt/live/$DOMAIN/"
   echo "   • Подписка уже настроена: путь ${SUB_PATHS:-?}, ссылки вида $scheme://$DOMAIN${SUB_PATHS:-/}<subId>."
   echo "     Если смените путь в панели — nginx подхватит сам за ~15 секунд (вручную: sync-sub-path на BACKEND)"
+  echo "   • KeyMaster (если нужен): запустите server4keymaster.sh на BACKEND; A-запись его домена (например keygen.$DOMAIN) → $RELAY_IP"
   echo
 }
 
 main() {
   [ "$(id -u)" -eq 0 ] || { echo "Запустите от root: sudo bash $0"; exit 1; }
   mkdir -p "$(dirname "$LOG")"
-  : > "$LOG"
+  ( umask 077; : > "$LOG" ); chmod 600 "$LOG"
   TMPD=$(mktemp -d /tmp/relay-setup.XXXXXX)
   trap cleanup EXIT
   trap 'echo; warn "прервано"; exit 130' INT TERM
