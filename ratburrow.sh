@@ -1,19 +1,7 @@
 #!/usr/bin/env bash
 #
-# Burrow — RELAY·BACKEND tunnel & server setup toolkit
-# Запускать от root: на RELAY (режим 3) или на самом сервере (режимы 1, 2, 4).
-#   curl -fsSL https://raw.githubusercontent.com/cryptonoise/sysadmin/refs/heads/main/burrow.sh | sudo bash
-#
-# Что делает:
-#   RELAY   — rathole-server, ufw, пересылка UDP 8443 (Hysteria2)
-#   BACKEND — (по SSH) пакеты, rathole-client, 3x-ui, nginx, сертификат Let's Encrypt, ufw
-# Итог: данные для входа в панель по https://домен/<WebBasePath>
-# Требования: Ubuntu 22.04+ на обоих серверах, root-доступ, SSH-ключ root для BACKEND
-# Туннель rathole работает по TLS (свой CA, SNI = домен панели). Noise-транспорт не используется:
-# поток из случайных байт сам по себе выглядит подозрительно.
-#
 VERSION="2.4.0"
-NAME="Burrow"
+NAME="RatBurrow"
 
 set -u
 set -o pipefail
@@ -4666,7 +4654,7 @@ run_install() {
     site_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' -H "Host: $DOMAIN" http://127.0.0.1:80/ 2>/dev/null || true)
   fi
   {
-    echo "Burrow v$VERSION — $(date '+%F %T')"
+    echo "RatBurrow v$VERSION — $(date '+%F %T')"
     echo "RELAY:        $RELAY_IP"
     echo "BACKEND:      $BACKEND_IP (SSH :$BACKEND_PORT)"
     echo "Domain:       $DOMAIN"
