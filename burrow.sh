@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Burrow — RELAY·BACKEND tunnel & server setup toolkit
-# Запускать от root: на RELAY (режим 3) или на самом сервере (режимы 1, 2, 4):  bash burrow.sh
+# Запускать от root: на RELAY (режим 3) или на самом сервере (режимы 1, 2, 4).
+#   curl -fsSL https://raw.githubusercontent.com/cryptonoise/sysadmin/refs/heads/main/burrow.sh | sudo bash
 #
 # Что делает:
 #   RELAY   — rathole-server, ufw, пересылка UDP 8443 (Hysteria2)
@@ -4732,6 +4733,9 @@ main() {
   esac
 }
 
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+# запуск как файл, через bash <(curl …) и через curl … | sudo bash;
+# при source (для тестов) main не вызывается. main — последняя команда файла,
+# поэтому при запуске из пайпа весь скрипт уже прочитан и дочерние процессы его не «съедят».
+if [ -z "${BASH_SOURCE[0]:-}" ] || [ "${BASH_SOURCE[0]}" = "$0" ]; then
   main "$@"
 fi
