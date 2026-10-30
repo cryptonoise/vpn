@@ -2,7 +2,7 @@
 set -euo pipefail
 export LC_ALL=C.UTF-8
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 NAME="SecureChain"
 
 CONF_FILE="${CONF_FILE:-/root/.secure-chain.conf}"
@@ -57,7 +57,9 @@ UNINSTALL_RM_XUI=""
 UNINSTALL_RM_CERT=""
 
 cleanup() {
-  [ -n "${TMPD:-}" ] && rm -rf "$TMPD" 2>/dev/null || true
+  if [ -n "${TMPD:-}" ]; then
+    rm -rf "$TMPD" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 trap 'echo; warn "прервано"; exit 130' INT TERM
@@ -291,22 +293,17 @@ bracketed_paste_on() {
 
 sanitize_key_line() {
   local s="$1"
-  
-  # Удаляем carriage return (\r)
+
   s="${s//$'\r'/}"
-  
-  # Удаляем BOM (Byte Order Mark) если есть
   s="${s#$'\xef\xbb\xbf'}"
-  
-  # Удаляем типичные escape-коды bracketed paste, если они проскочили
-  # ESC [ 200 ~  и ESC [ 201 ~
   s="${s//$'\e[200~'/}"
   s="${s//$'\e[201~'/}"
-  
-  # Удаляем ведущие и хвостовые пробелы/табы
-  s="${s#"${s%%[![:space:]]*}"}" 
-  s="${s%"${s##*[![:space:]]}"}" 
-  
+  s="${s//$'\e[?2004l'/}"
+  s="${s//$'\e[?2004h'/}"
+
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+
   printf '%s' "$s"
 }
 
@@ -326,139 +323,139 @@ read_hidden_line() {
   return "$rc"
 }
 
+set_selected_key_file() {
+  KEY_FILE="$1"
+  if [ "$KEY_FILE" = "$KEY_STORE_FILE" ]; then
+    KEY_STORE_USED=1
+  else
+    KEY_STORE_USED=0
+  fi
+}
+
 read_backend_key() {
   mkdir -p "$KEY_STORE_DIR" && chmod 700 "$KEY_STORE_DIR" || die "не удалось создать $KEY_STORE_DIR"
 
-  local f working first line rc tmpkey full_key_content=""
-  local -a candidates
+  while true; do
+    local -a candidates=()
+    local f working="" first="" line="" rc=0 tmpkey="" full_key_content=""
 
-  # Попытка найти существующий рабочий ключ
-  for f in "$KEY_STORE_FILE" /root/.ssh/id_ed25519 /root/.ssh/id_rsa /root/.ssh/id_ecdsa; do
-    [ -f "$f" ] && candidates+=("$f")
-  done
+    for f in "$KEY_STORE_FILE" /root/.ssh/id_ed25519 /root/.ssh/id_rsa /root/.ssh/id_ecdsa /root/.ssh/id_dsa; do
+      if [ -f "$f" ]; then
+        candidates+=("$f")
+      fi
+    done
 
-  if [ "${#candidates[@]}" -gt 0 ]; then
-    for f in "${candidates[@]}"; do
-      [ -z "$first" ] && first="$f"
-      if try_backend_key "$f"; then
-        working="$f"
+    if [ "${#candidates[@]}" -gt 0 ]; then
+      for f in "${candidates[@]}"; do
+        if [ -z "$first" ]; then
+          first="$f"
+        fi
+        if try_backend_key "$f"; then
+          working="$f"
+          break
+        fi
+      done
+    fi
+
+    echo
+    if [ -n "$working" ]; then
+      info "найден рабочий приватный ключ: $working"
+      echo " ${DIM}Enter — использовать его. Или вставьте другой приватный SSH-ключ RELAY -> BACKEND (скрыто).${R}"
+    else
+      echo " ${B}?${R} Вставьте приватный SSH-ключ RELAY -> BACKEND ${DIM}(скрыто)${R}"
+      if [ -n "$first" ]; then
+        echo " ${DIM}Enter — попробовать существующий файл: $first${R}"
+      else
+        echo " ${DIM}Подходящих ключей не найдено. Вставьте приватный ключ целиком, начиная с -----BEGIN ...${R}"
+      fi
+    fi
+
+    bracketed_paste_off
+
+    rc=0
+    read_hidden_line line || rc=$?
+
+    if [ -z "$line" ]; then
+      bracketed_paste_on
+      drain_tty
+
+      if [ -n "$working" ]; then
+        set_selected_key_file "$working"
+        ok "используется ключ: $KEY_FILE"
+        return 0
+      fi
+
+      if [ -n "$first" ] && key_is_valid "$first"; then
+        set_selected_key_file "$first"
+        ok "используется ключ: $KEY_FILE"
+        return 0
+      fi
+
+      fail "ключ не указан и не найден"
+      confirm "Попробовать снова?" y || return 1
+      continue
+    fi
+
+    full_key_content="$line"$'\n'
+
+    if [[ "$line" != -BEGIN* ]]; then
+      bracketed_paste_on
+      drain_tty
+
+      if [ -f "$line" ] && key_is_valid "$line"; then
+        set_selected_key_file "$line"
+        ok "ключ принят из файла: $KEY_FILE"
+        return 0
+      fi
+
+      fail "первая строка не похожа на начало ключа (-BEGIN...) и не является валидным путем к файлу"
+      confirm "Попробовать снова?" y || return 1
+      continue
+    fi
+
+    while true; do
+      rc=0
+      read_hidden_line line || rc=$?
+
+      full_key_content+="$line"$'\n'
+
+      if [[ "$line" == -END* ]]; then
+        break
+      fi
+
+      if [ "$rc" -ne 0 ]; then
+        break
+      fi
+
+      if [ "${#full_key_content}" -gt 100000 ]; then
         break
       fi
     done
-  fi
 
-  echo
-  if [ -n "$working" ]; then
-    info "найден рабочий приватный ключ: $working"
-    echo " ${DIM}Enter — использовать его. Или вставьте другой приватный SSH-ключ RELAY -> BACKEND (скрыто).${R}"
-  else
-    echo " ${B}?${R} Вставьте приватный SSH-ключ RELAY -> BACKEND ${DIM}(скрыто)${R}"
-    if [ -n "$first" ]; then
-      echo " ${DIM}Enter — попробовать существующий файл: $first${R}"
-    else
-      echo " ${DIM}Подходящих ключей не найдено. Вставьте приватный ключ целиком, начиная с -----BEGIN ...${R}"
-    fi
-  fi
-
-  bracketed_paste_off
-  
-  # Читаем первую строку
-  if read_hidden_line line; then
-    rc=0
-  else
-    rc=$?
-  fi
-  
-  # Если пустая строка (Enter)
-  if [ -z "$line" ]; then
     bracketed_paste_on
     drain_tty
-    
-    if [ -n "$working" ]; then
-      KEY_FILE="$working"
-      KEY_STORE_USED=0 # используем существующий путь, не наш сторовый
-      ok "используется ключ: $KEY_FILE"
-      return 0
-    elif [ -n "$first" ] && key_is_valid "$first"; then
-      KEY_FILE="$first"
-      KEY_STORE_USED=0
-      ok "используется ключ: $KEY_FILE"
-      return 0
-    else
-      fail "ключ не указан и не найден"
+
+    tmpkey="$KEY_STORE_FILE.tmp.$$"
+    printf '%s' "$full_key_content" > "$tmpkey"
+    chmod 600 "$tmpkey" || {
+      rm -f "$tmpkey"
+      fail "не удалось создать временный файл ключа"
       confirm "Попробовать снова?" y || return 1
-      return 1 
+      continue
+    }
+
+    if key_is_valid "$tmpkey"; then
+      mv -f "$tmpkey" "$KEY_STORE_FILE"
+      chmod 600 "$KEY_STORE_FILE" || true
+      set_selected_key_file "$KEY_STORE_FILE"
+      ok "приватный ключ успешно сохранён и проверен: $KEY_FILE"
+      return 0
     fi
-  fi
 
-  # Начинаем сборку ключа
-  full_key_content="$line"$'\n'
-  
-  # Если первая строка не BEGIN, значит это путь к файлу или мусор
-  if [[ "$line" != -BEGIN* ]]; then
-     if [ -f "$line" ]; then
-       bracketed_paste_on
-       drain_tty
-       if key_is_valid "$line"; then
-         KEY_FILE="$line"
-         KEY_STORE_USED=0
-         ok "ключ принят из файла: $KEY_FILE"
-         return 0
-       else
-         fail "файл существует, но не является валидным ключом: $line"
-         return 1
-       fi
-     else
-       bracketed_paste_on
-       drain_tty
-       fail "первая строка не похожа на начало ключа (-BEGIN...) и не является путем к файлу"
-       return 1
-     fi
-  fi
-
-  # Читаем остальные строки до END
-  while true; do
-    if read_hidden_line line; then
-      rc=0
-    else
-      rc=$?
-    fi
-    
-    # Добавляем перевод строки
-    full_key_content+="$line"$'\n'
-    
-    # Проверяем окончание
-    if [[ "$line" == -END* ]]; then
-      break
-    fi
-    
-    # Защита от бесконечного цикла (если человек забыл закрыть)
-    if [ ${#full_key_content} -gt 100000 ]; then
-       break
-    fi
-  done
-
-  bracketed_paste_on
-  drain_tty
-
-  # Создаем временный файл
-  tmpkey="$KEY_STORE_FILE.tmp.$$"
-  printf '%s' "$full_key_content" > "$tmpkey"
-  chmod 600 "$tmpkey" || { rm -f "$tmpkey"; fail "ошибка записи temp key"; return 1; }
-
-  # Валидация
-  if key_is_valid "$tmpkey"; then
-    mv -f "$tmpkey" "$KEY_STORE_FILE"
-    chmod 600 "$KEY_STORE_FILE" || true
-    KEY_FILE="$KEY_STORE_FILE"
-    KEY_STORE_USED=1
-    ok "приватный ключ успешно сохранён и проверен: $KEY_FILE"
-    return 0
-  else
     rm -f "$tmpkey"
-    fail "введённый ключ не проходит проверку ssh-keygen (формат неверен или есть passphrase)"
-    return 1
-  fi
+    fail "введённый ключ не проходит проверку ssh-keygen (неверный формат, лишние символы или passphrase)"
+    confirm "Попробовать снова?" y || return 1
+  done
 }
 
 ssh_connect() {
@@ -499,6 +496,7 @@ ssh_connect() {
 
     if echo "$err" | grep -qi 'permission denied'; then
       fail "BACKEND не принял ключ. Проверьте, что публичная часть ключа есть в root@BACKEND:~/.ssh/authorized_keys"
+      KEY_FILE=""
       read_backend_key || die "без валидного ключа к BACKEND продолжить нельзя"
       continue
     fi
@@ -511,6 +509,7 @@ ssh_connect() {
       fail "неверный порт"
     fi
 
+    KEY_FILE=""
     read_backend_key || die "без SSH к BACKEND продолжить нельзя"
   done
 }
@@ -794,9 +793,8 @@ map \$http_upgrade \$connection_upgrade {
 }
 
 map \$http_upgrade \$sc_upgrade_ok {
-    websocket 1;
-    http-upgrade 1;
     default 0;
+    "~*^(websocket|http-upgrade)$" 1;
 }
 
 server {
@@ -1066,9 +1064,8 @@ map \$http_upgrade \$connection_upgrade {
 }
 
 map \$http_upgrade \$sc_upgrade_ok {
-    websocket 1;
-    http-upgrade 1;
     default 0;
+    "~*^(websocket|http-upgrade)$" 1;
 }
 
 server {
