@@ -2,7 +2,7 @@
 set -euo pipefail
 export LC_ALL=C.UTF-8
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 NAME="SecureChain"
 
 CONF_FILE="${CONF_FILE:-/root/.secure-chain.conf}"
@@ -33,7 +33,7 @@ fi
 
 TMPD=""
 STEP=0
-TOTAL=16
+TOTAL=18
 MODE=""
 RELAY_IP=""
 BACKEND_IP=""
@@ -103,7 +103,7 @@ banner() {
 
 drain_tty() {
   if [ -r /dev/tty ]; then
-    while IFS= read -r -t 0.05 -n 1 _ </dev/tty; do :; done
+    while IFS= read -r -t 0.05 -n 1 _j </dev/tty; do :; done
   fi
 }
 
@@ -242,7 +242,7 @@ choose_remote_port() {
 
 bk() {
   [ "${#SSH_OPTS[@]}" -gt 0 ] || die "SSH к BACKEND не настроен"
-  ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" bash -lc "$*"
+  ssh -n "${SSH_OPTS[@]}" "root@$BACKEND_IP" bash -lc "$*"
 }
 
 remote_script() {
@@ -271,124 +271,216 @@ try_backend_key() {
     -o BatchMode=yes
   )
 
-  ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" true >/dev/null 2>&1
+  ssh -n "${SSH_OPTS[@]}" "root@$BACKEND_IP" true >/dev/null 2>&1
+}
+
+bracketed_paste_off() {
+  bind 'set enable-bracketed-paste off' >/dev/null 2>&1 || true
+  if [ -t 1 ] && [ -e /dev/tty ]; then
+    printf '\033[?2004l' >/dev/tty 2>/dev/null || true
+  fi
+}
+
+bracketed_paste_on() {
+  bind 'set enable-bracketed-paste on' >/dev/null 2>&1 || true
+  if [ -t 1 ] && [ -e /dev/tty ]; then
+    printf '\033[?2004h' >/dev/tty 2>/dev/null || true
+  fi
+}
+
+sanitize_key_line() {
+  local s="$1"
+  local cr=$'\r'
+  local bom=$'\xef\xbb\xbf'
+  local bp_start=$'\e[200~'
+  local bp_end=$'\e[201~'
+  local bp_off=$'\e[?2004l'
+  local bp_on=$'\e[?2004h'
+
+  s="${s//"$cr"/}"
+  s="${s#"$bom"}"
+  s="${s//"$bp_start"/}"
+  s="${s//"$bp_end"/}"
+  s="${s//"$bp_off"/}"
+  s="${s//"$bp_on"/}"
+
+  # trim leading/trailing whitespace
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+
+  printf '%s' "$s"
+}
+
+read_hidden_line() {
+  local __ref="$1"
+  local rc=0
+  local line=""
+
+  if [ -r /dev/tty ]; then
+    IFS= read -r -s line </dev/tty || rc=$?
+  else
+    IFS= read -r -s line || rc=$?
+  fi
+
+  line="$(sanitize_key_line "$line")"
+  printf -v "$__ref" '%s' "$line"
+  return "$rc"
 }
 
 read_backend_key() {
   mkdir -p "$KEY_STORE_DIR" && chmod 700 "$KEY_STORE_DIR" || die "не удалось создать $KEY_STORE_DIR"
 
-  local candidate_list=""
-  add_candidate() {
-    local f="$1"
-    if [ -f "$f" ]; then
-      candidate_list+="$f"$'\n'
-    fi
-  }
+  local f working first line rc tmpkey
+  local -a candidates
 
-  add_candidate "$KEY_STORE_FILE"
-  add_candidate "/root/.ssh/id_ed25519"
-  add_candidate "/root/.ssh/id_rsa"
-  add_candidate "/root/.ssh/id_ecdsa"
-  add_candidate "/root/.ssh/id_dsa"
+  while true; do
+    candidates=()
+    working=""
+    first=""
+    line=""
+    rc=0
+    tmpkey=""
 
-  local working="" first="" kf
-  while IFS= read -r kf; do
-    [ -n "$kf" ] || continue
-    if [ -z "$first" ]; then
-      first="$kf"
-    fi
-    if try_backend_key "$kf"; then
-      working="$kf"
-      break
-    fi
-  done <<< "$candidate_list"
-
-  echo
-  if [ -n "$working" ]; then
-    info "найден рабочий приватный ключ: $working"
-    echo " ${DIM}Enter — использовать его. Или вставьте другой приватный SSH-ключ RELAY -> BACKEND (скрыто).${R}"
-  else
-    echo " ${B}?${R} Вставьте приватный SSH-ключ RELAY -> BACKEND ${DIM}(скрыто)${R}"
-    if [ -n "$first" ]; then
-      echo " ${DIM}Enter — попробовать существующий файл: $first${R}"
-    else
-      echo " ${DIM}Подходящих ключей не найдено. Вставьте приватный ключ целиком, начиная с -----BEGIN ...${R}"
-    fi
-  fi
-
-  local line=""
-  if [ -r /dev/tty ]; then
-    IFS= read -r -s line </dev/tty || line=""
-  else
-    IFS= read -r -s line || line=""
-  fi
-  line="${line//$'\r'/}"
-
-  if [ -z "$line" ]; then
-    if [ -n "$working" ]; then
-      KEY_FILE="$working"
-    elif [ -n "$first" ] && key_is_valid "$first"; then
-      KEY_FILE="$first"
-    else
-      fail "ключ не указан и не найден"
-      return 1
-    fi
-
-    if [ "$KEY_FILE" = "$KEY_STORE_FILE" ]; then
-      KEY_STORE_USED=1
-    else
-      KEY_STORE_USED=0
-    fi
-
-    ok "используется ключ: $KEY_FILE"
-    return 0
-  fi
-
-  if [[ "$line" == -BEGIN* ]]; then
-    local tmpkey="$KEY_STORE_FILE.tmp.$$"
-    printf '%s\n' "$line" > "$tmpkey"
-    chmod 600 "$tmpkey" || { rm -f "$tmpkey"; return 1; }
-
-    while true; do
-      if [ -r /dev/tty ]; then
-        if ! IFS= read -r -s line </dev/tty; then
-          break
-        fi
-      else
-        if ! IFS= read -r -s line; then
-          break
-        fi
-      fi
-
-      line="${line//$'\r'/}"
-      printf '%s\n' "$line" >> "$tmpkey"
-
-      if [[ "$line" == -END* ]]; then
-        break
-      fi
+    for f in "$KEY_STORE_FILE" /root/.ssh/id_ed25519 /root/.ssh/id_rsa /root/.ssh/id_ecdsa /root/.ssh/id_dsa; do
+      [ -f "$f" ] && candidates+=("$f")
     done
 
-    if key_is_valid "$tmpkey"; then
-      mv -f "$tmpkey" "$KEY_STORE_FILE"
-      chmod 600 "$KEY_STORE_FILE" || true
-      KEY_FILE="$KEY_STORE_FILE"
-      KEY_STORE_USED=1
-      ok "приватный ключ сохранён: $KEY_FILE"
-      return 0
+    if [ "${#candidates[@]}" -gt 0 ]; then
+      for f in "${candidates[@]}"; do
+        [ -z "$first" ] && first="$f"
+        if try_backend_key "$f"; then
+          working="$f"
+          break
+        fi
+      done
+    fi
+
+    echo
+    if [ -n "$working" ]; then
+      info "найден рабочий приватный ключ: $working"
+      echo " ${DIM}Enter — использовать его. Или вставьте другой приватный SSH-ключ RELAY -> BACKEND (скрыто).${R}"
     else
+      echo " ${B}?${R} Вставьте приватный SSH-ключ RELAY -> BACKEND ${DIM}(скрыто)${R}"
+      if [ -n "$first" ]; then
+        echo " ${DIM}Enter — попробовать существующий файл: $first${R}"
+      else
+        echo " ${DIM}Подходящих ключей не найдено. Вставьте приватный ключ целиком, начиная с -----BEGIN ...${R}"
+      fi
+    fi
+
+    bracketed_paste_off
+
+    if read_hidden_line line; then
+      rc=0
+    else
+      rc=$?
+    fi
+
+    if [ -z "$line" ]; then
+      bracketed_paste_on
+      drain_tty
+
+      if [ -n "$working" ]; then
+        KEY_FILE="$working"
+      elif [ -n "$first" ] && key_is_valid "$first"; then
+        KEY_FILE="$first"
+      else
+        fail "ключ не указан и не найден"
+        confirm "Попробовать снова?" y || return 1
+        continue
+      fi
+
+      if [ "$KEY_FILE" = "$KEY_STORE_FILE" ]; then
+        KEY_STORE_USED=1
+      else
+        KEY_STORE_USED=0
+      fi
+
+      ok "используется ключ: $KEY_FILE"
+      return 0
+    fi
+
+    if [[ "$line" == -BEGIN* ]]; then
+      tmpkey="$KEY_STORE_FILE.tmp.$$"
+      printf '%s\n' "$line" > "$tmpkey"
+      chmod 600 "$tmpkey" || {
+        rm -f "$tmpkey"
+        bracketed_paste_on
+        drain_tty
+        fail "не удалось создать временный файл ключа"
+        confirm "Попробовать снова?" y || return 1
+        continue
+      }
+
+      while true; do
+        if read_hidden_line line; then
+          rc=0
+        else
+          rc=$?
+        fi
+
+        printf '%s\n' "$line" >> "$tmpkey"
+
+        if [[ "$line" == -END* ]]; then
+          break
+        fi
+
+        if [ "$rc" -ne 0 ]; then
+          break
+        fi
+      done
+
+      bracketed_paste_on
+      drain_tty
+
+      if key_is_valid "$tmpkey"; then
+        mv -f "$tmpkey" "$KEY_STORE_FILE"
+        chmod 600 "$KEY_STORE_FILE" || true
+        KEY_FILE="$KEY_STORE_FILE"
+        KEY_STORE_USED=1
+        ok "приватный ключ сохранён: $KEY_FILE"
+        return 0
+      fi
+
       rm -f "$tmpkey"
       fail "введённый ключ не читается: неверный формат или ключ защищён passphrase"
-      return 1
+      confirm "Попробовать снова?" y || return 1
+      continue
     fi
-  fi
 
-  if [ -f "$line" ]; then
-    KEY_FILE="$line"
-    KEY_STORE_USED=0
-  else
-    local tmpkey="$KEY_STORE_FILE.tmp.$$"
+    if [ -f "$line" ]; then
+      bracketed_paste_on
+      drain_tty
+
+      if key_is_valid "$line"; then
+        KEY_FILE="$line"
+        if [ "$KEY_FILE" = "$KEY_STORE_FILE" ]; then
+          KEY_STORE_USED=1
+        else
+          KEY_STORE_USED=0
+        fi
+        ok "ключ принят: $KEY_FILE"
+        return 0
+      fi
+
+      fail "файл существует, но не является валидным приватным SSH-ключом без passphrase: $line"
+      confirm "Попробовать снова?" y || return 1
+      continue
+    fi
+
+    tmpkey="$KEY_STORE_FILE.tmp.$$"
     printf '%s\n' "$line" > "$tmpkey"
-    chmod 600 "$tmpkey" || { rm -f "$tmpkey"; return 1; }
+    chmod 600 "$tmpkey" || {
+      rm -f "$tmpkey"
+      bracketed_paste_on
+      drain_tty
+      fail "не удалось создать временный файл ключа"
+      confirm "Попробовать снова?" y || return 1
+      continue
+    }
+
+    bracketed_paste_on
+    drain_tty
 
     if key_is_valid "$tmpkey"; then
       mv -f "$tmpkey" "$KEY_STORE_FILE"
@@ -397,20 +489,12 @@ read_backend_key() {
       KEY_STORE_USED=1
       ok "приватный ключ сохранён: $KEY_FILE"
       return 0
-    else
-      rm -f "$tmpkey"
-      fail "введённое значение не является валидным приватным SSH-ключом"
-      return 1
     fi
-  fi
 
-  if key_is_valid "$KEY_FILE"; then
-    ok "ключ принят: $KEY_FILE"
-    return 0
-  fi
-
-  fail "ключ не читается: $KEY_FILE"
-  return 1
+    rm -f "$tmpkey"
+    fail "введённое значение не является валидным приватным SSH-ключом"
+    confirm "Попробовать снова?" y || return 1
+  done
 }
 
 ssh_connect() {
@@ -431,7 +515,7 @@ ssh_connect() {
       -o ServerAliveCountMax=4
     )
 
-    if ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" true >/dev/null 2>"$TMPD/ssh.err"; then
+    if ssh -n "${SSH_OPTS[@]}" "root@$BACKEND_IP" true >/dev/null 2>"$TMPD/ssh.err"; then
       ok "SSH: root@$BACKEND_IP:$BACKEND_PORT"
       return 0
     fi
@@ -584,11 +668,11 @@ EOF
 }
 
 deploy_backend_tls() {
-  ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" "mkdir -p /etc/secure-chain/tls && chmod 700 /etc/secure-chain/tls" >>"$LOG" 2>&1 || return 1
+  ssh -n "${SSH_OPTS[@]}" "root@$BACKEND_IP" "mkdir -p /etc/secure-chain/tls && chmod 700 /etc/secure-chain/tls" >>"$LOG" 2>&1 || return 1
   ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" "cat > /etc/secure-chain/tls/ca.pem" < "$TLS_DIR/ca.pem" >>"$LOG" 2>&1 || return 1
   ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" "cat > /etc/secure-chain/tls/server.crt" < "$TLS_DIR/backend.crt" >>"$LOG" 2>&1 || return 1
   ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" "cat > /etc/secure-chain/tls/server.key" < "$TLS_DIR/backend.key" >>"$LOG" 2>&1 || return 1
-  ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" "chmod 600 /etc/secure-chain/tls/*" >>"$LOG" 2>&1 || return 1
+  ssh -n "${SSH_OPTS[@]}" "root@$BACKEND_IP" "chmod 600 /etc/secure-chain/tls/*" >>"$LOG" 2>&1 || return 1
   ok "mTLS сертификаты доставлены на BACKEND"
 }
 
@@ -1368,7 +1452,7 @@ do_uninstall() {
       -o ConnectTimeout=10
       -o BatchMode=yes
     )
-    if ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" true >/dev/null 2>&1; then
+    if ssh -n "${SSH_OPTS[@]}" "root@$BACKEND_IP" true >/dev/null 2>&1; then
       backend_ok=1
       ok "SSH к BACKEND доступен"
     else
@@ -1391,11 +1475,11 @@ do_uninstall() {
 run_install() {
   INSTALL_KIND="secure-chain"
   STEP=0
-  TOTAL=16
+  TOTAL=18
 
   check_reinstall
   STEP=0
-  TOTAL=16
+  TOTAL=18
 
   KEY_FILE=""
   KEY_STORE_USED=0
