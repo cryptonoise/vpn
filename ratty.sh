@@ -2,19 +2,23 @@
 set -euo pipefail
 export LC_ALL=C.UTF-8
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 NAME="SecureChain"
 
 CONF_FILE="${CONF_FILE:-/root/.secure-chain.conf}"
 REPORT_FILE="${REPORT_FILE:-/root/secure-chain-report.txt}"
 LOG="${LOG:-/var/log/secure-chain.log}"
 MARKER_FILE="${MARKER_FILE:-/root/.secure-chain.installed}"
+
 TLS_DIR="${TLS_DIR:-/etc/secure-chain/tls}"
+KEY_STORE_DIR="${KEY_STORE_DIR:-/root/.secure-chain}"
+KEY_STORE_FILE="${KEY_STORE_FILE:-$KEY_STORE_DIR/relay-backend-key}"
 
 PANEL_PORT="${PANEL_PORT:-999}"
 INTERNAL_NAME="${INTERNAL_NAME:-backend.secure-chain.local}"
 RELAY_WEBROOT="${RELAY_WEBROOT:-/var/www/secure-chain}"
 BACKEND_WEBROOT="${BACKEND_WEBROOT:-/var/www/secure-chain-backend}"
+
 RELAY_NGINX_AVAILABLE="/etc/nginx/sites-available/secure-chain-relay.conf"
 RELAY_NGINX_TEMP_AVAILABLE="/etc/nginx/sites-available/secure-chain-temp.conf"
 RELAY_NGINX_ENABLED="/etc/nginx/sites-enabled/secure-chain-relay.conf"
@@ -35,6 +39,7 @@ RELAY_IP=""
 BACKEND_IP=""
 BACKEND_PORT=""
 KEY_FILE=""
+KEY_STORE_USED=0
 DOMAIN=""
 EMAIL=""
 DNS_TARGET=""
@@ -89,11 +94,22 @@ banner() {
   echo " Цепочка: RELAY nginx + honeypot -> internal mTLS -> BACKEND 3x-ui/Xray VLESS WS"
   echo " Без rathole, без xhttp, без лишних режимов."
   echo
-  read -r -p " Нажмите Enter, чтобы начать." _ </dev/tty || true
+  if [ -r /dev/tty ]; then
+    read -r -p " Нажмите Enter, чтобы начать." _ </dev/tty || true
+  else
+    read -r -p " Нажмите Enter, чтобы начать." _ || true
+  fi
+}
+
+drain_tty() {
+  if [ -r /dev/tty ]; then
+    while IFS= read -r -t 0.05 -n 1 _ </dev/tty; do :; done
+  fi
 }
 
 ask() {
   local __ref="$1" __prompt="$2" __default="${3:-}" __input=""
+  drain_tty
   if [ -r /dev/tty ]; then
     read -r -p "$__prompt [$__default]: " __input </dev/tty || __input=""
   else
@@ -104,6 +120,7 @@ ask() {
 
 confirm() {
   local __prompt="$1" __default="${2:-y}" __ans=""
+  drain_tty
   if [ -r /dev/tty ]; then
     read -r -p "$__prompt [${__default^^}]: " __ans </dev/tty || __ans="$__default"
   else
@@ -132,6 +149,15 @@ valid_port() {
 
 valid_dom() {
   [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]
+}
+
+version_ge() {
+  [ -n "$1" ] || return 1
+  [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]
+}
+
+sed_escape_dot() {
+  printf '%s' "$1" | sed 's/\./\\./g'
 }
 
 rand_hex() {
@@ -163,7 +189,9 @@ ensure_tools() {
   command -v ss >/dev/null 2>&1 || miss+=(iproute2)
   command -v ufw >/dev/null 2>&1 || miss+=(ufw)
 
-  [ "${#miss[@]}" -eq 0 ] && return 0
+  if [ "${#miss[@]}" -eq 0 ]; then
+    return 0
+  fi
 
   info "устанавливаю на RELAY: ${miss[*]}"
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
@@ -175,12 +203,16 @@ detect_relay_ip() {
   local ip="" u
   for u in https://api.ipify.org https://ifconfig.me https://icanhazip.com; do
     ip=$(curl -4 -fsS --max-time 6 "$u" 2>/dev/null | tr -d '[:space:]' || true)
-    valid_ip "$ip" && break
+    if valid_ip "$ip"; then
+      break
+    fi
     ip=""
   done
+
   if [ -z "$ip" ]; then
     ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{ for (i=1; i<=NF; i++) if ($i=="src") print $(i+1) }' | head -1 || true)
   fi
+
   printf '%s' "$ip"
 }
 
@@ -190,11 +222,6 @@ ssh_ports() {
     sshd -T 2>/dev/null | awk '/^port / { print $2 }'
     systemctl show ssh.socket -p Listen 2>/dev/null | sed -n 's/^Listen=.*:\([0-9][0-9]*\) (Stream)$/\1/p'
   } | grep -E '^[0-9]+$' | sort -un || true
-}
-
-local_port_free() {
-  local p="$1"
-  ! ss -tlnH 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${p}\$"
 }
 
 remote_port_free() {
@@ -225,25 +252,183 @@ remote_script() {
   ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" bash -s -- "$@" < "$f"
 }
 
-read_key() {
-  while true; do
-    ask KEY_FILE "Путь к SSH-ключу RELAY -> BACKEND" "/root/.ssh/id_rsa"
-    if [ -f "$KEY_FILE" ]; then
+key_is_valid() {
+  [ -f "$1" ] && ssh-keygen -y -P "" -f "$1" >/dev/null 2>&1
+}
+
+try_backend_key() {
+  local kf="$1"
+  [ -n "${BACKEND_IP:-}" ] || return 1
+  [ -n "${BACKEND_PORT:-}" ] || return 1
+  key_is_valid "$kf" || return 1
+
+  SSH_OPTS=(
+    -i "$kf"
+    -p "$BACKEND_PORT"
+    -o IdentitiesOnly=yes
+    -o StrictHostKeyChecking=accept-new
+    -o ConnectTimeout=10
+    -o BatchMode=yes
+  )
+
+  ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" true >/dev/null 2>&1
+}
+
+read_backend_key() {
+  mkdir -p "$KEY_STORE_DIR" && chmod 700 "$KEY_STORE_DIR" || die "не удалось создать $KEY_STORE_DIR"
+
+  local candidate_list=""
+  add_candidate() {
+    local f="$1"
+    if [ -f "$f" ]; then
+      candidate_list+="$f"$'\n'
+    fi
+  }
+
+  add_candidate "$KEY_STORE_FILE"
+  add_candidate "/root/.ssh/id_ed25519"
+  add_candidate "/root/.ssh/id_rsa"
+  add_candidate "/root/.ssh/id_ecdsa"
+  add_candidate "/root/.ssh/id_dsa"
+
+  local working="" first="" kf
+  while IFS= read -r kf; do
+    [ -n "$kf" ] || continue
+    if [ -z "$first" ]; then
+      first="$kf"
+    fi
+    if try_backend_key "$kf"; then
+      working="$kf"
       break
     fi
-    fail "ключ не найден: $KEY_FILE"
-  done
+  done <<< "$candidate_list"
+
+  echo
+  if [ -n "$working" ]; then
+    info "найден рабочий приватный ключ: $working"
+    echo " ${DIM}Enter — использовать его. Или вставьте другой приватный SSH-ключ RELAY -> BACKEND (скрыто).${R}"
+  else
+    echo " ${B}?${R} Вставьте приватный SSH-ключ RELAY -> BACKEND ${DIM}(скрыто)${R}"
+    if [ -n "$first" ]; then
+      echo " ${DIM}Enter — попробовать существующий файл: $first${R}"
+    else
+      echo " ${DIM}Подходящих ключей не найдено. Вставьте приватный ключ целиком, начиная с -----BEGIN ...${R}"
+    fi
+  fi
+
+  local line=""
+  if [ -r /dev/tty ]; then
+    IFS= read -r -s line </dev/tty || line=""
+  else
+    IFS= read -r -s line || line=""
+  fi
+  line="${line//$'\r'/}"
+
+  if [ -z "$line" ]; then
+    if [ -n "$working" ]; then
+      KEY_FILE="$working"
+    elif [ -n "$first" ] && key_is_valid "$first"; then
+      KEY_FILE="$first"
+    else
+      fail "ключ не указан и не найден"
+      return 1
+    fi
+
+    if [ "$KEY_FILE" = "$KEY_STORE_FILE" ]; then
+      KEY_STORE_USED=1
+    else
+      KEY_STORE_USED=0
+    fi
+
+    ok "используется ключ: $KEY_FILE"
+    return 0
+  fi
+
+  if [[ "$line" == -BEGIN* ]]; then
+    local tmpkey="$KEY_STORE_FILE.tmp.$$"
+    printf '%s\n' "$line" > "$tmpkey"
+    chmod 600 "$tmpkey" || { rm -f "$tmpkey"; return 1; }
+
+    while true; do
+      if [ -r /dev/tty ]; then
+        if ! IFS= read -r -s line </dev/tty; then
+          break
+        fi
+      else
+        if ! IFS= read -r -s line; then
+          break
+        fi
+      fi
+
+      line="${line//$'\r'/}"
+      printf '%s\n' "$line" >> "$tmpkey"
+
+      if [[ "$line" == -END* ]]; then
+        break
+      fi
+    done
+
+    if key_is_valid "$tmpkey"; then
+      mv -f "$tmpkey" "$KEY_STORE_FILE"
+      chmod 600 "$KEY_STORE_FILE" || true
+      KEY_FILE="$KEY_STORE_FILE"
+      KEY_STORE_USED=1
+      ok "приватный ключ сохранён: $KEY_FILE"
+      return 0
+    else
+      rm -f "$tmpkey"
+      fail "введённый ключ не читается: неверный формат или ключ защищён passphrase"
+      return 1
+    fi
+  fi
+
+  if [ -f "$line" ]; then
+    KEY_FILE="$line"
+    KEY_STORE_USED=0
+  else
+    local tmpkey="$KEY_STORE_FILE.tmp.$$"
+    printf '%s\n' "$line" > "$tmpkey"
+    chmod 600 "$tmpkey" || { rm -f "$tmpkey"; return 1; }
+
+    if key_is_valid "$tmpkey"; then
+      mv -f "$tmpkey" "$KEY_STORE_FILE"
+      chmod 600 "$KEY_STORE_FILE" || true
+      KEY_FILE="$KEY_STORE_FILE"
+      KEY_STORE_USED=1
+      ok "приватный ключ сохранён: $KEY_FILE"
+      return 0
+    else
+      rm -f "$tmpkey"
+      fail "введённое значение не является валидным приватным SSH-ключом"
+      return 1
+    fi
+  fi
+
+  if key_is_valid "$KEY_FILE"; then
+    ok "ключ принят: $KEY_FILE"
+    return 0
+  fi
+
+  fail "ключ не читается: $KEY_FILE"
+  return 1
 }
 
 ssh_connect() {
   local err np
   while true; do
+    if [ -z "${KEY_FILE:-}" ]; then
+      read_backend_key || die "не получен валидный SSH-ключ для BACKEND"
+    fi
+
     SSH_OPTS=(
       -i "$KEY_FILE"
-      -o StrictHostKeyChecking=accept-new
-      -o ConnectTimeout=10
-      -o BatchMode=yes
       -p "$BACKEND_PORT"
+      -o IdentitiesOnly=yes
+      -o StrictHostKeyChecking=accept-new
+      -o ConnectTimeout=15
+      -o BatchMode=yes
+      -o ServerAliveInterval=15
+      -o ServerAliveCountMax=4
     )
 
     if ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" true >/dev/null 2>"$TMPD/ssh.err"; then
@@ -264,25 +449,32 @@ ssh_connect() {
       fi
     fi
 
-    fail "SSH недоступен: $(tail -n1 "$TMPD/ssh.err" 2>/dev/null || echo неизвестная ошибка)"
-    echo " Проверьте IP, порт, ключ и разрешение входа root по ключу."
+    if echo "$err" | grep -qi 'permission denied'; then
+      fail "BACKEND не принял ключ. Проверьте, что публичная часть ключа есть в root@BACKEND:~/.ssh/authorized_keys"
+      read_backend_key || die "без валидного ключа к BACKEND продолжить нельзя"
+      continue
+    fi
+
+    fail "SSH не удался: $(tail -n1 "$TMPD/ssh.err" 2>/dev/null || echo неизвестная ошибка)"
     ask np "SSH-порт BACKEND" "$BACKEND_PORT"
     if valid_port "$np"; then
       BACKEND_PORT="$np"
     else
       fail "неверный порт"
     fi
-    read_key
+
+    read_backend_key || die "без SSH к BACKEND продолжить нельзя"
   done
 }
 
 backend_os_check() {
   local bos
   bos=$(bk '. /etc/os-release; echo "$ID $VERSION_ID"' 2>>"$LOG" || true)
+
   case "$bos" in
     ubuntu\ *)
       local ver="${bos#ubuntu }"
-      if printf '%s\n22.04\n' "$ver" | sort -V | head -n1 | grep -q '^22\.04$'; then
+      if version_ge "$ver" 22.04; then
         ok "ОС BACKEND: Ubuntu $ver"
       else
         die "BACKEND: нужна Ubuntu 22.04 или новее (найдена $ver)"
@@ -327,6 +519,18 @@ dns_check() {
   warn "DNS не идеален: A='${all:-нет}', AAAA='${v6:-нет}', ожидается IPv4='$tgt'"
   warn "Если сертификат Let's Encrypt не выпустится, поправьте A-запись и уберите AAAA."
   return 1
+}
+
+tune_relay() {
+  sysctl -w net.core.default_qdisc=fq >>"$LOG" 2>&1 || true
+  sysctl -w net.ipv4.tcp_congestion_control=bbr >>"$LOG" 2>&1 || true
+  sysctl -w net.ipv4.tcp_mtu_probing=1 >>"$LOG" 2>&1 || true
+  sysctl -w net.core.rmem_max=16777216 >>"$LOG" 2>&1 || true
+  sysctl -w net.core.wmem_max=16777216 >>"$LOG" 2>&1 || true
+  sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216" >>"$LOG" 2>&1 || true
+  sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216" >>"$LOG" 2>&1 || true
+  sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >>"$LOG" 2>&1 || true
+  return 0
 }
 
 generate_internal_tls() {
@@ -493,7 +697,8 @@ EOF
 }
 
 relay_cert() {
-  if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+  if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ] &&
+     [ -f "/etc/letsencrypt/live/$DOMAIN/privkey.pem" ]; then
     ok "сертификат Let's Encrypt уже существует для $DOMAIN"
     return 0
   fi
@@ -511,6 +716,26 @@ relay_final_nginx() {
   local v6 l6_80=""
   v6=$(nginx_ipv6_enabled)
   [ "$v6" = 1 ] && l6_80="listen [::]:80;"
+
+  local nginx_ver listen443 http2_directive=""
+  nginx_ver="$(nginx -v 2>&1 | sed 's/.*nginx\///; s/[^0-9.].*//')"
+
+  if version_ge "$nginx_ver" 1.25.1; then
+    listen443="listen 443 ssl;"
+    http2_directive="http2 on;"
+  else
+    listen443="listen 443 ssl http2;"
+  fi
+
+  if [ "$v6" = 1 ]; then
+    if version_ge "$nginx_ver" 1.25.1; then
+      listen443+="
+listen [::]:443 ssl;"
+    else
+      listen443+="
+listen [::]:443 ssl http2;"
+    fi
+  fi
 
   cat > "$RELAY_NGINX_AVAILABLE" <<EOF
 limit_req_zone \$binary_remote_addr zone=sc_ws_limit_relay:10m rate=10r/s;
@@ -541,8 +766,8 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    $([ "$v6" = 1 ] && echo "listen [::]:443 ssl;")
+    $listen443
+    $http2_directive
     server_name $DOMAIN;
 
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
@@ -615,28 +840,77 @@ EOF
 }
 
 update_relay_hosts() {
-  sed -i "/[[:space:]]${INTERNAL_NAME}\$/d" /etc/hosts || return 1
+  local re
+  re=$(sed_escape_dot "$INTERNAL_NAME")
+  sed -i "/[[:space:]]${re}\$/d" /etc/hosts || return 1
   echo "$BACKEND_IP $INTERNAL_NAME" >> /etc/hosts || return 1
   ok "/etc/hosts RELAY: $INTERNAL_NAME -> $BACKEND_IP"
 }
 
 install_relay_helper() {
+  local internal_re
+  internal_re=$(sed_escape_dot "$INTERNAL_NAME")
+
   cat > /usr/local/bin/secure-chain-set-backend <<EOF
 #!/bin/bash
 set -e
 NEW="\$1"
 [ -z "\$NEW" ] && { echo "usage: secure-chain-set-backend НОВЫЙ_IP_BACKEND"; exit 1; }
-sed -i "/[[:space:]]${INTERNAL_NAME}\$/d" /etc/hosts
+sed -i "/[[:space:]]${internal_re}\$/d" /etc/hosts
 echo "\$NEW ${INTERNAL_NAME}" >> /etc/hosts
 systemctl reload nginx
 echo "Secure Chain backend updated: \$NEW"
 EOF
+
   chmod +x /usr/local/bin/secure-chain-set-backend
   ok "установлена команда secure-chain-set-backend"
 }
 
+post_checks() {
+  local code
+
+  code=$(curl -s -o /dev/null --max-time 10 -w '%{http_code}' "https://$DOMAIN/" 2>/dev/null || true)
+  if [ "$code" = "200" ]; then
+    ok "honeypot RELAY отвечает HTTP 200"
+  else
+    warn "honeypot RELAY вернул HTTP ${code:-000}"
+  fi
+
+  code=$(curl -s -o /dev/null --max-time 10 -w '%{http_code}' "https://$DOMAIN$CHANNEL_PATH" 2>/dev/null || true)
+  if [ "$code" = "404" ]; then
+    ok "канал скрыт без WebSocket/HTTPUpgrade upgrade: HTTP 404"
+  else
+    warn "канал без upgrade вернул HTTP ${code:-000}, ожидался 404"
+  fi
+}
+
 make_remote_scripts() {
   local D="$TMPD"
+
+  cat > "$D/f2b-ignore.sh" <<'EOF'
+IP="$1"
+J=/etc/fail2ban/jail.local
+[ -f "$J" ] || exit 0
+if grep -q '^ignoreip' "$J"; then
+  grep -q "$IP" "$J" || sed -i "s|^ignoreip.*|& $IP|" "$J"
+else
+  sed -i "/^\[sshd\]/a ignoreip = 127.0.0.1/8 ::1 $IP" "$J"
+fi
+systemctl restart fail2ban >/dev/null 2>&1 || true
+exit 0
+EOF
+
+  cat > "$D/be-tune.sh" <<'EOF'
+set -e
+sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || true
+sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1 || true
+sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216" >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216" >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || true
+EOF
 
   cat > "$D/be-pkgs.sh" <<'EOF'
 set -e
@@ -698,6 +972,7 @@ TLS_DIR="$7"
 NGINX_CONF="/etc/nginx/sites-available/secure-chain-backend.conf"
 
 mkdir -p "$WEBROOT"
+
 cat > "$WEBROOT/index.html" <<'HTML'
 <!doctype html>
 <html><head><meta charset="utf-8"><title>Internal Service</title></head>
@@ -715,8 +990,24 @@ if [ -e /proc/net/if_inet6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv
   V6=1
 fi
 
-L6=""
-[ "$V6" = 1 ] && L6="listen [::]:$INTERNAL_PORT ssl;"
+NGINX_VER="$(nginx -v 2>&1 | sed 's/.*nginx\///; s/[^0-9.].*//')"
+HTTP2=""
+if [ -n "$NGINX_VER" ] && [ "$(printf '%s\n%s\n' "$NGINX_VER" "1.25.1" | sort -V | head -n1)" = "1.25.1" ]; then
+  LISTEN_SSL="listen $INTERNAL_PORT ssl;"
+  HTTP2="http2 on;"
+else
+  LISTEN_SSL="listen $INTERNAL_PORT ssl http2;"
+fi
+
+if [ "$V6" = 1 ]; then
+  if [ -n "$HTTP2" ]; then
+    LISTEN_SSL="$LISTEN_SSL
+listen [::]:$INTERNAL_PORT ssl;"
+  else
+    LISTEN_SSL="$LISTEN_SSL
+listen [::]:$INTERNAL_PORT ssl http2;"
+  fi
+fi
 
 cat > "$NGINX_CONF" <<EOT
 limit_req_zone \$binary_remote_addr zone=sc_ws_limit_backend:10m rate=10r/s;
@@ -733,8 +1024,8 @@ map \$http_upgrade \$sc_upgrade_ok {
 }
 
 server {
-    listen $INTERNAL_PORT ssl;
-$L6
+    $LISTEN_SSL
+    $HTTP2
     server_name $INTERNAL_NAME;
 
     ssl_certificate $TLS_DIR/server.crt;
@@ -824,6 +1115,7 @@ EOF
 set -e
 PANEL_PORT="$1"
 BASE_PATH="${2#/}"
+BASE_PATH="${BASE_PATH%/}"
 XU="$3"
 XP="$4"
 UUID="$5"
@@ -864,7 +1156,7 @@ RESP_ADD=$(curl -sS -b "$COOKIE" -X POST "$BASE/panel/api/inbounds/add" \
   --data-urlencode "streamSettings=$STREAM" \
   --data-urlencode "sniffing=$SNIFFING" \
   --data-urlencode "allocate={}" \
-  --data-urlencode "tag=sc-vless" \
+  --data-urlencode "tag=sc-vless-$(date +%s)" \
   --data-urlencode "domain=" \
   --data-urlencode "tgId=" \
   --data-urlencode "subId=sc$(date +%s)" 2>&1 || true)
@@ -923,6 +1215,7 @@ RELAY_IP=${RELAY_IP:-}
 BACKEND_IP=${BACKEND_IP:-}
 BACKEND_PORT=${BACKEND_PORT:-}
 KEY_FILE=${KEY_FILE:-}
+KEY_STORE_USED=${KEY_STORE_USED:-0}
 DOMAIN=${DOMAIN:-}
 EMAIL=${EMAIL:-}
 CHANNEL_PATH=${CHANNEL_PATH:-}
@@ -946,6 +1239,7 @@ RELAY_IP=${RELAY_IP:-}
 BACKEND_IP=${BACKEND_IP:-}
 BACKEND_PORT=${BACKEND_PORT:-}
 KEY_FILE=${KEY_FILE:-}
+KEY_STORE_USED=${KEY_STORE_USED:-0}
 DOMAIN=${DOMAIN:-}
 EMAIL=${EMAIL:-}
 CHANNEL_PATH=${CHANNEL_PATH:-}
@@ -1001,6 +1295,9 @@ do_uninstall() {
     return 1
   fi
 
+  STEP=0
+  TOTAL=4
+
   if [ "${UNINSTALL_ASSUME_YES:-0}" != 1 ]; then
     confirm "Удалить установку Secure Chain?" n || { echo " Отменено."; return 1; }
   fi
@@ -1029,7 +1326,9 @@ do_uninstall() {
   rm -f /usr/local/bin/secure-chain-set-backend 2>/dev/null || true
 
   if [ -n "${INTERNAL_NAME:-}" ]; then
-    sed -i "/[[:space:]]${INTERNAL_NAME}\$/d" /etc/hosts 2>/dev/null || true
+    local re
+    re=$(sed_escape_dot "$INTERNAL_NAME")
+    sed -i "/[[:space:]]${re}\$/d" /etc/hosts 2>/dev/null || true
   fi
 
   ufw delete allow 80/tcp >/dev/null 2>&1 || true
@@ -1048,6 +1347,12 @@ do_uninstall() {
     ok "сертификат $DOMAIN удалён, если существовал"
   fi
 
+  if [ "${KEY_STORE_USED:-0}" = 1 ] && [ "${KEY_FILE:-}" = "$KEY_STORE_FILE" ]; then
+    rm -f "$KEY_STORE_FILE" 2>/dev/null || true
+    rmdir "$KEY_STORE_DIR" 2>/dev/null || true
+    ok "сохранённый приватный ключ удалён"
+  fi
+
   ok "RELAY: настройки Secure Chain удалены"
 
   section "BACKEND: удаление"
@@ -1057,10 +1362,11 @@ do_uninstall() {
     BACKEND_PORT="${BACKEND_PORT:-22}"
     SSH_OPTS=(
       -i "$KEY_FILE"
+      -p "$BACKEND_PORT"
+      -o IdentitiesOnly=yes
       -o StrictHostKeyChecking=accept-new
       -o ConnectTimeout=10
       -o BatchMode=yes
-      -p "$BACKEND_PORT"
     )
     if ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" true >/dev/null 2>&1; then
       backend_ok=1
@@ -1091,6 +1397,9 @@ run_install() {
   STEP=0
   TOTAL=16
 
+  KEY_FILE=""
+  KEY_STORE_USED=0
+
   echo
   echo "${B}Параметры Secure Chain${R}"
   thin
@@ -1102,22 +1411,26 @@ run_install() {
       BACKEND_IP=""
       continue
     fi
-    valid_ip "$BACKEND_IP" && break
+    if valid_ip "$BACKEND_IP"; then
+      break
+    fi
     fail "неверный IP"
     BACKEND_IP=""
   done
 
   while true; do
     ask BACKEND_PORT "SSH-порт BACKEND" "${BACKEND_PORT:-22}"
-    valid_port "$BACKEND_PORT" && break
+    if valid_port "$BACKEND_PORT"; then
+      break
+    fi
     fail "неверный порт"
   done
 
-  read_key
-
   while true; do
     ask DOMAIN "Домен RELAY (A-запись -> IP этого сервера)" "${DOMAIN:-}"
-    valid_dom "$DOMAIN" && break
+    if valid_dom "$DOMAIN"; then
+      break
+    fi
     fail "неверный домен"
     DOMAIN=""
   done
@@ -1133,14 +1446,16 @@ run_install() {
   section "Подбор свободных портов на BACKEND"
   INTERNAL_PORT=$(choose_remote_port 28443 28444 28445 28446 28447 28448) || die "не найден свободный internal порт на BACKEND"
   XRAY_PORT=$(choose_remote_port 10000 10001 10002 10003 10004 10005 10006) || die "не найден свободный Xray порт на BACKEND"
+  PANEL_PORT=$(choose_remote_port 999 998 1001 1002 2053 2096) || die "не найден свободный порт панели на BACKEND"
   ok "BACKEND internal port: $INTERNAL_PORT"
   ok "BACKEND Xray port: $XRAY_PORT"
+  ok "BACKEND panel port: $PANEL_PORT"
 
   CHANNEL_PATH="/$(openssl rand -hex 8)/"
   UUID=$(new_uuid)
   XU=$(openssl rand -hex 5)
   XP=$(openssl rand -hex 10)
-  XW=$(openssl rand -hex 9)
+  XW="/$(openssl rand -hex 9)/"
 
   echo
   rule
@@ -1154,7 +1469,7 @@ run_install() {
   kv "UUID" "$UUID"
   kv "Internal TLS" "$INTERNAL_NAME:$INTERNAL_PORT (mTLS)"
   kv "Xray local" "127.0.0.1:$XRAY_PORT"
-  kv "Panel local" "127.0.0.1:$PANEL_PORT/$XW"
+  kv "Panel local" "127.0.0.1:$PANEL_PORT$XW"
   kv "RELAY ports" "SSH, 80/tcp, 443/tcp"
   kv "BACKEND ports" "SSH, $INTERNAL_PORT/tcp только от RELAY"
   kv "Tunnel" "без rathole, без xhttp; HTTPS/WSS -> internal mTLS -> VLESS WS"
@@ -1166,6 +1481,12 @@ run_install() {
   write_marker in-progress
   make_remote_scripts
 
+  section "Подготовка связки"
+  remote_script "$TMPD/f2b-ignore.sh" "$RELAY_IP" >>"$LOG" 2>&1 || true
+  tune_relay || warn "сетевые твики на RELAY применены не полностью"
+  remote_script "$TMPD/be-tune.sh" >>"$LOG" 2>&1 || warn "сетевые твики на BACKEND применены не полностью"
+  ok "fail2ban ignore и сетевые твики обработаны"
+
   section "RELAY: пакеты"
   relay_packages || die "не удалось подготовить RELAY"
 
@@ -1175,6 +1496,9 @@ run_install() {
   section "Внутренний mTLS"
   generate_internal_tls || die "не удалось создать внутренний mTLS CA"
   deploy_backend_tls || die "не удалось доставить mTLS на BACKEND"
+
+  section "RELAY: hosts"
+  update_relay_hosts || die "не удалось обновить /etc/hosts"
 
   section "DNS"
   dns_check || true
@@ -1194,8 +1518,7 @@ run_install() {
   section "RELAY: финальный nginx"
   relay_final_nginx || die "не удалось применить nginx на RELAY"
 
-  section "RELAY: hosts и helper"
-  update_relay_hosts || die "не удалось обновить /etc/hosts"
+  section "RELAY: helper"
   install_relay_helper || warn "secure-chain-set-backend не установлен"
 
   section "BACKEND: пакеты"
@@ -1237,6 +1560,9 @@ run_install() {
   write_marker done
   ok "настройки сохранены: $CONF_FILE"
 
+  section "Проверка"
+  post_checks || true
+
   local sc_ws_enc
   sc_ws_enc=$(urlencode_path "$CHANNEL_PATH")
 
@@ -1249,9 +1575,11 @@ run_install() {
     echo "UUID: $UUID"
     echo "Internal TLS: $INTERNAL_NAME:$INTERNAL_PORT"
     echo "Xray local: 127.0.0.1:$XRAY_PORT"
-    echo "Panel local: http://127.0.0.1:$PANEL_PORT/$XW"
+    echo "Panel local: http://127.0.0.1:$PANEL_PORT$XW"
     echo "Username: $XU"
     echo "Password: $XP"
+    echo "Key file: ${KEY_FILE:-}"
+    echo "Key stored by script: ${KEY_STORE_USED:-0}"
   } > "$REPORT_FILE"
   chmod 600 "$REPORT_FILE" || true
 
@@ -1270,11 +1598,11 @@ run_install() {
   echo
 
   printf ' %sПанель 3x-ui%s\n' "$B" "$R"
-  echo " Панель слушает только на BACKEND 127.0.0.1:$PANEL_PORT/$XW"
+  echo " Панель слушает только на BACKEND 127.0.0.1:$PANEL_PORT$XW"
   echo " Доступ через SSH-туннель с RELAY:"
   echo "   ssh -i $KEY_FILE -p $BACKEND_PORT root@$BACKEND_IP -L 9999:127.0.0.1:$PANEL_PORT"
   echo " Затем в браузере:"
-  echo "   http://127.0.0.1:9999/$XW"
+  echo "   http://127.0.0.1:9999$XW"
   echo " Username: $XU"
   echo " Password: $XP"
   echo
@@ -1316,7 +1644,12 @@ menu() {
   fi
 
   while true; do
-    read -r -p " ${B}?${R} Выберите вариант: " c </dev/tty || c=""
+    if [ -r /dev/tty ]; then
+      read -r -p " ${B}?${R} Выберите вариант: " c </dev/tty || c=""
+    else
+      read -r -p " ${B}?${R} Выберите вариант: " c || c=""
+    fi
+
     case "$c" in
       1) MODE="install"; return 0 ;;
       2)
