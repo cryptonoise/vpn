@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-VERSION="2.4.0"
+VERSION="3.0.0"
 NAME="RatBurrow"
 
 set -u
@@ -10,13 +10,17 @@ export LC_ALL=C.UTF-8   # одинаковая работа с кириллиц�
 # ───────────────────────── пути (переопределяются для тестов) ─────────────────────────
 UFW_BEFORE="${UFW_BEFORE:-/etc/ufw/before.rules}"
 UFW_SYSCTL="${UFW_SYSCTL:-/etc/ufw/sysctl.conf}"
-CONF_FILE="${CONF_FILE:-/root/.relay-setup.conf}"
-REPORT_FILE="${REPORT_FILE:-/root/relay-setup-report.txt}"
-LOG="${LOG:-/var/log/relay-setup.log}"
-TLS_DIR="${TLS_DIR:-/etc/rathole/tls}"
-MARKER_FILE="${MARKER_FILE:-/root/.relay-setup.installed}"
+CONF_FILE="${CONF_FILE:-/root/.chain-setup.conf}"
+LEGACY_CONF="${LEGACY_CONF:-/root/.relay-setup.conf}"          # настройки прежней схемы (rathole): только для подсказок в вопросах
+LEGACY_MARKER="${LEGACY_MARKER:-/root/.relay-setup.installed}"  # метка прежней схемы
+REPORT_FILE="${REPORT_FILE:-/root/chain-setup-report.txt}"
+LOG="${LOG:-/var/log/chain-setup.log}"
+MARKER_FILE="${MARKER_FILE:-/root/.chain-setup.installed}"
 PANEL_PORT=999
-TOTAL=14
+CHAIN_USER_PORT=21443     # 127.0.0.1: инбаунд пользователей (за nginx)
+CHAIN_TUNNEL_PORT=21444   # 127.0.0.1: инбаунд туннеля, к которому подключается мост BACKEND (за nginx)
+SELFTEST_PORT=21481       # 127.0.0.1: временный клиент для проверки цепочки
+TOTAL=12
 STEP=0
 
 # ───────────────────────── цвета ─────────────────────────
@@ -50,13 +54,12 @@ banner() {
   printf '  %s%s%s\n' "$B" "$NAME" "$R"
   printf '  %sверсия %s%s\n' "$DIM" "$VERSION" "$R"
   rule
-  echo "  Всё для серверов в одном скрипте:"
+  echo "  Защищённый канал RELAY ← BACKEND для обхода ТСПУ:"
   echo "   • подготовка сервера: обновление, SSH-порт и ключ, fail2ban, автообновления"
-  echo "   • Backend с 3x-ui, nginx и сертификатом (с relay или без)"
-  echo "   • Honeypot: автоматически генерируемый сайт на корневом адресе указанного домена"
-  echo "   • Панель 3x-ui остаётся доступна по https://домен/<WebBasePath>"
-  echo "   • Relay: обратный туннель rathole (TLS), firewall, пересылка UDP"
-  echo "   • тест блокировок (16 КБ, SNI, порты, UDP) и скорости между серверами"
+  echo "   • RELAY (РФ): nginx + Let's Encrypt, «живой» сайт-приманка, панель 3x-ui и подписка"
+  echo "   • BACKEND (за рубежом): мост Xray сам подключается к RELAY, входящие порты закрыты"
+  echo "   • канал: VLESS + XHTTP по HTTPS на 443, секретные пути, всё остальное — 404"
+  echo "   • клиент: Incy и любой клиент на Xray-core (подписка из панели)"
   rule
   echo
   rd -r -p "  Нажмите Enter, чтобы начать." _
@@ -152,26 +155,6 @@ die() {
   exit 1
 }
 
-# ───────────────────────── общие функции (уходят и на BACKEND) ─────────────────────────
-rathole_asset() {
-  case "$(uname -m)" in
-    x86_64 | amd64) echo "rathole-x86_64-unknown-linux-gnu.zip" ;;
-    aarch64 | arm64) echo "rathole-aarch64-unknown-linux-musl.zip" ;;
-    *) echo "unsupported arch: $(uname -m)" >&2; return 1 ;;
-  esac
-}
-
-rathole_install() {
-  local asset tmp
-  asset=$(rathole_asset) || return 1
-  tmp=$(mktemp -d) || return 1
-  curl -fsSL --retry 3 -o "$tmp/r.zip" "https://github.com/rapiz1/rathole/releases/latest/download/$asset" || return 1
-  unzip -oq "$tmp/r.zip" -d "$tmp" || return 1
-  install -m 755 "$tmp/rathole" /usr/local/bin/rathole || return 1
-  rm -rf "$tmp"
-  test -x /usr/local/bin/rathole
-}
-
 # сетевые твики: BBR, буферы TCP/UDP, MTU probing и др. (применяется на RELAY и BACKEND)
 tune_network() {
   local f=/etc/sysctl.d/99-relay-network-tuning.conf
@@ -203,7 +186,6 @@ tune_network() {
     if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then echo "net.netfilter.nf_conntrack_max=262144"; fi
   } > "$f"
   sysctl -q -p "$f" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
-  [ "${1:-}" = norestart ] || systemctl try-restart rathole >/dev/null 2>&1 || true
   return 0
 }
 
@@ -223,537 +205,6 @@ EOF
 }
 marker_get() { sed -n "s/^$1=//p" "$MARKER_FILE" 2>/dev/null | head -n1; }
 
-menu() {
-  local has=0 c k
-  [ -f "$MARKER_FILE" ] && has=1
-  echo
-  echo "${B}Что делаем?${R}"
-  thin
-  if [ -f "$PREP_MARKER_FILE" ]; then
-    info "подготовка сервера уже выполнена: $(awk -F= '/^ran_at=/{print $2}' "$PREP_MARKER_FILE"), SSH-порт $(awk -F= '/^ssh_port=/{print $2}' "$PREP_MARKER_FILE") (повторный выбор пункта 1 предложит откат)"
-  fi
-  if [ $has -eq 1 ]; then
-    k=$(marker_get KIND); k="${k:-relay}"
-    info "найдена метка установки: $(marker_get INSTALLED_AT), статус: $(marker_get STATUS), режим: $k, сервер $(marker_get BACKEND_IP), домен $(marker_get DOMAIN)"
-  fi
-  echo "  ${B}1${R}. Подготовить сервер"
-  echo "  ${B}2${R}. Установить Backend + 3X-UI + Honeypot (без relay)"
-  echo "  ${B}3${R}. Установить Relay + Backend + 3X-UI + Honeypot"
-  echo "  ${B}4${R}. Протестировать BACKEND сервер"
-  [ $has -eq 1 ] && echo "  ${B}5${R}. Отменить установку (удалить всё)"
-  while true; do
-    rd -r -p "${B}?${R} Выберите вариант: " c
-    case "$c" in
-      1) MODE="prepare"; return 0 ;;
-      2) MODE="install_backend"; return 0 ;;
-      3) MODE="install_relay"; return 0 ;;
-      4) MODE="test"; return 0 ;;
-      5) if [ $has -eq 1 ]; then MODE="uninstall"; return 0; fi; fail "вариант 5 доступен только после установки" ;;
-      *) if [ $has -eq 1 ]; then fail "введите от 1 до 5"; else fail "введите от 1 до 4"; fi ;;
-    esac
-  done
-}
-
-# ───────────────────────── удаление установки ─────────────────────────
-relay_uninstall() {
-  local dest ip
-  dest=$(sed -n '/# BEGIN relay-setup-nat/,/# END relay-setup-nat/p' "$UFW_BEFORE" 2>/dev/null | grep -oP '(?<=--to-destination )[0-9.]+(?=:8443)' | head -n1)
-  systemctl disable --now rathole >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/rathole.service /usr/local/bin/rathole /usr/local/bin/switch-backend
-  rm -rf /etc/rathole
-  systemctl daemon-reload
-  for ip in $(ufw status 2>/dev/null | awk '/2333\/tcp/ { print $NF }' | grep -E '^[0-9.]+$'); do
-    ufw delete allow from "$ip" to any port 2333 proto tcp >/dev/null 2>&1 || true
-  done
-  for ip in 443/tcp 80/tcp 8443/tcp 8443/udp; do ufw delete allow "$ip" >/dev/null 2>&1 || true; done
-  [ -n "$dest" ] && { ufw route delete allow proto udp from any to "$dest" port 8443 >/dev/null 2>&1 || true; }
-  [ -f "$UFW_BEFORE" ] && sed -i '/^# BEGIN relay-setup-nat$/,/^# END relay-setup-nat$/d' "$UFW_BEFORE"
-  rm -f /etc/sysctl.d/99-relay-forward.conf /etc/sysctl.d/99-relay-network-tuning.conf /etc/modules-load.d/relay-bbr.conf
-  ufw --force reload >/dev/null 2>&1 || true
-  rm -f "$CONF_FILE" "$REPORT_FILE" "$MARKER_FILE"
-}
-
-do_uninstall() {
-  STEP=0; TOTAL=3
-  local kind
-  kind=$(marker_get KIND); kind="${kind:-relay}"
-  echo
-  echo "${B}Удаление установки${R}"
-  thin
-  if [ "$kind" = "backend" ]; then
-    info "BACKEND (режим без relay): правила ufw (80, 443, 8443), служебная команда sync-sub-path, сетевые твики"
-  else
-    info "RELAY: туннель rathole, правила ufw (2333, 80, 443, 8443), NAT для UDP, служебные команды, сетевые твики"
-    info "BACKEND: rathole-client, правило 8443/udp, switch-relay, sync-sub-path, сетевые твики"
-  fi
-  confirm "Удалить эти настройки?" n || { echo "  Отменено."; return 1; }
-  local rm_xui=0 rm_web=0 reach=0 direct=0
-  [ "$kind" = "backend" ] && direct=1
-  ask_backend
-  if [ "${LOCAL_BACKEND:-0}" = 1 ]; then
-    reach=1
-  else
-    ssh_opts
-    if ssh "${SSH_OPTS[@]}" -o BatchMode=yes "root@$BACKEND_IP" true >/dev/null 2>"$TMPD/ssh.err"; then
-      reach=1
-      ok "SSH: root@$BACKEND_IP:$BACKEND_PORT"
-    else
-      fail "BACKEND недоступен: $(tail -n1 "$TMPD/ssh.err")"
-      confirm "Удалить только настройки RELAY (BACKEND останется как есть)?" n || { echo "  Отменено."; return 1; }
-    fi
-  fi
-  if [ $reach -eq 1 ]; then
-    confirm "Удалить на BACKEND также 3x-ui (панель, пользователи, инбаунды)?" n && rm_xui=1
-    confirm "Удалить на BACKEND также конфиг nginx и сертификат домена ${DOMAIN:-$(marker_get DOMAIN)}?" n && rm_web=1
-  fi
-  make_remote_scripts
-  section "BACKEND"
-  if [ $reach -eq 1 ]; then
-    step_run "Удаление настроек, правил и служебных команд" rscript "$TMPD/uninstall-backend.sh" "${RELAY_IP:-$(marker_get RELAY_IP)}" "${DOMAIN:-$(marker_get DOMAIN)}" "$rm_xui" "$rm_web" "$direct" || warn "часть действий на BACKEND не выполнена (см. лог)"
-  else
-    warn "пропущено: BACKEND недоступен"
-  fi
-  section "RELAY"
-  if [ "$kind" = "backend" ]; then
-    info "relay в этом режиме не использовался"
-    rm -f "$CONF_FILE" "$REPORT_FILE" "$MARKER_FILE"
-  else
-    step_run "Удаление rathole, правил ufw, NAT и настроек сети" relay_uninstall || warn "часть действий на RELAY не выполнена (см. лог)"
-  fi
-  section "Готово"
-  ok "метка установки удалена"
-  [ $reach -eq 1 ] && [ $rm_xui -eq 0 ] && [ "$kind" != "backend" ] && info "панель 3x-ui на BACKEND оставлена (порты 80/443 на BACKEND закрыты ufw — при необходимости откройте: ufw allow 443/tcp)"
-  return 0
-}
-
-# ───────────────────────── тест BACKEND (iperf3) ─────────────────────────
-iperf_run() {  # iperf_run имя [опции iperf3]
-  local name="$1"; shift
-  timeout 45 iperf3 -c "$BACKEND_IP" -p 5201 -4 -t 8 --connect-timeout 5000 -J "$@" > "$TMPD/iperf-$name.json" 2>>"$LOG" || true
-  { echo "--- iperf3 $name:"; head -c 1500 "$TMPD/iperf-$name.json"; echo; } >> "$LOG"
-}
-
-iperf_parse() {  # → "Мбит/с байт retr ошибка"
-  python3 - "$1" <<'PY'
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    print("0 0 0 нет ответа от iperf3 (таймаут или запуск не удался)")
-    sys.exit(0)
-err = str(d.get("error", "")).replace("\n", " ")[:90]
-e = d.get("end") or {}
-r = e.get("sum_received") or {}
-t = e.get("sum_sent") or {}
-if not e and not err:
-    err = "iperf3 завершился без данных"
-print(int(r.get("bits_per_second", 0) / 1e6), int(r.get("bytes", 0)), int(t.get("retransmits", 0)), err)
-PY
-}
-
-res_line() {  # res_line статус(ok|warn|fail|info) "название" "значение"
-  local ic
-  case "$1" in ok) ic="${GRN}✔${R}" ;; warn) ic="${YLW}▲${R}" ;; fail) ic="${RED}✖${R}" ;; *) ic="${BLU}•${R}" ;; esac
-  local n=$((34 - ${#2}))
-  [ $n -lt 1 ] && n=1
-  printf '  %s %s%s%*s%s %s\n' "$ic" "$DIM" "$2" "$n" "" "$R" "$3"
-}
-
-# оценка одного TCP-теста (массивы problems/warns — из run_test)
-tcp_line() {  # tcp_line "подпись" Мбит/с байт retr|- ошибка секунд порт_недоступен [тихо]
-  local label="$1" mb="$2" by="$3" rt="$4" er="$5" secs="$6" bad="$7" quiet="${8:-0}" extra=""
-  [ "$rt" != "-" ] && extra=", retr ${rt}"
-  if [ "$bad" = 1 ]; then
-    res_line fail "$label" "не выполнен: тестовый порт недоступен"
-  elif [ "$er" = "STALL" ]; then
-    if [[ "$label" == *отдача* ]]; then
-      res_line fail "$label" "данные перестали уходить (поток встал)"
-    else
-      res_line fail "$label" "получено $((by / 1024)) КБ, затем данные перестали идти"
-    fi
-    [ "$quiet" = 1 ] || problems+=("$label: поток встаёт (получено ~$((by / 1024)) КБ)")
-  elif [ -n "$er" ] && [ "$by" -lt 200000 ]; then
-    res_line fail "$label" "не выполнен: $er"
-    [ "$quiet" = 1 ] || problems+=("$label: тест не выполнен — $er")
-  elif [ "$by" -lt 200000 ] || [ "$mb" -lt 1 ]; then
-    res_line fail "$label" "получено $((by / 1024)) КБ за ${secs} с — поток замерзает"
-    [ "$quiet" = 1 ] || problems+=("$label: поток замерзает после ~$((by / 1024)) КБ")
-  elif [ "$mb" -lt 100 ]; then
-    res_line warn "$label" "${mb} Мбит/с${extra}"
-    [ "$quiet" = 1 ] || warns+=("$label: скорость ниже 100 Мбит/с")
-  else
-    res_line ok "$label" "${mb} Мбит/с${extra}"
-  fi
-}
-
-# сырой TCP без TLS (iperf3): справочно — заморозка здесь не означает, что VPN не работает
-raw_line() {  # raw_line "подпись" Мбит/с байт retr ошибка
-  local label="$1" mb="$2" by="$3" rt="$4" er="$5"
-  if [ "${PORT_BAD:-0}" = 1 ]; then
-    res_line info "$label" "пропущен: порт 5201 недоступен"
-  elif [ -n "$er" ] && [ "$by" -lt 200000 ]; then
-    res_line info "$label" "не выполнен: $er"
-  elif [ "$by" -lt 200000 ] || [ "$mb" -lt 1 ]; then
-    RAW_FROZEN=1
-    res_line warn "$label" "режется: получено $((by / 1024)) КБ за 8 с (справочно)"
-  else
-    res_line ok "$label" "${mb} Мбит/с, retr ${rt}"
-  fi
-}
-
-probe() {  # probe имя вид порт аргументы...
-  local name="$1" kind="$2" port="$3"; shift 3
-  timeout 60 python3 "$TMPD/tlstest-client.py" "$kind" "$BACKEND_IP" "$port" "$@" > "$TMPD/pr-$name.txt" 2>>"$LOG" || true
-  echo "--- probe $name ($kind :$port $*): $(cat "$TMPD/pr-$name.txt" 2>/dev/null)" >> "$LOG"
-}
-
-probe_if() {  # probe_if имя вид порт ... — только если порт доступен
-  [ "${PS[$3]:-0}" = 1 ] || return 0
-  probe "$@"
-}
-
-pr_get() {  # → "Мбит/с байт ошибка"
-  local f="$TMPD/pr-$1.txt"
-  if [ -s "$f" ]; then head -n1 "$f"; else echo "0 0 нет ответа (таймаут или запуск не удался)"; fi
-}
-
-pr_state() {  # → 1 поток идёт, 0 встал/ошибка, -1 порт недоступен
-  local name="$1" port="$2" a b e
-  if [ "${PS[$port]:-0}" != 1 ]; then echo -1; return; fi
-  read -r a b e <<< "$(pr_get "$name")"
-  if [ -z "$e" ] && [ "${b:-0}" -ge 200000 ] && [ "${a:-0}" -ge 1 ]; then echo 1; else echo 0; fi
-}
-
-pr_line() {  # pr_line имя "подпись" порт секунд [тихо]
-  local n="$1" label="$2" port="$3" secs="$4" q="${5:-1}" mb by er
-  if [ "${PS[$port]:-0}" != 1 ]; then res_line info "$label" "пропущен: порт $port недоступен"; return 0; fi
-  read -r mb by er <<< "$(pr_get "$n")"
-  tcp_line "$label" "$mb" "$by" "-" "$er" "$secs" 0 "$q"
-}
-
-# варианты, которые можно гнать параллельно (определяют, ОТ ЧЕГО зависит блокировка)
-probe_batch() {
-  local w="dl.google.com"
-  probe_if ya tls 8444 yandex.ru D 1 4 &
-  probe_if vk tls 8444 vk.com D 1 4 &
-  probe_if ms tls 8444 www.microsoft.com D 1 4 &
-  probe_if ns tls 8444 - D 1 4 &
-  [ -n "$SNI_DOM" ] && probe_if dm tls 8444 "$SNI_DOM" D 1 4 &
-  probe_if gi tls 8444 "$w" D 1 4 0 8 &
-  probe_if t12 tls 8445 "$w" D 1 4 &
-  probe_if pa tls 2087 "$w" D 1 4 &
-  probe_if pb tls 9443 "$w" D 1 4 &
-  probe_if pc tls 4443 "$w" D 1 4 &
-  probe_if r8446 raw 8446 - D 1 4 &
-  probe_if h8447 http 8447 "$w" D 1 4 &
-  [ -n "$SNI_DOM" ] && probe_if h8447d http 8447 "$SNI_DOM" D 1 4 &
-  wait
-}
-
-# контроль: скачивание с RELAY с других зарубежных сайтов (нагрузки на VPN нет)
-ctl_run() {  # ctl_run имя URL [опции curl]
-  curl -s --max-time 8 "${@:3}" -o /dev/null -w '%{size_download} %{http_code}' "$2" > "$TMPD/ctl-$1.txt" 2>>"$LOG" || true
-}
-ctl_batch() {
-  ctl_run cf "https://speed.cloudflare.com/__down?bytes=4000000" &
-  ctl_run hz "https://speed.hetzner.de/100MB.bin" -r 0-3999999 &
-  ctl_run ovh "https://proof.ovh.net/files/10Mb.dat" -r 0-3999999 &
-  ctl_run gg "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" -r 0-3999999 &
-  wait
-}
-ctl_line() {  # ctl_line имя "подпись"
-  local sz code
-  read -r sz code < "$TMPD/ctl-$1.txt" 2>/dev/null || { sz=0; code=000; }
-  sz="${sz:-0}"; code="${code:-000}"
-  if [ "$sz" -ge 1000000 ]; then res_line ok "$2" "получено $((sz / 1048576)) МБ за 8 с"
-  elif [ "$sz" -ge 200000 ]; then res_line warn "$2" "получено $((sz / 1024)) КБ за 8 с (медленно)"
-  elif [ "$code" = "000" ] && [ "$sz" -eq 0 ]; then res_line fail "$2" "нет ответа (соединение не установилось или встало до заголовков)"
-  else res_line fail "$2" "получено $((sz / 1024)) КБ (код $code) — режется"
-  fi
-}
-
-asn_info() {  # "AS12345 название"
-  local rev a n
-  rev=$(echo "$BACKEND_IP" | awk -F. '{ print $4"."$3"."$2"."$1 }')
-  a=$(dig +short TXT "$rev.origin.asn.cymru.com" @8.8.8.8 2>/dev/null | head -n1 | tr -d '"' | awk -F'|' '{ print $1 }' | awk '{ print $1 }')
-  [ -n "$a" ] || return 0
-  n=$(dig +short TXT "AS${a}.asn.cymru.com" @8.8.8.8 2>/dev/null | head -n1 | tr -d '"' | awk -F'|' '{ print $NF }' | sed 's/^ *//')
-  echo "AS${a} ${n}"
-}
-
-joinl() { local out="" x; for x in "$@"; do out="${out:+$out; }$x"; done; echo "$out"; }
-
-# наибольший размер пакета, проходящий без фрагментации (MTU пути)
-mtu_probe() {
-  local sz
-  : > "$TMPD/mtu.txt"
-  for sz in 1472 1452 1432 1412 1392 1372 1352 1300 1200; do
-    if ping -c 1 -W 1 -M "do" -s "$sz" -q "$BACKEND_IP" >/dev/null 2>&1; then
-      echo $((sz + 28)) > "$TMPD/mtu.txt"
-      return 0
-    fi
-  done
-  echo 0 > "$TMPD/mtu.txt"
-}
-
-run_test() {
-  STEP=0; TOTAL=6
-  echo
-  echo "${B}Тест BACKEND: блокировки и скорость${R}"
-  thin
-  info "тест идёт на свободных портах (8444, 2087, 9443, 4443, 8445–8448, 5201) и не трогает 443, 8443, 999 и работу VPN"
-  ask_backend
-  [ "${LOCAL_BACKEND:-0}" = 1 ] && die "для теста IP BACKEND должен отличаться от IP этого сервера (тест идёт между двумя серверами)"
-  make_remote_scripts
-
-  section "Подключение к BACKEND"
-  ssh_connect
-  rscript "$TMPD/f2b-ignore.sh" "$RELAY_IP" >>"$LOG" 2>&1 || true
-
-  section "Подготовка: iperf3 и сетевые настройки"
-  if command -v iperf3 >/dev/null 2>&1; then
-    ok "iperf3 на RELAY уже установлен"
-  else
-    step_run "iperf3 на RELAY" bash -c 'export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a; apt-get -o DPkg::Lock::Timeout=300 update -y && apt-get -o DPkg::Lock::Timeout=300 install -y iperf3' || die "не удалось установить iperf3 на RELAY"
-  fi
-  if bk 'command -v iperf3 >/dev/null 2>&1' 2>>"$LOG"; then
-    ok "iperf3 на BACKEND уже установлен"
-  else
-    step_run "iperf3 на BACKEND" rscript "$TMPD/iperf-install.sh" || die "не удалось установить iperf3 на BACKEND"
-  fi
-  # BBR/fq нужны для честного измерения — применяем скрыто на обоих серверах
-  tune_network norestart >>"$LOG" 2>&1   # без рестарта rathole: тест не должен рвать туннель
-  rscript "$TMPD/tune.sh" norestart >>"$LOG" 2>&1 || true
-
-  section "Тестовые серверы на BACKEND"
-  IPERF_STARTED=1
-  step_run "iperf3 -s (порт 5201 открыт только для RELAY)" rscript "$TMPD/iperf-server.sh" "$RELAY_IP" || die "не удалось запустить iperf3-сервер на BACKEND"
-  step_run "тестовый сервер: TLS 1.3/1.2, HTTP, сырой TCP, UDP (порты открыты только для RELAY)" rscript "$TMPD/tlstest-start.sh" "$RELAY_IP" || die "не удалось запустить тестовый сервер на BACKEND"
-  local -A PS=()
-  local pp bound unavailable="" busy=""
-  bound=$(bk 'cat /run/relay-test.ports' 2>>"$LOG")
-  for pp in 5201 8444 2087 9443 4443 8445 8446 8447; do
-    if [ "$pp" != 5201 ] && ! grep -q ":$pp:" <<< "$bound"; then busy="$busy $pp"; PS[$pp]=0; continue; fi
-    if timeout 4 bash -c ">/dev/tcp/$BACKEND_IP/$pp" 2>/dev/null; then PS[$pp]=1; else PS[$pp]=0; unavailable="$unavailable $pp"; fi
-  done
-  PS[8448]=1
-  ok "тестовые порты, доступные с RELAY:$(for pp in 5201 8444 2087 9443 4443 8445 8446 8447; do [ "${PS[$pp]}" = 1 ] && printf ' %s' "$pp"; done) (+ UDP 8448)"
-  [ -n "$unavailable" ] && warn "недоступны с RELAY (firewall хостера?):$unavailable"
-  [ -n "$busy" ] && info "заняты на BACKEND, пропущены:$busy"
-
-  local SNI_W="dl.google.com" SNI_DOM="${DOMAIN:-}"
-  [ -n "$SNI_DOM" ] || SNI_DOM=$(marker_get DOMAIN)
-
-  section "Измерения (RELAY → BACKEND, напрямую, без туннеля)"
-  step_run "ping, 10 пакетов" bash -c "ping -c 10 -i 0.3 -q '$BACKEND_IP' > '$TMPD/ping.txt' 2>&1 || true"
-  step_run "MTU пути (ping с запретом фрагментации)" mtu_probe
-  if [ "${PS[5201]}" = 1 ]; then
-    step_run "сырой TCP, iperf3, 1 поток (8 с)" iperf_run p1 -P 1
-    step_run "сырой TCP, iperf3, MSS 1200 (8 с)" iperf_run pm -P 1 -M 1200
-  fi
-  if [ "${PS[8444]}" = 1 ]; then
-    step_run "TLS, SNI $SNI_W, 1 поток (6 с)" probe g1 tls 8444 "$SNI_W" D 1 6
-    step_run "TLS, SNI $SNI_W, MSS 1200 (6 с)" probe gm tls 8444 "$SNI_W" D 1 6 1200
-  fi
-  step_run "варианты: SNI, порты, TLS 1.2, HTTP, сырой TCP, пауза (параллельно)" probe_batch
-  if [ "$(pr_state g1 8444)" = 1 ] || [ "$(pr_state gm 8444)" = 1 ]; then
-    step_run "TLS, SNI $SNI_W, 4 потока (6 с)" probe g4 tls 8444 "$SNI_W" D 4 6
-    step_run "TLS, SNI $SNI_W, отдача на BACKEND (6 с)" probe gu tls 8444 "$SNI_W" U 1 6
-  fi
-  step_run "UDP: эхо (20 пакетов)" probe uecho udp-echo 8448
-  step_run "UDP: поток ~48 Мбит/с (4 с)" probe ublast udp-blast 8448 4
-  step_run "контроль: скачивание с RELAY с Cloudflare, Hetzner, OVH, Google (8 с)" ctl_batch
-
-  section "Сетевые параметры"
-  local cc_r cc_b qd_r qd_b dev_r dev_b mtu_r mtu_b
-  cc_r=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-  qd_r=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-  cc_b=$(bk 'sysctl -n net.ipv4.tcp_congestion_control' 2>>"$LOG")
-  qd_b=$(bk 'sysctl -n net.core.default_qdisc' 2>>"$LOG")
-  ok "RELAY: ${cc_r:-?} / ${qd_r:-?}   BACKEND: ${cc_b:-?} / ${qd_b:-?}"
-  dev_r=$(ip route get "$BACKEND_IP" 2>/dev/null | grep -oP 'dev \K\S+' | head -n1)
-  mtu_r=$(cat "/sys/class/net/${dev_r:-none}/mtu" 2>/dev/null)
-  dev_b=$(bk "ip route get $RELAY_IP | grep -oP 'dev \K\S+' | head -n1" 2>>"$LOG")
-  mtu_b=$(bk "cat /sys/class/net/${dev_b:-none}/mtu" 2>>"$LOG")
-  ok "MTU интерфейсов: RELAY ${dev_r:-?}=${mtu_r:-?}, BACKEND ${dev_b:-?}=${mtu_b:-?}"
-
-  section "Результаты"
-  iperf_stop
-  local p1 p1b p1r p1e pm pmb pmr pme g1 g1b g1e gm gmb gme g4 g4b g4e gu gub gue loss rtt pmtu asn
-  read -r p1 p1b p1r p1e <<< "$(iperf_parse "$TMPD/iperf-p1.json")"
-  read -r pm pmb pmr pme <<< "$(iperf_parse "$TMPD/iperf-pm.json")"
-  read -r g1 g1b g1e <<< "$(pr_get g1)"
-  read -r gm gmb gme <<< "$(pr_get gm)"
-  read -r g4 g4b g4e <<< "$(pr_get g4)"
-  read -r gu gub gue <<< "$(pr_get gu)"
-  loss=$(grep -oE '[0-9.]+% packet loss' "$TMPD/ping.txt" | head -n1 | cut -d% -f1)
-  rtt=$(grep -oE '= [0-9.]+/[0-9.]+/' "$TMPD/ping.txt" | head -n1 | cut -d/ -f2)
-  loss="${loss:-100}"; rtt="${rtt:-?}"; rtt="${rtt%.*}"
-  pmtu=$(cat "$TMPD/mtu.txt" 2>/dev/null); pmtu="${pmtu:-0}"
-  asn=$(asn_info)
-
-  # состояния всех вариантов
-  local -A ST=() SL=()
-  SL[g1]="TLS :8444, SNI $SNI_W"; SL[gm]="TLS :8444, SNI google, MSS 1200"
-  SL[ya]="TLS :8444, SNI yandex.ru"; SL[vk]="TLS :8444, SNI vk.com"; SL[ms]="TLS :8444, SNI www.microsoft.com"
-  SL[ns]="TLS :8444, без SNI"; SL[dm]="TLS :8444, SNI ${SNI_DOM}"; SL[gi]="TLS :8444, пауза 8 с, затем данные"
-  SL[t12]="TLS 1.2 :8445, SNI $SNI_W"; SL[pa]="TLS :2087, SNI $SNI_W"; SL[pb]="TLS :9443, SNI $SNI_W"; SL[pc]="TLS :4443, SNI $SNI_W"
-  SL[r8446]="Сырой TCP :8446 (без TLS)"; SL[h8447]="HTTP :8447, Host $SNI_W"; SL[h8447d]="HTTP :8447, Host ${SNI_DOM}"
-  local item n
-  for item in g1:8444 gm:8444 ya:8444 vk:8444 ms:8444 ns:8444 dm:8444 gi:8444 t12:8445 pa:2087 pb:9443 pc:4443 r8446:8446 h8447:8447 h8447d:8447; do
-    n="${item%%:*}"
-    { [ "$n" = dm ] || [ "$n" = h8447d ]; } && [ -z "$SNI_DOM" ] && continue
-    ST[$n]=$(pr_state "$n" "${item##*:}")
-  done
-
-  local problems=() warns=() notes=() pass_l=() fail_l=()
-  RAW_FROZEN=0
-  for item in g1 gm ya vk ms ns dm gi t12 pa pb pc r8446 h8447 h8447d; do
-    [ -n "${ST[$item]:-}" ] || continue
-    [ "${ST[$item]}" = 1 ] && pass_l+=("${SL[$item]}")
-    [ "${ST[$item]}" = 0 ] && fail_l+=("${SL[$item]}")
-  done
-  local cn=0 cp=0 c sz code
-  for c in cf hz ovh gg; do
-    read -r sz code < "$TMPD/ctl-$c.txt" 2>/dev/null || sz=0
-    cn=$((cn + 1)); [ "${sz:-0}" -ge 1000000 ] && cp=$((cp + 1))
-  done
-
-  echo
-  rule
-  printf '  %sРезультаты теста BACKEND %s%s\n' "$B" "$BACKEND_IP" "$R"
-  rule
-  printf '  %sКанал%s\n' "$B" "$R"
-  if [ "${loss%.*}" -ge 5 ]; then res_line fail "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; problems+=("потери пакетов ${loss}% на пути до BACKEND")
-  elif [ "${loss%.*}" -ge 1 ]; then res_line warn "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; warns+=("есть потери пакетов (${loss}%)")
-  else res_line ok "Канал (ping)" "RTT ${rtt} мс, потери ${loss}%"; fi
-  if [ "$pmtu" -ge 1500 ]; then res_line ok "MTU пути" "1500 (без фрагментации)"
-  elif [ "$pmtu" -gt 0 ]; then res_line warn "MTU пути" "$pmtu (меньше 1500)"
-  else res_line warn "MTU пути" "не определён (ICMP с запретом фрагментации не проходит)"; fi
-  [ -n "$asn" ] && res_line info "Сеть BACKEND" "$asn"
-
-  printf '  %sСырой TCP и HTTP%s\n' "$B" "$R"
-  raw_line "Сырой TCP (iperf3)" "$p1" "$p1b" "$p1r" "$p1e"
-  raw_line "Сырой TCP (iperf3), MSS 1200" "$pm" "$pmb" "$pmr" "$pme"
-  pr_line r8446 "${SL[r8446]}" 8446 4
-  pr_line h8447 "${SL[h8447]}" 8447 4
-  [ -n "$SNI_DOM" ] && pr_line h8447d "${SL[h8447d]}" 8447 4
-
-  printf '  %sTLS 1.3, порт 8444 (SNI и MSS)%s\n' "$B" "$R"
-  pr_line g1 "${SL[g1]}" 8444 6
-  pr_line gm "${SL[gm]}" 8444 6
-  pr_line ya "${SL[ya]}" 8444 4
-  pr_line vk "${SL[vk]}" 8444 4
-  pr_line ms "${SL[ms]}" 8444 4
-  pr_line ns "${SL[ns]}" 8444 4
-  [ -n "$SNI_DOM" ] && pr_line dm "${SL[dm]}" 8444 4
-  pr_line gi "${SL[gi]}" 8444 4
-
-  printf '  %sTLS: другие версии и порты%s\n' "$B" "$R"
-  pr_line t12 "${SL[t12]}" 8445 4
-  pr_line pa "${SL[pa]}" 2087 4
-  pr_line pb "${SL[pb]}" 9443 4
-  pr_line pc "${SL[pc]}" 4443 4
-
-  if [ "${ST[g1]:-0}" = 1 ] || [ "${ST[gm]:-0}" = 1 ]; then
-    printf '  %sСкорость (поток идёт)%s\n' "$B" "$R"
-    tcp_line "TLS, 1 поток" "$g1" "$g1b" "-" "$g1e" 6 0 1
-    tcp_line "TLS, 4 потока" "$g4" "$g4b" "-" "$g4e" 6 0
-    tcp_line "TLS, отдача на BACKEND" "$gu" "$gub" "-" "$gue" 6 0
-  fi
-
-  printf '  %sUDP (порт 8448; важно для Hysteria2 / AmneziaWG)%s\n' "$B" "$R"
-  local ue ub uer um umb ume udp_ok=0
-  read -r ue ub uer <<< "$(pr_get uecho)"
-  if [ "${ub:-0}" -ge 18 ]; then res_line ok "UDP, эхо" "${ub}/20 ответов"
-  elif [ "${ub:-0}" -gt 0 ]; then res_line warn "UDP, эхо" "${ub}/20 ответов (потери)"
-  else res_line fail "UDP, эхо" "ответов нет"; fi
-  read -r um umb ume <<< "$(pr_get ublast)"
-  if [ "${umb:-0}" -ge 200000 ] && [ -z "$ume" ]; then res_line ok "UDP, поток" "~${um} Мбит/с, потерь < 5%"; udp_ok=1
-  elif [ "${umb:-0}" -gt 0 ]; then res_line warn "UDP, поток" "~${um} Мбит/с, $ume"
-  else res_line fail "UDP, поток" "данные не приходят"; fi
-
-  printf '  %sКонтроль: другие зарубежные сайты с RELAY%s\n' "$B" "$R"
-  ctl_line cf "Cloudflare (speed.cloudflare.com)"
-  ctl_line hz "Hetzner (speed.hetzner.de)"
-  ctl_line ovh "OVH (proof.ovh.net)"
-  ctl_line gg "Google (dl.google.com)"
-
-  printf '  %sСистема%s\n' "$B" "$R"
-  if [ "$cc_r" = bbr ] && [ "$cc_b" = bbr ]; then res_line ok "BBR / fq" "RELAY: $cc_r/$qd_r, BACKEND: $cc_b/$qd_b"
-  else res_line warn "BBR / fq" "RELAY: ${cc_r:-?}/${qd_r:-?}, BACKEND: ${cc_b:-?}/${qd_b:-?}"; warns+=("BBR недоступен на одном из серверов (ядро или виртуализация хостера)"); fi
-  rule
-
-  # главный вывод: есть ли блокировка по объёму (16–20 КБ) и от чего она зависит
-  local mtu_fix=1400
-  [ "$pmtu" -gt 0 ] && [ "$pmtu" -lt 1400 ] && mtu_fix="$pmtu"
-  if [ "${PS[8444]:-0}" != 1 ]; then
-    res_line warn "Блокировка по 16 КБ" "не проверена: тестовый порт 8444 недоступен"
-    problems+=("порт 8444 на BACKEND недоступен с RELAY: проверьте firewall хостера (в ufw порт уже открыт для RELAY)")
-  elif [ "${ST[g1]}" = 1 ]; then
-    res_line ok "Блокировка по 16 КБ" "нет: TLS-поток идёт полностью"
-  elif [ "${ST[gm]}" = 1 ]; then
-    res_line warn "Блокировка по 16 КБ" "нет, но проблема MTU/PMTUD"
-    problems+=("с обычным MSS поток встаёт (~$((g1b / 1024)) КБ), с MSS 1200 идёт: это не блокировка по объёму, а потеря крупных пакетов (MTU/PMTUD)")
-    notes+=("исправление: на ОБОИХ серверах уменьшить MTU, например: ip link set dev ${dev_r:-eth0} mtu ${mtu_fix} (RELAY) и ip link set dev ${dev_b:-eth0} mtu ${mtu_fix} (BACKEND); затем повторить тест (для постоянного эффекта — прописать MTU в netplan)")
-  elif [ ${#pass_l[@]} -gt 0 ]; then
-    res_line warn "Блокировка по 16 КБ" "частично: зависит от параметров"
-    warns+=("потоки с SNI $SNI_W на порту 8444 встают (~$((g1b / 1024)) КБ), но проходят: $(joinl "${pass_l[@]}")")
-    warns+=("режутся: $(joinl "${fail_l[@]}")")
-    notes+=("для туннеля/VPN на этом участке используйте проходящие параметры (порт, SNI, версию TLS)")
-  else
-    res_line fail "Блокировка по 16 КБ" "ДА: потоки встают после ~$((g1b / 1024)) КБ при любых портах, SNI и версиях TLS"
-    problems+=("TCP встаёт после ~$((g1b / 1024)) КБ при любых портах, SNI и версиях TLS — это блокировка/заморозка по объёму, не MTU")
-    if [ "$cp" -gt 0 ]; then
-      problems+=("контрольные зарубежные сайты с RELAY открываются ($cp из $cn): режется именно путь до BACKEND — смените IP/подсеть/хостера BACKEND")
-    else
-      problems+=("контрольные зарубежные сайты с RELAY тоже режутся: заморозка действует на любой TCP из этого места (RELAY/хостер → зарубеж), а не только на BACKEND")
-    fi
-    if [ $udp_ok -eq 1 ]; then notes+=("UDP проходит: используйте UDP-ветку (Hysteria2 / AmneziaWG), TCP-путь для этой пары серверов не годится")
-    else notes+=("UDP тоже не проходит: этот путь между серверами для VPN не подходит"); fi
-  fi
-
-  if [ "${ST[g1]:-0}" = 1 ]; then
-    if [ "$RAW_FROZEN" -eq 1 ] || [ "${ST[r8446]:-1}" = 0 ]; then
-      notes+=("сырой TCP без TLS режется, а TLS с SNI $SNI_W проходит — для VPN это нормально: трафик VLESS/Reality выглядит как TLS")
-    fi
-    if [ -n "$SNI_DOM" ] && [ "${ST[dm]:-1}" = 0 ]; then
-      warns+=("SNI вашего домена ($SNI_DOM) встаёт, а $SNI_W проходит: туннелю rathole (TLS с SNI домена) может понадобиться «белый» SNI")
-    fi
-    [ -z "$g4e" ] && [ "$g4" -ge $((g1 * 3)) ] && [ "$g1" -ge 1 ] && [ "$g1" -lt 200 ] && warns+=("один TLS-поток заметно медленнее четырёх: узким местом являются потери или окна TCP (используйте несколько соединений)")
-    [ -z "$gue" ] && [ "$gu" -ge 1 ] && [ "$g1" -ge 1 ] && [ "$gu" -lt $((g1 * 3 / 10)) ] && warns+=("отдача на BACKEND в разы медленнее скачивания: проверьте асимметрию канала/лимиты хостера")
-  fi
-  local m
-  if [ ${#problems[@]} -eq 0 ] && [ ${#warns[@]} -eq 0 ]; then
-    echo "  ${GRN}${B}Итог: всё в порядке.${R} Блокировки по объёму нет, канал между серверами не ограничивает скорость."
-  else
-    if [ ${#problems[@]} -gt 0 ]; then echo "  ${RED}${B}Итог: найдены проблемы:${R}"; else echo "  ${YLW}${B}Итог: есть замечания:${R}"; fi
-    for m in "${problems[@]}"; do echo "   ${RED}✖${R} $m"; done
-    for m in "${warns[@]}"; do echo "   ${YLW}▲${R} $m"; done
-  fi
-  for m in "${notes[@]}"; do echo "   ${BLU}•${R} $m"; done
-  echo "  ${DIM}Тест идёт напрямую RELAY→BACKEND, без туннеля rathole, на свободных портах. Сырые ответы: $LOG${R}"
-  echo
-}
-
-iperf_stop() {
-  [ "${IPERF_STARTED:-0}" = 1 ] || return 0
-  rscript "$TMPD/iperf-stop.sh" "${RELAY_IP:-}" >>"$LOG" 2>&1 || true
-  IPERF_STARTED=0
-}
-
-# GitHub из РФ бывает недоступен: тогда архив скачивает BACKEND и передаёт на RELAY
-rathole_install_via_backend() {
-  local asset tmp
-  asset=$(rathole_asset) || return 1
-  tmp=$(mktemp -d) || return 1
-  bk "curl -fsSL --retry 3 https://github.com/rapiz1/rathole/releases/latest/download/$asset" > "$tmp/r.zip" || return 1
-  unzip -oq "$tmp/r.zip" -d "$tmp" || return 1
-  install -m 755 "$tmp/rathole" /usr/local/bin/rathole || return 1
-  rm -rf "$tmp"
-  test -x /usr/local/bin/rathole
-}
-
 # порты, на которых слушает sshd (+ порт текущего SSH-подключения; Ubuntu 22.10+ — ssh.socket)
 ssh_ports() {
   {
@@ -762,14 +213,6 @@ ssh_ports() {
     systemctl show ssh.socket -p Listen 2>/dev/null | sed -n 's/^Listen=.*:\([0-9][0-9]*\) (Stream)$/\1/p'
     [ -n "${SSH_CONNECTION:-}" ] && echo "$SSH_CONNECTION" | awk '{ print $4 }'
   } | grep -E '^[0-9]+$' | sort -un
-}
-
-# ───────────────────────── RELAY: подготовка ─────────────────────────
-relay_prepare() {
-  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-  apt-get -o DPkg::Lock::Timeout=300 update -y &&
-    apt-get -o DPkg::Lock::Timeout=300 install -y curl unzip ufw dnsutils openssh-client ca-certificates openssl iproute2 || return 1
-  rathole_install || { echo "прямая загрузка rathole не удалась, пробую через BACKEND"; rathole_install_via_backend; }
 }
 
 # базовые утилиты нужны ещё до вопросов (curl, dig, ssh, openssl, ss)
@@ -801,154 +244,6 @@ detect_relay_ip() {
   printf '%s' "$ip"
 }
 
-# ───────────────────────── RELAY: rathole-server ─────────────────────────
-# свой CA и серверный сертификат для домена; PKCS#12 нужен rathole-server.
-# Сертификат привязан к имени (домену), не к IP — поэтому identity.pfx годится для любого нового RELAY.
-relay_tls_setup() {
-  local d="$TLS_DIR"
-  mkdir -p "$d" && chmod 700 "$d" || return 1
-  if [ -f "$d/identity.pfx" ] && [ -f "$d/srv.pem" ] &&
-    openssl x509 -in "$d/srv.pem" -noout -ext subjectAltName 2>/dev/null | grep -q "DNS:$DOMAIN"; then
-    return 0   # уже есть сертификат для этого домена — CA не меняем
-  fi
-  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$d/ca.key" -out "$d/ca.pem" -days 3650 -subj "/CN=rathole-ca" &&
-    openssl req -newkey rsa:2048 -nodes -keyout "$d/srv.key" -out "$d/srv.csr" -subj "/CN=$DOMAIN" &&
-    printf 'subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' "$DOMAIN" > "$d/ext.cnf" &&
-    openssl x509 -req -in "$d/srv.csr" -CA "$d/ca.pem" -CAkey "$d/ca.key" -CAcreateserial -out "$d/srv.pem" -days 3650 -extfile "$d/ext.cnf" &&
-    openssl rand -hex 16 > "$d/pfx.pass" &&
-    openssl pkcs12 -export -out "$d/identity.pfx" -inkey "$d/srv.key" -in "$d/srv.pem" -certfile "$d/ca.pem" -passout "pass:$(cat "$d/pfx.pass")" &&
-    chmod 600 "$d"/* &&
-    rm -f "$d/srv.csr" "$d/ca.srl"
-}
-
-# BACKEND: CA для проверки сервера + резервная копия identity (для замены RELAY) + rathole-client
-backend_rathole() {
-  bk "mkdir -p /etc/rathole/relay-tls && chmod 700 /etc/rathole/relay-tls" &&
-    bk "cat > /etc/rathole/ca.pem" < "$TLS_DIR/ca.pem" &&
-    tar -C "$TLS_DIR" -cf - identity.pfx pfx.pass ca.pem | bk "tar -C /etc/rathole/relay-tls -xf - && chmod 600 /etc/rathole/relay-tls/*" &&
-    rscript "$TMPD/rathole-client.sh" "$RELAY_IP" "$SECRET" "$DOMAIN"
-}
-
-relay_rathole_server() {
-  mkdir -p /etc/rathole
-  local pfx_pw
-  pfx_pw=$(cat "$TLS_DIR/pfx.pass") || return 1
-  cat > /etc/rathole/server.toml <<EOF
-[server]
-bind_addr = "0.0.0.0:2333"
-default_token = "$SECRET"
-
-[server.transport]
-type = "tls"
-
-[server.transport.tls]
-pkcs12 = "$TLS_DIR/identity.pfx"
-pkcs12_password = "$pfx_pw"
-
-[server.services.https]
-bind_addr = "0.0.0.0:443"
-
-[server.services.http]
-bind_addr = "0.0.0.0:80"
-
-[server.services.reality]
-bind_addr = "0.0.0.0:8443"
-EOF
-  chmod 600 /etc/rathole/server.toml
-  cat > /etc/systemd/system/rathole.service <<'EOF'
-[Unit]
-Description=rathole server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/rathole --server /etc/rathole/server.toml
-Restart=always
-RestartSec=3
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload &&
-    systemctl enable rathole >/dev/null 2>&1 &&
-    systemctl restart rathole &&
-    sleep 2 &&
-    systemctl is-active --quiet rathole
-}
-
-# порты 2333/443/80/8443 не должны быть заняты чужими процессами
-relay_port_conflicts() {
-  local bad=""
-  for p in 2333 443 80 8443; do
-    local owner
-    owner=$(ss -tlnp 2>/dev/null | awk -v p=":$p" '$4 ~ p"$" { print $0 }' | grep -v rathole | head -1)
-    [ -n "$owner" ] && bad="$bad $p"
-  done
-  printf '%s' "$bad"
-}
-
-# ───────────────────────── RELAY: ufw + пересылка UDP ─────────────────────────
-# NAT для UDP 8443 кладётся в before.rules ufw (переживает перезагрузку и ufw reload)
-relay_nat_block() {
-  cat <<EOF
-# BEGIN relay-setup-nat
-*nat
-:PREROUTING ACCEPT [0:0]
-:POSTROUTING ACCEPT [0:0]
--A PREROUTING -p udp --dport 8443 -j DNAT --to-destination $BACKEND_IP:8443
--A POSTROUTING -p udp -d $BACKEND_IP --dport 8443 -j MASQUERADE
-COMMIT
-# END relay-setup-nat
-
-EOF
-}
-
-relay_apply_nat() {
-  [ -f "$UFW_BEFORE" ] || return 1
-  cp -n "$UFW_BEFORE" "$UFW_BEFORE.bak.relay-setup" 2>/dev/null || true
-  sed -i '/^# BEGIN relay-setup-nat$/,/^# END relay-setup-nat$/d' "$UFW_BEFORE"
-  { relay_nat_block; cat "$UFW_BEFORE"; } > "$UFW_BEFORE.new" &&
-    cat "$UFW_BEFORE.new" > "$UFW_BEFORE" &&
-    rm -f "$UFW_BEFORE.new"
-}
-
-relay_enable_forwarding() {
-  touch "$UFW_SYSCTL"
-  if grep -qE '^#?net/ipv4/ip_forward=' "$UFW_SYSCTL"; then
-    sed -i 's|^#\?net/ipv4/ip_forward=.*|net/ipv4/ip_forward=1|' "$UFW_SYSCTL"
-  else
-    echo 'net/ipv4/ip_forward=1' >> "$UFW_SYSCTL"
-  fi
-  echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-relay-forward.conf
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null
-}
-
-# убираем старые TCP-DNAT правила (остались от прежней схемы без rathole) — они обходят rathole
-relay_cleanup_old_dnat() {
-  local rule
-  while read -r rule; do
-    [ -z "$rule" ] && continue
-    # shellcheck disable=SC2086
-    iptables -t nat ${rule/-A/-D} 2>/dev/null || true
-  done < <(iptables -t nat -S PREROUTING 2>/dev/null | grep -E -- '-p tcp .*--dport (443|80|8443) .*DNAT')
-  if command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save >/dev/null 2>&1 || true; fi
-}
-
-relay_firewall() {
-  local p ports
-  ports=$(ssh_ports)
-  [ -n "$ports" ] || { echo "SSH-порт RELAY не определён: firewall не включаю, чтобы не потерять доступ" >&2; return 1; }
-  relay_cleanup_old_dnat
-  for p in $ports; do ufw allow "$p/tcp" || return 1; done
-  ufw allow from "$BACKEND_IP" to any port 2333 proto tcp || return 1
-  ufw allow 443/tcp && ufw allow 80/tcp && ufw allow 8443/tcp && ufw allow 8443/udp || return 1
-  ufw route allow proto udp from any to "$BACKEND_IP" port 8443 || return 1
-  relay_enable_forwarding || return 1
-  relay_apply_nat || return 1
-  ufw --force enable >/dev/null && ufw --force reload >/dev/null
-}
-
 # ───────────────────────── DNS ─────────────────────────
 dns_collect() {  # IPv4 из нескольких резолверов + системного
   local d
@@ -974,7 +269,7 @@ dns_check() {
     echo "  Домен:        $DOMAIN"
     echo "  Сейчас:       A: ${all:-нет}   AAAA: ${v6:-нет}"
     echo "  Должно быть:  A = $tgt (IP сервера, DNS only, TTL 1 мин), AAAA — удалить"
-    echo "  ${DIM}(IPv6 через туннель не пробрасывается, а Let's Encrypt проверяет по IPv6 первым)${R}"
+    echo "  ${DIM}(AAAA должен отсутствовать: клиенты и Let's Encrypt предпочитают IPv6, а канал настроен только на IPv4)${R}"
     rule
     rd -r -p "  Нажмите Enter, когда исправили (n — пропустить проверку): " x
     if [[ "$x" =~ ^[nNнН] ]]; then
@@ -1094,10 +389,565 @@ ssh_connect() {
   done
 }
 
-# ───────────────────────── удалённые скрипты (создаются в $TMPD) ─────────────────────────
-make_remote_scripts() {
-  local D="$TMPD"
 
+# ───────────────────────── сохранение настроек ─────────────────────────
+# Читаем только известные ключи (файл не исполняем). Настройки прежней схемы (rathole) —
+# только как подсказки по умолчанию: IP/порт/домен/ключ.
+load_conf() {
+  local f k v
+  for f in "$LEGACY_CONF" "$CONF_FILE"; do
+    [ -f "$f" ] || continue
+    for k in BACKEND_IP BACKEND_PORT DOMAIN KEY_PATH USER_PATH TUNNEL_PATH TUNNEL_UUID; do
+      v=$(sed -n "s/^$k=//p" "$f" 2>/dev/null | head -n1)
+      [ -n "$v" ] && printf -v "$k" '%s' "$v"
+    done
+  done
+  return 0
+}
+
+save_conf() {
+  : > "$CONF_FILE"; chmod 600 "$CONF_FILE"
+  cat > "$CONF_FILE" <<EOT
+RELAY_IP=${RELAY_IP:-}
+BACKEND_IP=${BACKEND_IP:-}
+BACKEND_PORT=${BACKEND_PORT:-}
+DOMAIN=${DOMAIN:-}
+EMAIL=${EMAIL:-}
+KEY_PATH=${KEY_PATH:-}
+USER_PATH=${USER_PATH:-}
+TUNNEL_PATH=${TUNNEL_PATH:-}
+TUNNEL_UUID=${TUNNEL_UUID:-}
+EOT
+  chmod 600 "$CONF_FILE"
+}
+
+cleanup() {
+  [ -n "${TMPD:-}" ] && [ -d "$TMPD" ] && {
+    [ -n "${SELFTEST_PID:-}" ] && kill "$SELFTEST_PID" >/dev/null 2>&1 || true
+    [ -n "${SSH_OPTS+x}" ] && ssh "${SSH_OPTS[@]}" -O exit "root@${BACKEND_IP:-x}" >/dev/null 2>&1 || true
+    rm -rf "$TMPD"
+  }
+  printf '%s' "$R"
+}
+
+
+preflight() {
+  # ── автопроверки окружения (без вопросов)
+  echo "${B}Проверка окружения${R}"
+  thin
+  # shellcheck disable=SC1091
+  . /etc/os-release 2>/dev/null || true
+  if [ "${ID:-}" = "ubuntu" ]; then
+    if version_ge "${VERSION_ID:-0}" 22.04; then ok "ОС: ${PRETTY_NAME:-ubuntu}"; else die "нужна Ubuntu 22.04 или новее (найдена ${VERSION_ID:-?})"; fi
+  elif [ "${ID:-}" = "debian" ]; then
+    warn "ОС ${PRETTY_NAME:-debian}: скрипт проверен на Ubuntu 22.04+, на Debian 12+ должен работать"
+  else
+    warn "ОС ${PRETTY_NAME:-?}: скрипт рассчитан на Ubuntu 22.04+"
+  fi
+  ensure_tools || die "не удалось установить базовые утилиты (curl, dig, ssh, openssl)"
+  RELAY_IP=$(detect_relay_ip)
+  valid_ip "$RELAY_IP" || die "не удалось определить внешний IP этого сервера"
+  ok "IP RELAY: $RELAY_IP"
+  load_conf
+
+}
+
+# ───────────────────────── подготовка сервера (бывший preServer.sh) ─────────────────────────
+# Выполняется на ЭТОМ сервере. PREP_ROOT — только для тестов (префикс путей).
+PR="${PREP_ROOT:-}"
+PREP_MARKER_DIR="$PR/var/lib/preserver"
+PREP_MARKER_FILE="$PREP_MARKER_DIR/.preserver-ran"   # тот же путь, что у автономного preServer.sh
+
+# Убираем противоречащие настройки в drop-in конфигах sshd: Include стоит в начале sshd_config,
+# и sshd берёт ПЕРВОЕ встреченное значение — правки в основном файле иначе молча игнорируются.
+neutralize_sshd_dropins() {
+  local f
+  for f in "$PR"/etc/ssh/sshd_config.d/*.conf; do
+    [ -f "$f" ] || continue
+    [ "$(basename "$f")" = "99-preserver.conf" ] && continue
+    sed -i -E 's/^[[:space:]]*(Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication)\b/# [preServer disabled] \1/' "$f"
+    if ! grep -qE '^[^#[:space:]]' "$f" 2>/dev/null; then
+      rm -f "$f"
+      info "удалён пустой drop-in конфиг: $f"
+    fi
+  done
+}
+
+disable_ssh_socket_activation() {
+  if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.socket'; then
+    if systemctl is-enabled ssh.socket &>/dev/null || systemctl is-active ssh.socket &>/dev/null; then
+      systemctl stop ssh.socket >/dev/null 2>&1 || true
+      systemctl disable ssh.socket >/dev/null 2>&1 || true
+      info "обнаружена socket activation (ssh.socket) — отключена, чтобы смена порта применялась без перезагрузки"
+    fi
+  fi
+}
+
+verify_and_restart_sshd() {
+  local want_port="$1" want_pwauth="$2" want_rootlogin="$3"
+  mkdir -p /run/sshd
+  chmod 0755 /run/sshd
+
+  local eff
+  eff="$(sshd -T 2>&1)" || {
+    fail "sshd -T завершился с ошибкой, перезапуск отменён"
+    printf '    Вывод sshd -T:\n%s\n' "$eff"
+    return 1
+  }
+
+  local eff_port eff_pwauth eff_rootlogin eff_ports
+  eff_ports=$(awk '/^port /{print $2}' <<< "$eff")
+  eff_port=$(tr '\n' ',' <<< "$eff_ports")
+  eff_port="${eff_port%,}"
+  eff_pwauth=$(awk '/^passwordauthentication /{print $2; exit}' <<< "$eff")
+  eff_rootlogin=$(awk '/^permitrootlogin /{print $2; exit}' <<< "$eff")
+
+  local nw="$want_rootlogin" ne="$eff_rootlogin"
+  [ "$nw" = "prohibit-password" ] && nw="without-password"
+  [ "$ne" = "prohibit-password" ] && ne="without-password"
+
+  if ! grep -qx "$want_port" <<< "$eff_ports" || [ "$eff_pwauth" != "$want_pwauth" ] || [ "$ne" != "$nw" ]; then
+    fail "эффективный конфиг sshd НЕ совпадает с ожидаемым (port=$eff_port pwauth=$eff_pwauth rootlogin=$eff_rootlogin)"
+    echo "    Проверьте /etc/ssh/sshd_config.d/*.conf вручную. Перезапуск sshd ОТМЕНЁН."
+    return 1
+  fi
+
+  local svc="ssh"
+  systemctl list-unit-files | grep -q "sshd.service" && svc="sshd"
+
+  disable_ssh_socket_activation
+
+  # остановка ssh.socket/ssh.service удаляет /run/sshd — создаём заново перед sshd -t
+  mkdir -p /run/sshd
+  chmod 0755 /run/sshd
+
+  if ! sshd -t 2>&1; then
+    fail "sshd -t: синтаксическая ошибка, перезапуск отменён"
+    return 1
+  fi
+
+  systemctl enable "$svc" >/dev/null 2>&1 || true
+  systemctl restart "$svc" 2>/dev/null || systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+  ok "sshd перезапущен, эффективный конфиг подтверждён (port=$eff_port pwauth=$eff_pwauth rootlogin=$eff_rootlogin)"
+  return 0
+}
+
+prep_rollback() {
+  local cfg="$PR/etc/ssh/sshd_config" old_port=""
+  echo
+  echo "${B}Откат настроек подготовки сервера${R}"
+  thin
+  [ -f "$PREP_MARKER_FILE" ] && old_port="$(awk -F= '/^ssh_port=/{print $2; exit}' "$PREP_MARKER_FILE" 2>/dev/null || true)"
+
+  mkdir -p /run/sshd
+  chmod 0755 /run/sshd
+
+  if [ -f "$cfg" ]; then
+    cp "$cfg" "${cfg}.bak.$(date +%s)"
+    neutralize_sshd_dropins
+
+    if grep -qE '^\s*#?\s*Port\b' "$cfg"; then
+      sed -i -E 's/^\s*#?\s*Port\b.*/Port 22/' "$cfg"
+    else
+      echo "Port 22" >> "$cfg"
+    fi
+    sed -i -E 's/^\s*#?\s*PermitRootLogin\b.*/PermitRootLogin yes/' "$cfg"
+    sed -i -E 's/^\s*#?\s*PasswordAuthentication\b.*/PasswordAuthentication yes/' "$cfg"
+    sed -i -E 's/^\s*#?\s*PrintMotd\b.*/PrintMotd yes/' "$cfg"
+    sed -i -E 's/^\s*#?\s*PrintLastLog\b.*/PrintLastLog yes/' "$cfg"
+
+    if passwd -S root 2>/dev/null | awk '{print $2}' | grep -qE '^(L|LK|NP)$'; then
+      warn "у root не задан пароль. Вход по паролю не заработает без: passwd root"
+    fi
+
+    if command -v ufw &>/dev/null; then
+      ufw allow 22/tcp comment 'SSH (preServer rollback)' >/dev/null 2>&1 || true
+      if [[ "$old_port" =~ ^[0-9]+$ ]] && [ "$old_port" != "22" ]; then
+        ufw --force delete allow "${old_port}/tcp" >/dev/null 2>&1 || true
+        info "правило ufw для порта $old_port (подготовка) удалено, остальные правила не тронуты"
+      fi
+    fi
+
+    verify_and_restart_sshd 22 yes yes || warn "порт/пароль отредактированы, но перезапуск не выполнен — проверьте вручную!"
+  fi
+
+  if dpkg -s fail2ban &>/dev/null; then
+    systemctl stop fail2ban >/dev/null 2>&1 || true
+    systemctl disable fail2ban >/dev/null 2>&1 || true
+    apt-get purge -y fail2ban >/dev/null 2>&1 || true
+    rm -f "$PR/etc/fail2ban/jail.local"
+    ok "fail2ban удалён"
+  fi
+
+  if dpkg -s fastfetch &>/dev/null; then
+    apt-get purge -y fastfetch >/dev/null 2>&1 || true
+    ok "fastfetch удалён"
+  elif command -v fastfetch &>/dev/null; then
+    rm -f "$(command -v fastfetch)"
+  fi
+  rm -rf "$PR/root/.config/fastfetch"
+  rm -f "$PR/etc/profile.d/fastfetch-ssh.sh"
+  if [ -d "$PR/etc/update-motd.d" ]; then
+    chmod +x "$PR"/etc/update-motd.d/* 2>/dev/null || true
+  fi
+
+  rm -f "$PR/usr/local/sbin/daily-security-update.sh"
+  rm -f "$PR/etc/cron.d/daily-security-update"
+  rm -f "$PREP_MARKER_FILE"
+
+  echo
+  ok "откат завершён"
+  [ -f "$MARKER_FILE" ] && info "установка туннеля/панели этим откатом не затрагивается (для неё — пункт «Отменить установку»)"
+  return 0
+}
+
+prep_fastfetch_ppa() {
+  add-apt-repository -y ppa:zhangsongcui3371/fastfetch &&
+    apt-get -o DPkg::Lock::Timeout=300 update -qq &&
+    apt-get -o DPkg::Lock::Timeout=300 install -y fastfetch
+}
+
+prep_fastfetch_deb() {
+  local arch url tmp
+  arch=$(dpkg --print-architecture)
+  url=$(curl -fsSL "https://api.github.com/repos/fastfetch-cli/fastfetch/releases/latest" |
+    grep "browser_download_url" | grep "linux-${arch}.deb" | head -1 | cut -d '"' -f 4) || true
+  [ -n "$url" ] || return 1
+  tmp=$(mktemp)
+  curl -fsSL "$url" -o "$tmp"
+  dpkg -i "$tmp" || apt-get install -f -y
+  rm -f "$tmp"
+}
+
+run_prepare() {
+  STEP=0; TOTAL=7
+  if [ -f "$PREP_MARKER_FILE" ]; then
+    echo
+    warn "обнаружена метка предыдущей подготовки сервера:"
+    sed 's/^/     /' "$PREP_MARKER_FILE"
+    echo
+    if confirm "Выполнить откат настроек подготовки?" n; then
+      prep_rollback
+    else
+      echo "  Отменено."
+    fi
+    return 0
+  fi
+
+  echo
+  echo "${B}Подготовка сервера${R}"
+  thin
+  info "обновление системы, fail2ban, SSH (свой порт, вход только по ключу), автообновления, fastfetch"
+  info "выполняется на ЭТОМ сервере: запустите скрипт отдельно на RELAY и на BACKEND"
+  [ -f "$MARKER_FILE" ] && warn "установка туннеля/панели уже выполнена: после смены SSH-порта укажите новый порт при следующих запусках"
+  confirm "Начать подготовку?" || { echo "  Отменено."; return 0; }
+
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 APT_LISTCHANGES_FRONTEND=none
+  export PYTHONWARNINGS="ignore::SyntaxWarning"
+  local APT_OPTS=(-o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+  # [1] пакетная база
+  section "Проверка пакетной базы"
+  if [ -d "$PR/var/lib/dpkg/updates" ] && ls "$PR"/var/lib/dpkg/updates/* >/dev/null 2>&1; then
+    warn "обнаружены незавершённые операции dpkg, восстанавливаю..."
+    if pgrep -x dpkg >/dev/null 2>&1 || pgrep -x apt-get >/dev/null 2>&1; then
+      info "apt/dpkg сейчас занят другим процессом — блокировки не трогаю, ждём освобождения"
+    else
+      rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock /var/lib/apt/lists/lock
+    fi
+    step_run -s "dpkg --configure -a" dpkg --configure -a --force-confdef --force-confold
+    rm -f "$PR"/var/lib/dpkg/updates/*
+    step_run -s "dpkg --configure -a (повторно)" dpkg --configure -a
+  fi
+  ok "пакетная база в порядке"
+
+  # [2] обновление системы
+  section "Обновление системы"
+  step_run "Обновление списков пакетов" apt-get "${APT_OPTS[@]}" update -qq || die "apt update не удался"
+  step_run "Обновление пакетов (upgrade)" apt-get "${APT_OPTS[@]}" upgrade -y || die "apt upgrade не удался"
+  step_run "Обновление дистрибутива (dist-upgrade, лимит 30 минут)" timeout --foreground 1800 apt-get "${APT_OPTS[@]}" dist-upgrade -y || {
+    rc=$?
+    if [ "$rc" -eq 124 ]; then die "apt dist-upgrade завис или превысил лимит 30 минут. Проверьте /var/log/apt/term.log и /var/log/dpkg.log; возможен незавершённый dpkg или запрос действия.";
+    else die "apt dist-upgrade завершился с ошибкой (код $rc). Подробности — в $LOG и /var/log/apt/term.log"; fi
+  }
+  step_run "Удаление ненужных пакетов" apt-get "${APT_OPTS[@]}" autoremove -y || warn "autoremove не выполнен"
+
+  # [3] утилиты и fail2ban
+  section "Установка утилит"
+  local PACKAGES=(unattended-upgrades fail2ban htop iotop nethogs curl wget git cron ripgrep)
+  local missing=() pkg
+  for pkg in "${PACKAGES[@]}"; do
+    dpkg -s "$pkg" &>/dev/null || missing+=("$pkg")
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    step_run "Установка пакетов: ${missing[*]}" apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "${missing[@]}" || die "не удалось установить пакеты"
+  else
+    ok "все утилиты уже установлены"
+  fi
+  mkdir -p "$PR/etc/fail2ban"
+  cat > "$PR/etc/fail2ban/jail.local" << 'F2BEOF'
+[sshd]
+enabled = true
+port = 1119
+backend = systemd
+maxretry = 5
+bantime = 1h
+findtime = 10m
+F2BEOF
+  systemctl enable fail2ban >/dev/null 2>&1 || true
+  systemctl restart fail2ban >/dev/null 2>&1 || true
+  systemctl enable cron >/dev/null 2>&1 || true
+  systemctl start cron >/dev/null 2>&1 || true
+  ok "fail2ban и утилиты настроены"
+
+  # [4] SSH
+  section "Настройка SSH"
+  mkdir -p /run/sshd
+  chmod 0755 /run/sshd
+  local cfg="$PR/etc/ssh/sshd_config" in_port ssh_port key tmpf p
+  while true; do
+    ask in_port "Введите внутренний порт SSH" "1119"
+    ssh_port="$in_port"
+    if [[ "$ssh_port" =~ ^[0-9]+$ ]] && [ "$ssh_port" -ge 1 ] && [ "$ssh_port" -le 65535 ]; then
+      if command -v ss &>/dev/null && ss -tulnp | grep ":${ssh_port} " | grep -vq sshd; then
+        warn "порт $ssh_port занят."
+        confirm "Продолжить?" && break || continue
+      fi
+      break
+    else
+      fail "порт должен быть числом 1-65535"
+    fi
+  done
+  ok "выбран порт SSH: $ssh_port"
+
+  while true; do
+    rd -r -p "${B}?${R} Введите SSH публичный ключ: " key
+    if [[ "$key" =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521)\  ]]; then
+      break
+    else
+      fail "неверный формат ключа"
+    fi
+  done
+  ok "ключ принят"
+
+  if [ -f "$cfg" ]; then
+    info "sshd будет слушать только порт: $ssh_port (старые порты, включая 22, не сохраняются)"
+    cp "$cfg" "${cfg}.bak.$(date +%s)"
+    ls -1t "${cfg}".bak.* 2>/dev/null | tail -n +6 | xargs -r rm -f
+    neutralize_sshd_dropins
+
+    # Port-строка — в начало файла (чтобы не попасть внутрь блока Match)
+    sed -i -E '/^[[:space:]]*#?[[:space:]]*Port[[:space:]]/d' "$cfg"
+    tmpf=$(mktemp)
+    echo "Port $ssh_port" | cat - "$cfg" > "$tmpf"
+    cat "$tmpf" > "$cfg"
+    rm -f "$tmpf"
+
+    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "$cfg"
+    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$cfg"
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$cfg"
+    sed -i 's/^#\?UseDNS.*/UseDNS no/' "$cfg"
+
+    mkdir -p "$PR/root/.ssh" && chmod 700 "$PR/root/.ssh"
+    grep -qF "$key" "$PR/root/.ssh/authorized_keys" 2>/dev/null || echo "$key" >> "$PR/root/.ssh/authorized_keys"
+    chmod 600 "$PR/root/.ssh/authorized_keys"
+
+    if [ -f "$PR/etc/fail2ban/jail.local" ]; then
+      sed -i "s/^port = .*/port = $ssh_port/" "$PR/etc/fail2ban/jail.local"
+      systemctl restart fail2ban >/dev/null 2>&1 || true
+    fi
+
+    if command -v ufw &>/dev/null; then
+      ufw allow "${ssh_port}/tcp" comment 'SSH (preServer)' >/dev/null 2>&1 || true
+      ok "порт $ssh_port открыт в ufw"
+    fi
+
+    verify_and_restart_sshd "$ssh_port" no prohibit-password || die "ошибка применения настроек SSH: проверьте конфиги вручную"
+  else
+    warn "файл $cfg не найден — настройка SSH пропущена"
+  fi
+
+  # [5] автообновления
+  section "Автообновления"
+  local UPDATE_SCRIPT="$PR/usr/local/sbin/daily-security-update.sh"
+  mkdir -p "$(dirname "$UPDATE_SCRIPT")" "$PR/etc/cron.d"
+  cat > "$UPDATE_SCRIPT" << 'EOF'
+#!/bin/bash
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+LOG_FILE="/var/log/auto-update.log"
+{
+    echo "===== $(date '+%F %T') start ====="
+    apt-get -o DPkg::Lock::Timeout=600 update -qq
+    apt-get -o DPkg::Lock::Timeout=600 upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+    apt-get autoremove -y
+    echo "===== $(date '+%F %T') done ====="
+} >> "$LOG_FILE" 2>&1
+EOF
+  chmod 0755 "$UPDATE_SCRIPT"
+  cat > "$PR/etc/cron.d/daily-security-update" << EOF
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 3 * * * root /usr/local/sbin/daily-security-update.sh
+EOF
+  chmod 0644 "$PR/etc/cron.d/daily-security-update"
+  systemctl is-active --quiet cron || systemctl start cron >/dev/null 2>&1 || true
+  ok "автообновления настроены (ежедневно в 03:00)"
+
+  # [6] fastfetch
+  section "Fastfetch"
+  local ff=false
+  if command -v fastfetch &>/dev/null; then
+    ff=true
+    ok "fastfetch уже установлен"
+  else
+    if command -v add-apt-repository &>/dev/null; then
+      step_run -s "Установка Fastfetch (PPA)" prep_fastfetch_ppa && ff=true
+    fi
+    if ! $ff; then
+      step_run -s "Установка Fastfetch (.deb с GitHub)" prep_fastfetch_deb && ff=true
+    fi
+  fi
+
+  if $ff; then
+    mkdir -p "$PR/root/.config/fastfetch"
+    cat > "$PR/root/.config/fastfetch/logo.txt" << 'ASCII_LOGO'
++------------------------------+
+| +--------------------------+ |
+| | +----------------------+ | |
+| | | +------------------+ | | |
+| | | | +--------------+ | | | |
+| | | | | +----------+ | | | | |
+| | | | | |          | | | | | |
+| | | | | |    ●●    | | | | | |
+| | | | | |          | | | | | |
+| | | | | +----------+ | | | | |
+| | | | +--------------+ | | | |
+| | | +------------------+ | | |
+| | +----------------------+ | |
+| +--------------------------+ |
++------------------------------+
+ASCII_LOGO
+
+    cat > "$PR/root/.config/fastfetch/config.jsonc" << 'FFCONFIG'
+{
+    "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+    "logo": {
+        "type": "file",
+        "source": "/root/.config/fastfetch/logo.txt",
+        "padding": { "top": 1, "left": 2, "right": 4 }
+    },
+    "display": {
+        "color": { "keys": "blue", "title": "bright_magenta", "separator": "white" }
+    },
+    "modules": [
+        { "type": "custom", "format": "\u001b[97m┌──────────────────────────────────────Hardware──────────────────────────────────────┐\u001b[0m" },
+        { "type": "host", "key": "▣ PC : ", "keyColor": "green" },
+        { "type": "cpu", "key": "   ├▢ CPU: ", "keyColor": "green" },
+        { "type": "cpuusage", "key": "   ├▢ Usage: ", "keyColor": "green" },
+        { "type": "loadavg", "key": "   ├▢ Load: ", "keyColor": "green" },
+        { "type": "gpu", "key": "   ├▢ GPU: ", "keyColor": "green" },
+        { "type": "memory", "key": "   ├▢ RAM: ", "keyColor": "green" },
+        { "type": "swap", "key": "   ├▢ Swap: ", "keyColor": "green" },
+        { "type": "disk", "key": "   ├▢ Disk: ", "keyColor": "green" },
+        { "type": "custom", "format": "\u001b[97m└────────────────────────────────────────────────────────────────────────────────────┘\u001b[0m" },
+        "break",
+        { "type": "custom", "format": "\u001b[97m┌──────────────────────────────────────Software──────────────────────────────────────┐\u001b[0m" },
+        { "type": "os", "key": "▣ OS : ", "keyColor": "yellow" },
+        { "type": "kernel", "key": "   ├▢ Kernel: ", "keyColor": "yellow" },
+        { "type": "packages", "key": "   ├▢ Packages: ", "keyColor": "yellow" },
+        { "type": "shell", "key": "   ├▢ Shell: ", "keyColor": "yellow" },
+        { "type": "custom", "format": "\u001b[97m└────────────────────────────────────────────────────────────────────────────────────┘\u001b[0m" },
+        "break",
+        { "type": "custom", "format": "\u001b[97m┌───────────────────────────────────────Network──────────────────────────────────────┐\u001b[0m" },
+        { "type": "localip", "key": "▣ IP : ", "keyColor": "cyan" },
+        { "type": "command", "key": "   └▢ Location: ", "keyColor": "cyan", "text": "curl -s --max-time 2 https://ipinfo.io/city" },
+        { "type": "custom", "format": "\u001b[97m└────────────────────────────────────────────────────────────────────────────────────┘\u001b[0m" },
+        "break",
+        { "type": "uptime", "key": "▣ UP : ", "keyColor": "magenta" },
+        { "type": "datetime", "key": "   └⏰ : ", "keyColor": "magenta" },
+        { "type": "colors", "paddingLeft": 2, "symbol": "circle" }
+    ]
+}
+FFCONFIG
+
+    if [ -d "$PR/etc/update-motd.d" ]; then
+      chmod -x "$PR"/etc/update-motd.d/* 2>/dev/null || true
+    fi
+    truncate -s 0 "$PR/etc/motd" 2>/dev/null || true
+    if [ -f "$cfg" ]; then
+      if grep -q "^PrintMotd" "$cfg" 2>/dev/null; then
+        sed -i 's/^PrintMotd.*/PrintMotd no/' "$cfg"
+      else
+        echo "PrintMotd no" >> "$cfg"
+      fi
+    fi
+
+    mkdir -p "$PR/etc/profile.d"
+    cat > "$PR/etc/profile.d/fastfetch-ssh.sh" << 'PROFEOF'
+if [ -n "${FASTFETCH_RAN:-}" ]; then return 0; fi
+if [ -n "$SSH_CONNECTION" ] && command -v fastfetch >/dev/null 2>&1; then
+    fastfetch
+    export FASTFETCH_RAN=1
+fi
+PROFEOF
+    chmod 0644 "$PR/etc/profile.d/fastfetch-ssh.sh"
+    ok "fastfetch настроен"
+  fi
+
+  # [7] итог
+  section "Завершение"
+  ok "подготовка сервера завершена"
+  kv "SSH port" "${ssh_port:-пропущено}"
+  kv "Fail2ban" "активен"
+  kv "Fastfetch" "$($ff && echo 'установлен' || echo 'пропущен')"
+  kv "Log" "$LOG"
+  mkdir -p "$PREP_MARKER_DIR"
+  {
+    echo "version=$VERSION"
+    echo "ran_at=$(date '+%F %T')"
+    echo "ssh_port=${ssh_port:-skipped}"
+  } > "$PREP_MARKER_FILE"
+  warn "проверьте вход по ключу на новом порту ($ssh_port) ДО перезагрузки!"
+
+  if [ -z "$PR" ] && [ -t 1 ] && [ -e /dev/tty ]; then
+    echo
+    if confirm "Перезагрузить сейчас?" n; then
+      reboot
+    fi
+  fi
+  return 0
+}
+
+menu() {
+  local has=0 c
+  [ -f "$MARKER_FILE" ] && has=1
+  echo
+  echo "${B}Что делаем?${R}"
+  thin
+  if [ -f "$PREP_MARKER_FILE" ]; then
+    info "подготовка сервера уже выполнена: $(awk -F= '/^ran_at=/{print $2}' "$PREP_MARKER_FILE"), SSH-порт $(awk -F= '/^ssh_port=/{print $2}' "$PREP_MARKER_FILE") (повторный выбор пункта 1 предложит откат)"
+  fi
+  if [ $has -eq 1 ]; then
+    info "найдена метка установки: $(marker_get INSTALLED_AT), статус: $(marker_get STATUS), BACKEND $(marker_get BACKEND_IP), домен $(marker_get DOMAIN)"
+  fi
+  echo "  ${B}1${R}. Подготовить сервер"
+  echo "  ${B}2${R}. Настроить"
+  [ $has -eq 1 ] && echo "  ${B}3${R}. Откат"
+  while true; do
+    rd -r -p "${B}?${R} Выберите вариант: " c
+    case "$c" in
+      1) MODE="prepare"; return 0 ;;
+      2) MODE="install"; return 0 ;;
+      3) if [ $has -eq 1 ]; then MODE="uninstall"; return 0; fi; fail "вариант 3 доступен только после установки" ;;
+      *) if [ $has -eq 1 ]; then fail "введите от 1 до 3"; else fail "введите от 1 до 2"; fi ;;
+    esac
+  done
+}
+
+
+# ───────────────────────── скрипты установки (создаются в $TMPD) ─────────────────────────
+make_scripts() {
+  local D="$TMPD"
 
   # Встроенный генератор Honeypot: исходник хранится в читаемом виде без сжатия.
   cat > "$D/honeypot-generator.source.sh" <<'__HONEYPOT_GENERATOR_SOURCE_20261027__'
@@ -2912,78 +2762,14 @@ HONEYPOT_WRAPPER
     cat "$D/honeypot-generator.source.sh"
   } > "$D/honeypot.sh"
 
-  cat > "$D/pkgs.sh" <<'EOF'
+  # RELAY: пакеты (обновление системы делает пункт «Подготовить сервер»)
+  cat > "$D/relay-pkgs.sh" <<'EOF'
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 APT_LISTCHANGES_FRONTEND=none
 APT=(apt-get -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
-run_apt() {
-  local label="$1"; shift
-  echo "[APT] $label"
-  if timeout --foreground 1800 "${APT[@]}" "$@"; then
-    echo "[OK] $label"
-  else
-    rc=$?
-    if [ "$rc" -eq 124 ]; then echo "[ERROR] $label: таймаут 30 минут; проверьте блокировки apt/dpkg и /var/log/apt/term.log" >&2
-    else echo "[ERROR] $label: код завершения $rc; последние сообщения apt/dpkg:" >&2; tail -n 35 /var/log/apt/term.log /var/log/dpkg.log 2>/dev/null || true; fi
-    exit "$rc"
-  fi
-}
-run_apt "обновление списков" update -qq
-run_apt "обновление пакетов" upgrade -y
-run_apt "dist-upgrade (лимит 30 минут)" dist-upgrade -y
-run_apt "установка зависимостей" install -y curl wget sudo nginx certbot dnsutils unzip ufw ca-certificates openssl python3 gzip
- timedatectl set-timezone Europe/Moscow || true
+timeout --foreground 1800 "${APT[@]}" update -qq
+timeout --foreground 1800 "${APT[@]}" install -y curl unzip nginx certbot ufw sqlite3 python3 openssl dnsutils ca-certificates gzip iproute2
 EOF
-
-  { declare -f rathole_asset rathole_install; cat <<'EOF'
-set -e
-RELAY="$1"; SECRET="$2"; DOMAIN="$3"
-rathole_install
-mkdir -p /etc/rathole
-cat > /etc/rathole/client.toml <<EOT
-[client]
-remote_addr = "$RELAY:2333"
-default_token = "$SECRET"
-
-[client.transport]
-type = "tls"
-
-[client.transport.tls]
-trusted_root = "/etc/rathole/ca.pem"
-hostname = "$DOMAIN"
-
-[client.services.https]
-local_addr = "127.0.0.1:443"
-
-[client.services.http]
-local_addr = "127.0.0.1:80"
-
-[client.services.reality]
-local_addr = "127.0.0.1:8443"
-EOT
-chmod 600 /etc/rathole/client.toml
-cat > /etc/systemd/system/rathole.service <<'EOT'
-[Unit]
-Description=rathole client
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/rathole --client /etc/rathole/client.toml
-Restart=always
-RestartSec=3
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOT
-systemctl daemon-reload
-systemctl enable rathole >/dev/null 2>&1
-systemctl restart rathole
-sleep 3
-systemctl is-active --quiet rathole
-EOF
-  } > "$D/rathole-client.sh"
 
   cat > "$D/xui.sh" <<'EOF'
 set -e
@@ -3056,134 +2842,57 @@ mkdir -p /var/www/certbot
 certbot certonly --webroot -w /var/www/certbot -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" --deploy-hook "systemctl reload nginx"
 EOF
 
-  cat > "$D/nginx-final.sh" <<'EOF'
+  cat > "$D/sub-setup.sh" <<'EOF'
 set -e
-DOMAIN="$1"
-XUI_PATH="${2:-}"
-XUI_PATH="${XUI_PATH#/}"
-XUI_PATH="${XUI_PATH%/}"
-V6=""
-if [ -e /proc/net/if_inet6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" = 0 ]; then V6=1; fi
-L6_80=""
-[ -n "$V6" ] && L6_80="listen [::]:80;"
-NGINX_VER="$(nginx -v 2>&1 | sed 's/.*nginx\///; s/[^0-9.].*//')"
-if [ "$(printf '%s\n1.25.1\n' "$NGINX_VER" | sort -V | head -n1)" = "1.25.1" ]; then
-  LISTEN_SSL="listen 443 ssl;"
-  [ -n "$V6" ] && LISTEN_SSL="$LISTEN_SSL
-    listen [::]:443 ssl;"
-  LISTEN_SSL="$LISTEN_SSL
-    http2 on;"
+DOMAIN="$1"; SCHEME="$2"
+systemctl stop x-ui
+python3 - "$DOMAIN" "$SCHEME" <<'PY'
+import sqlite3, sys
+domain, scheme = sys.argv[1], sys.argv[2]
+c = sqlite3.connect("/etc/x-ui/x-ui.db")
+
+def get(k, d=""):
+    r = c.execute("select value from settings where key=?", (k,)).fetchone()
+    return r[0] if r and r[0] else d
+
+def put(k, v):
+    if c.execute("select 1 from settings where key=?", (k,)).fetchone():
+        c.execute("update settings set value=? where key=?", (v, k))
+    else:
+        c.execute("insert into settings(key,value) values(?,?)", (k, v))
+
+norm = lambda p: "/" + p.strip("/") + "/"
+sp, jp, cp = (norm(get(k, d)) for k, d in (("subPath", "/sub/"), ("subJsonPath", "/json/"), ("subClashPath", "/clash/")))
+put("subEnable", "true")
+put("subListen", "127.0.0.1")
+put("subPort", get("subPort", "2096"))
+base = scheme + "://" + domain
+put("subURI", base + sp)
+put("subJsonURI", base + jp)
+put("subClashURI", base + cp)
+c.commit()
+print(sp)
+PY
+systemctl start x-ui
+sleep 2
+systemctl is-active --quiet x-ui
+EOF
+
+  cat > "$D/f2b-ignore.sh" <<'EOF'
+IP="$1"
+J=/etc/fail2ban/jail.local
+[ -f "$J" ] || exit 0
+if grep -q '^ignoreip' "$J"; then
+  grep -q "$IP" "$J" || sed -i "s|^ignoreip.*|& $IP|" "$J"
 else
-  LISTEN_SSL="listen 443 ssl http2;"
-  [ -n "$V6" ] && LISTEN_SSL="$LISTEN_SSL
-    listen [::]:443 ssl http2;"
+  sed -i "/^\[sshd\]/a ignoreip = 127.0.0.1/8 ::1 $IP" "$J"
 fi
-cat > /etc/nginx/sites-available/apex.conf <<EOT
-server {
-    listen 80;
-    $L6_80
-    server_name $DOMAIN;
-
-    location ^~ /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-
-server {
-    $LISTEN_SSL
-    server_name $DOMAIN;
-
-    ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers on;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
-    ssl_session_tickets off;
-
-    server_tokens off;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
-
-    # BEGIN sub-paths
-    # END sub-paths
-
-    # Отдельный путь панели 3x-ui; корень домена остаётся обычным сайтом.
-    location = /$XUI_PATH { return 301 /$XUI_PATH/; }
-    location ^~ /$XUI_PATH/ {
-        proxy_pass http://127.0.0.1:999;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-
-    root /var/www/honeypot/$DOMAIN;
-    index index.html;
-    error_page 404 /404.html;
-    location = /404.html { internal; }
-    location ~ /\.(?!well-known) { return 404; }
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-}
-EOT
-nginx -t
-systemctl reload nginx
-# прежние глобальные хуки (stop/start nginx) мешали продлению других сертификатов — убираем
-rm -f /etc/letsencrypt/renewal-hooks/pre/stop-nginx.sh /etc/letsencrypt/renewal-hooks/post/start-nginx.sh
-/usr/local/bin/sync-sub-path || true
-systemctl enable --now certbot.timer
+systemctl restart fail2ban >/dev/null 2>&1 || true
+exit 0
 EOF
 
-  cat > "$D/ufw-backend.sh" <<'EOF'
+  cat > "$D/helper-relay.sh" <<'EOF'
 set -e
-RELAY="$1"
-ports=$( {
-  ss -tlnp 2>/dev/null | awk '/"sshd"/ { n = split($4, a, ":"); print a[n] }'
-  sshd -T 2>/dev/null | awk '/^port / { print $2 }'
-  systemctl show ssh.socket -p Listen 2>/dev/null | sed -n 's/^Listen=.*:\([0-9][0-9]*\) (Stream)$/\1/p'
-  [ -n "${SSH_CONNECTION:-}" ] && echo "$SSH_CONNECTION" | awk '{ print $4 }'
-} | grep -E '^[0-9]+$' | sort -un || true )
-[ -n "$ports" ] || { echo "sshd port not found" >&2; exit 1; }
-for p in $ports; do ufw allow "$p/tcp"; done
-for r in "443/tcp" "80/tcp" "8443/tcp" "443" "80" "8443" "Nginx Full" "Nginx HTTP" "Nginx HTTPS"; do
-  ufw delete allow "$r" >/dev/null 2>&1 || true
-done
-for p in 443 80 8443; do
-  ufw delete allow from "$RELAY" to any port "$p" proto tcp >/dev/null 2>&1 || true
-done
-ufw allow from "$RELAY" to any port 8443 proto udp
-ufw --force enable
-ufw status
-EOF
-
-  cat > "$D/helper-backend.sh" <<'EOF'
-set -e
-cat > /usr/local/bin/switch-relay <<'EOT'
-#!/bin/bash
-set -e
-NEW="$1"; [ -z "$NEW" ] && { echo "usage: switch-relay НОВЫЙ_IP_РЕЛЕЯ"; exit 1; }
-CFG=/etc/rathole/client.toml
-OLD=$(grep -oP '(?<=remote_addr = ")[0-9.]+' $CFG)
-sed -i "s/$OLD:2333/$NEW:2333/" $CFG
-ufw delete allow from $OLD to any port 8443 proto udp || true
-ufw allow from $NEW to any port 8443 proto udp
-systemctl restart rathole
-echo "RELAY: $OLD -> $NEW"
-journalctl -u rathole -n 5 --no-pager
-EOT
-chmod +x /usr/local/bin/switch-relay
 cat > /usr/local/bin/sync-sub-path <<'EOT2'
 #!/usr/bin/env python3
 # Берёт пути подписки из базы 3x-ui и прописывает их в nginx (apex.conf, блок sub-paths).
@@ -3260,377 +2969,503 @@ WantedBy=timers.target
 EOT3
 systemctl daemon-reload
 systemctl enable --now sync-sub-path.timer >/dev/null 2>&1
+cat > /usr/local/bin/chain-set-backend <<'EOT4'
+#!/bin/bash
+# Смена IP BACKEND: туннельный путь на RELAY принимает подключения только с этого адреса (any — без ограничения)
+set -e
+NEW="${1:-}"; [ -n "$NEW" ] || { echo "usage: chain-set-backend НОВЫЙ_IP_BACKEND | any"; exit 1; }
+F=/etc/nginx/chain-backend.conf
+if [ "$NEW" = any ]; then
+  printf 'allow all;\n' > "$F"
+else
+  [[ "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "неверный IP"; exit 1; }
+  printf 'allow %s;\nallow 127.0.0.1;\ndeny all;\n' "$NEW" > "$F"
+fi
+nginx -t 2>/dev/null && systemctl reload nginx
+[ -f /root/.chain-setup.conf ] && sed -i "s/^BACKEND_IP=.*/BACKEND_IP=$NEW/" /root/.chain-setup.conf
+echo "BACKEND (туннельный путь): $NEW"
+EOT4
+chmod +x /usr/local/bin/chain-set-backend
+cat > /usr/local/bin/chain-status <<'EOT5'
+#!/bin/bash
+# Состояние цепочки на RELAY
+conf=/root/.chain-setup.conf
+get() { sed -n "s/^$1=//p" "$conf" 2>/dev/null | head -n1; }
+D=$(get DOMAIN); TP=$(get TUNNEL_PATH); UP=$(get USER_PATH)
+st() { systemctl is-active --quiet "$1" && echo "работает" || echo "НЕ РАБОТАЕТ"; }
+echo "nginx:        $(st nginx)"
+echo "3x-ui:        $(st x-ui)"
+n=$(ss -tnH state established "( sport = :21444 )" 2>/dev/null | wc -l)
+echo "туннель:      соединений от BACKEND: $n $([ "$n" -ge 1 ] && echo '(мост подключён)' || echo '(моста нет — проверьте chain-bridge на BACKEND)')"
+echo "BACKEND:      $(get BACKEND_IP) ($(head -n1 /etc/nginx/chain-backend.conf 2>/dev/null))"
+exp=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$D/fullchain.pem" 2>/dev/null | cut -d= -f2)
+echo "сертификат:   до ${exp:-?}"
+code=$(curl -s -o /dev/null -w '%{http_code}' --resolve "$D:443:127.0.0.1" "https://$D/" 2>/dev/null)
+echo "сайт:         HTTP ${code:-000} (ожидается 200)"
+code=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --resolve "$D:443:127.0.0.1" "https://$D/$UP/" 2>/dev/null)
+echo "проба пути:   HTTP ${code:-000} для чужого запроса (ожидается 404)"
+EOT5
+chmod +x /usr/local/bin/chain-status
+cat > /usr/local/bin/chain-site-refresh <<'EOT6'
+#!/usr/bin/env python3
+# Обновляет «живые» страницы сайта: /status/ и /api/v1/{health,status}.json (запускается таймером)
+import datetime, json, os, random, re, sys
+try:
+    domain = open("/etc/chain-site.domain").read().strip()
+except OSError:
+    sys.exit(0)
+root = "/var/www/honeypot/" + domain
+if not os.path.isdir(root):
+    sys.exit(0)
+name = domain.split(".")[0].capitalize()
+try:
+    t = re.search(r"<title>(.*?)</title>", open(root + "/index.html", encoding="utf-8").read(), re.S | re.I)
+    if t:
+        name = re.split(r"\s+[—|–-]\s+", t.group(1).strip())[0] or name
+except OSError:
+    pass
+now = datetime.datetime.now(datetime.timezone.utc)
+day = random.Random(now.strftime("%Y%m%d") + domain)
+minute = random.Random(now.strftime("%Y%m%d%H") + str(now.minute // 5) + domain)
+comps = [("Web application", 99.98), ("API", 99.96), ("Authentication", 99.99), ("Background jobs", 99.94)]
+rows = [(c, u, minute.randint(38, 140)) for c, u in comps]
+bars = "".join('<i class="%s"></i>' % ("w" if day.random() < 0.03 else "g") for _ in range(90))
+html = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>%(n)s — System status</title><style>body{font:16px/1.5 system-ui,sans-serif;margin:0;background:#f6f7f9;color:#1b1f24}
+main{max-width:720px;margin:40px auto;padding:0 20px}h1{font-size:24px;margin:0 0 4px}.ok{color:#1a7f37;font-weight:600}
+.card{background:#fff;border:1px solid #e3e6ea;border-radius:10px;padding:6px 18px;margin:18px 0}
+.r{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid #eef0f2}.r:last-child{border:0}.s{color:#6a737d;font-size:14px}
+.b{display:flex;gap:2px;height:30px;margin-top:10px}.b i{flex:1;border-radius:2px}.g{background:#2da44e}.w{background:#d4a72c}
+small{color:#6a737d}</style></head><body><main><h1>%(n)s Status</h1><div class="ok">All systems operational</div>
+<div class="card">%(rows)s</div><div class="card"><div class="r"><span>Uptime — last 90 days</span><span class="s">99.97%%</span></div>
+<div class="b">%(bars)s</div><p><small>Updated %(t)s UTC</small></p></div></main></body></html>
+""" % {"n": name, "t": now.strftime("%Y-%m-%d %H:%M"), "bars": bars,
+       "rows": "".join('<div class="r"><span>%s</span><span class="s">%.2f%% · %d ms</span></div>' % (c, u, ms) for c, u, ms in rows)}
+os.makedirs(root + "/status", exist_ok=True)
+os.makedirs(root + "/api/v1", exist_ok=True)
+open(root + "/status/index.html", "w", encoding="utf-8").write(html)
+up = int((now - datetime.datetime(2025, 3, 14, tzinfo=datetime.timezone.utc)).total_seconds())
+json.dump({"status": "ok", "service": domain.split(".")[0], "version": "2.14.1", "uptime_seconds": up,
+           "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ")}, open(root + "/api/v1/health.json", "w"))
+json.dump({"status": "operational", "components": [{"name": c, "status": "operational", "latency_ms": ms} for c, u, ms in rows],
+           "updated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ")}, open(root + "/api/v1/status.json", "w"))
+EOT6
+chmod +x /usr/local/bin/chain-site-refresh
+cat > /etc/systemd/system/chain-site-refresh.service <<'EOT7'
+[Unit]
+Description=Refresh status pages of the site
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/chain-site-refresh
+EOT7
+cat > /etc/systemd/system/chain-site-refresh.timer <<'EOT7'
+[Unit]
+Description=Refresh status pages every 5 minutes
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=300
+
+[Install]
+WantedBy=timers.target
+EOT7
+systemctl daemon-reload
+systemctl enable --now chain-site-refresh.timer >/dev/null 2>&1
 EOF
+
 
   # сетевые твики на BACKEND (та же функция, что и на RELAY)
   { declare -f tune_network; echo 'tune_network "$@"'; } > "$D/tune.sh"
 
-  # подписка: включить, слушать только локально, прописать URI обратного прокси; печатает пути из панели
-  cat > "$D/sub-setup.sh" <<'EOF'
-set -e
-DOMAIN="$1"; SCHEME="$2"
-systemctl stop x-ui
-python3 - "$DOMAIN" "$SCHEME" <<'PY'
-import sqlite3, sys
-domain, scheme = sys.argv[1], sys.argv[2]
-c = sqlite3.connect("/etc/x-ui/x-ui.db")
+  # RELAY: финальный конфиг nginx (сайт, панель, секретные пути, «живые» эндпоинты)
+  cat > "$D/nginx-final.py" <<'PYEOF'
+import os, re, subprocess, sys
 
-def get(k, d=""):
-    r = c.execute("select value from settings where key=?", (k,)).fetchone()
-    return r[0] if r and r[0] else d
+domain, xui_path, upath, tpath, uport, tport, backend = sys.argv[1:8]
+xui_path = xui_path.strip("/")
+v6 = os.path.exists("/proc/net/if_inet6") and open("/proc/sys/net/ipv6/conf/all/disable_ipv6").read().strip() == "0"
+ver = subprocess.run(["nginx", "-v"], capture_output=True, text=True).stderr
+m = re.search(r"nginx/(\d+)\.(\d+)\.(\d+)", ver)
+newer = tuple(int(x) for x in m.groups()) >= (1, 25, 1) if m else False
 
-def put(k, v):
-    if c.execute("select 1 from settings where key=?", (k,)).fetchone():
-        c.execute("update settings set value=? where key=?", (v, k))
-    else:
-        c.execute("insert into settings(key,value) values(?,?)", (k, v))
+if newer:
+    listen_ssl = "listen 443 ssl default_server;\n" + ("    listen [::]:443 ssl default_server;\n" if v6 else "") + "    http2 on;"
+else:
+    listen_ssl = "listen 443 ssl http2 default_server;" + ("\n    listen [::]:443 ssl http2 default_server;" if v6 else "")
+listen_80 = "listen 80 default_server;" + ("\n    listen [::]:80 default_server;" if v6 else "")
 
-norm = lambda p: "/" + p.strip("/") + "/"
-sp, jp, cp = (norm(get(k, d)) for k, d in (("subPath", "/sub/"), ("subJsonPath", "/json/"), ("subClashPath", "/clash/")))
-put("subEnable", "true")
-put("subListen", "127.0.0.1")
-put("subPort", get("subPort", "2096"))
-base = scheme + "://" + domain
-put("subURI", base + sp)
-put("subJsonURI", base + jp)
-put("subClashURI", base + cp)
-c.commit()
-print(sp)
-PY
-systemctl start x-ui
-sleep 2
-systemctl is-active --quiet x-ui
-EOF
+try:
+    os.remove("/etc/nginx/sites-enabled/default")   # иначе два default_server на портах 80/443
+except OSError:
+    pass
+os.makedirs("/etc/nginx/snippets", exist_ok=True)
+os.makedirs("/etc/nginx/conf.d", exist_ok=True)
+os.makedirs("/var/www/certbot", exist_ok=True)
 
-  cat > "$D/iperf-install.sh" <<'EOF'
-set -e
-export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-apt-get -o DPkg::Lock::Timeout=300 update -y
-apt-get -o DPkg::Lock::Timeout=300 install -y iperf3
-EOF
+open("/etc/nginx/snippets/chain-headers.conf", "w").write(
+    'add_header X-Content-Type-Options "nosniff" always;\n'
+    'add_header X-Frame-Options "SAMEORIGIN" always;\n'
+    'add_header Referrer-Policy "strict-origin-when-cross-origin" always;\n'
+    'add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;\n'
+    'add_header X-Request-ID $request_id always;\n')
+open("/etc/nginx/conf.d/chain-limit.conf", "w").write(
+    "limit_req_zone $binary_remote_addr zone=chain_site:10m rate=10r/s;\nlimit_req_status 429;\n")
+if not os.path.exists("/etc/nginx/chain-backend.conf"):
+    open("/etc/nginx/chain-backend.conf", "w").write(
+        "allow all;\n" if backend == "any" else "allow %s;\nallow 127.0.0.1;\ndeny all;\n" % backend)
 
-  cat > "$D/iperf-server.sh" <<'EOF'
-set -e
-RELAY="$1"
-rm -f /run/relay-iperf.fw
-if ufw status 2>/dev/null | grep -q '^Status: active'; then
-  ufw allow from "$RELAY" to any port 5201 proto tcp >/dev/null
-  touch /run/relay-iperf.fw
-fi
-if [ -f /run/relay-iperf3.pid ]; then kill "$(cat /run/relay-iperf3.pid)" 2>/dev/null || true; fi
-iperf3 -s -D -4 -p 5201 -I /run/relay-iperf3.pid
-sleep 1
-ss -tlnH | grep -q ':5201 '
-EOF
+tpl = r"""server {
+    @@LISTEN80@@
+    server_name @@DOMAIN@@;
+    server_tokens off;
 
-  cat > "$D/iperf-stop.sh" <<'EOF'
-RELAY="$1"
-if [ -f /run/relay-iperf3.pid ]; then kill "$(cat /run/relay-iperf3.pid)" 2>/dev/null || true; rm -f /run/relay-iperf3.pid; fi
-if [ -f /run/relay-iperf.fw ]; then ufw delete allow from "$RELAY" to any port 5201 proto tcp >/dev/null 2>&1 || true; rm -f /run/relay-iperf.fw; fi
-if [ -f /run/relay-tls.pid ]; then kill "$(cat /run/relay-tls.pid)" 2>/dev/null || true; rm -f /run/relay-tls.pid /run/relay-tls-srv.py /run/relay-tls.key /run/relay-tls.crt; fi
-if [ -f /run/relay-tls.fw ]; then
-  while read -r spec; do
-    [ -n "$spec" ] && ufw delete allow from "$RELAY" to any port "${spec%/*}" proto "${spec#*/}" >/dev/null 2>&1 || true
-  done < /run/relay-tls.fw
-  rm -f /run/relay-tls.fw
-fi
-rm -f /run/relay-test.ports
-true
-EOF
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+    location / {
+        return 301 https://@@DOMAIN@@$request_uri;
+    }
+}
 
-  cat > "$D/tlstest-start.sh" <<'EOF'
-set -e
-RELAY="$1"
-rm -f /run/relay-tls.fw /run/relay-test.ports
-if [ -f /run/relay-tls.pid ]; then kill "$(cat /run/relay-tls.pid)" 2>/dev/null || true; sleep 0.5; fi
-openssl req -x509 -newkey rsa:2048 -nodes -keyout /run/relay-tls.key -out /run/relay-tls.crt -days 1 -subj "/CN=localhost" >/dev/null 2>&1
-cat > /run/relay-tls-srv.py <<'PYEOF'
-import socket, ssl, struct, threading, time
+server {
+    @@LISTENSSL@@
+    server_name @@DOMAIN@@;
 
-CRT, KEY = "/run/relay-tls.crt", "/run/relay-tls.key"
-ctx13 = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-ctx13.load_cert_chain(CRT, KEY)
-ctx12 = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-ctx12.load_cert_chain(CRT, KEY)
-ctx12.maximum_version = ssl.TLSVersion.TLSv1_2
-chunk = b"x" * 65536
-bound = []
+    ssl_certificate     /etc/letsencrypt/live/@@DOMAIN@@/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/@@DOMAIN@@/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    ssl_session_tickets off;
 
-def stream(c, mode):
-    end = time.time() + 12
-    if mode == b"D":
-        while time.time() < end:
-            c.sendall(chunk)
-    elif mode == b"U":
-        while time.time() < end:
-            if not c.recv(65536):
-                break
+    server_tokens off;
+    access_log off;
+    include /etc/nginx/snippets/chain-headers.conf;
 
-def handle_stream(c, ctx):
+    root /var/www/honeypot/@@DOMAIN@@;
+    index index.html;
+    error_page 404 /404.html;
+    location = /404.html { internal; }
+
+    # BEGIN sub-paths
+    # END sub-paths
+
+    # Канал пользователей (VLESS + XHTTP): только HTTP/2 и только точный секретный путь, остальное — 404
+    location ^~ /@@UPATH@@/ {
+        if ($server_protocol != "HTTP/2.0") { return 404; }
+        limit_except GET POST { deny all; }
+        client_max_body_size 0;
+        client_body_timeout 5m;
+        grpc_read_timeout 315s;
+        grpc_send_timeout 5m;
+        grpc_set_header Host $host;
+        grpc_intercept_errors on;
+        error_page 400 401 403 405 =404 /404.html;
+        grpc_pass grpc://127.0.0.1:@@UPORT@@;
+    }
+
+    # Туннель: сюда сам подключается мост BACKEND; другим адресам — 404
+    location ^~ /@@TPATH@@/ {
+        if ($server_protocol != "HTTP/2.0") { return 404; }
+        include /etc/nginx/chain-backend.conf;
+        error_page 403 =404 /404.html;
+        client_max_body_size 0;
+        client_body_timeout 5m;
+        grpc_read_timeout 315s;
+        grpc_send_timeout 5m;
+        grpc_set_header Host $host;
+        grpc_pass grpc://127.0.0.1:@@TPORT@@;
+    }
+
+    # Панель 3x-ui по отдельному пути
+    location = /@@XUI@@ { return 301 /@@XUI@@/; }
+    location ^~ /@@XUI@@/ {
+        limit_req zone=chain_site burst=60 nodelay;
+        proxy_pass http://127.0.0.1:999;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    # «Живой» сайт: статус-страница и API-подобные эндпоинты
+    location = /status { return 301 /status/; }
+    location ^~ /status/ {
+        limit_req zone=chain_site burst=30 nodelay;
+        include /etc/nginx/snippets/chain-headers.conf;
+        add_header Cache-Control "no-cache" always;
+        try_files $uri $uri/index.html =404;
+    }
+    location = /api/v1/health {
+        limit_req zone=chain_site burst=30 nodelay;
+        default_type application/json;
+        include /etc/nginx/snippets/chain-headers.conf;
+        add_header Cache-Control "no-store" always;
+        try_files /api/v1/health.json =404;
+    }
+    location = /api/v1/status {
+        limit_req zone=chain_site burst=30 nodelay;
+        default_type application/json;
+        include /etc/nginx/snippets/chain-headers.conf;
+        add_header Cache-Control "no-store" always;
+        try_files /api/v1/status.json =404;
+    }
+    location ^~ /api/ {
+        limit_req zone=chain_site burst=30 nodelay;
+        default_type application/json;
+        include /etc/nginx/snippets/chain-headers.conf;
+        add_header WWW-Authenticate 'Bearer realm="api"' always;
+        return 401 '{"error":"unauthorized","message":"Missing or invalid API key"}';
+    }
+
+    location ~ /\.(?!well-known) { return 404; }
+    location / {
+        limit_req zone=chain_site burst=30 nodelay;
+        try_files $uri $uri/ =404;
+    }
+}
+"""
+conf = (tpl.replace("@@LISTEN80@@", listen_80).replace("@@LISTENSSL@@", listen_ssl)
+        .replace("@@DOMAIN@@", domain).replace("@@UPATH@@", upath).replace("@@TPATH@@", tpath)
+        .replace("@@UPORT@@", uport).replace("@@TPORT@@", tport).replace("@@XUI@@", xui_path))
+open("/etc/nginx/sites-available/apex.conf", "w").write(conf)
+if not os.path.islink("/etc/nginx/sites-enabled/apex.conf"):
     try:
-        if ctx is not None:
-            c = ctx.wrap_socket(c, server_side=True)
-        c.settimeout(15)
-        stream(c, c.recv(1))
-    except Exception:
+        os.symlink("/etc/nginx/sites-available/apex.conf", "/etc/nginx/sites-enabled/apex.conf")
+    except FileExistsError:
         pass
-    finally:
-        try:
-            c.close()
-        except Exception:
-            pass
-
-def handle_http(c):
+if subprocess.call(["nginx", "-t"]) != 0:
+    sys.exit("nginx -t не прошёл")
+subprocess.check_call(["systemctl", "reload", "nginx"])
+subprocess.call(["systemctl", "enable", "--now", "certbot.timer"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+for f in ("/etc/letsencrypt/renewal-hooks/pre/stop-nginx.sh", "/etc/letsencrypt/renewal-hooks/post/start-nginx.sh"):
     try:
-        c.settimeout(15)
-        data = b""
-        while b"\r\n\r\n" not in data and len(data) < 8192:
-            d = c.recv(4096)
-            if not d:
-                break
-            data += d
-        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 1073741824\r\nConnection: close\r\n\r\n")
-        end = time.time() + 12
-        while time.time() < end:
-            c.sendall(chunk)
-    except Exception:
+        os.remove(f)
+    except OSError:
         pass
-    finally:
-        try:
-            c.close()
-        except Exception:
-            pass
-
-def listen(port, handler, kind):
-    try:
-        srv = socket.socket()
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("0.0.0.0", port))
-        srv.listen(64)
-    except OSError:
-        return
-    bound.append("tcp:%d:%s" % (port, kind))
-    def loop():
-        while True:
-            c, _ = srv.accept()
-            threading.Thread(target=handler, args=(c,), daemon=True).start()
-    threading.Thread(target=loop, daemon=True).start()
-
-def blast(u, addr):
-    seq = 0
-    end = time.time() + 4
-    body = b"y" * 1196
-    while time.time() < end:
-        for _ in range(50):
-            u.sendto(struct.pack(">I", seq) + body, addr)
-            seq += 1
-        time.sleep(0.01)
-    for _ in range(5):
-        u.sendto(b"Z" + struct.pack(">I", seq), addr)
-
-def udp_loop():
-    try:
-        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        u.bind(("0.0.0.0", 8448))
-    except OSError:
-        return
-    bound.append("udp:8448:udp")
-    while True:
-        data, addr = u.recvfrom(2048)
-        if data[:1] == b"E":
-            u.sendto(data, addr)
-        elif data[:1] == b"D":
-            threading.Thread(target=blast, args=(u, addr), daemon=True).start()
-
-for prt in (8444, 2087, 9443, 4443):
-    listen(prt, lambda c: handle_stream(c, ctx13), "tls13")
-listen(8445, lambda c: handle_stream(c, ctx12), "tls12")
-listen(8446, lambda c: handle_stream(c, None), "raw")
-listen(8447, handle_http, "http")
-threading.Thread(target=udp_loop, daemon=True).start()
-time.sleep(0.5)
-open("/run/relay-test.ports", "w").write("\n".join(bound) + "\n")
-while True:
-    time.sleep(3600)
 PYEOF
-nohup python3 /run/relay-tls-srv.py >/dev/null 2>&1 &
-echo $! > /run/relay-tls.pid
-sleep 1.5
-[ -s /run/relay-test.ports ]
-if ufw status 2>/dev/null | grep -q '^Status: active'; then
-  while IFS=: read -r proto port kind; do
-    [ -n "$port" ] || continue
-    ufw allow from "$RELAY" to any port "$port" proto "$proto" >/dev/null
-    echo "$port/$proto" >> /run/relay-tls.fw
-  done < /run/relay-test.ports
+
+  # RELAY: инбаунды 3x-ui через API (пользователи + туннель с reverse) и маршрутизация «пользователи → туннель»
+  cat > "$D/chain-inbounds.py" <<'PYEOF'
+import json, secrets, string, sys, urllib.parse, urllib.request, uuid
+
+base, token, domain, upath, tpath, uport, tport = sys.argv[1:8]
+uport, tport = int(uport), int(tport)
+
+
+def api(path, body=None, form=None, method=None):
+    if body is not None:
+        data, ctype = json.dumps(body).encode(), "application/json"
+    elif form is not None:
+        data, ctype = urllib.parse.urlencode(form).encode(), "application/x-www-form-urlencoded"
+    else:
+        data, ctype = None, "application/json"
+    req = urllib.request.Request(base + path, data=data, method=method,
+                                 headers={"Authorization": "Bearer " + token, "Content-Type": ctype})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+
+def stream(path, ext=None):
+    s = {"network": "xhttp", "security": "none",
+         "xhttpSettings": {"path": "/" + path + "/", "host": domain, "mode": "auto", "xPaddingBytes": "100-1000"}}
+    if ext:
+        s["externalProxy"] = ext
+    return json.dumps(s)
+
+
+# панель после перезапуска отвечает не сразу
+import time
+for _ in range(60):
+    try:
+        api("/panel/api/inbounds/list")
+        break
+    except Exception:
+        time.sleep(1)
+else:
+    sys.exit("API панели не отвечает")
+
+sniff = json.dumps({"enabled": False, "destOverride": ["http", "tls"], "metadataOnly": False, "routeOnly": False})
+alnum = string.ascii_lowercase + string.digits
+existing = {i.get("remark"): i for i in (api("/panel/api/inbounds/list").get("obj") or [])}
+
+
+def first_client(inb):
+    s = inb.get("settings")
+    s = json.loads(s) if isinstance(s, str) else s
+    return s["clients"][0]
+
+
+# пользователи: VLESS + XHTTP, TLS снаружи (nginx); во внешней ссылке/подписке — домен:443 с TLS
+if "chain-users" in existing:
+    c = first_client(existing["chain-users"])
+    user_id, sub_id = c["id"], c.get("subId", "")
+else:
+    user_id, sub_id = str(uuid.uuid4()), "".join(secrets.choice(alnum) for _ in range(16))
+    settings = {"clients": [{"id": user_id, "email": "user1", "flow": "", "limitIp": 0, "totalGB": 0, "expiryTime": 0,
+                             "enable": True, "subId": sub_id, "comment": "", "reset": 0}],
+                "decryption": "none", "fallbacks": []}
+    ext = [{"forceTls": "tls", "dest": domain, "port": 443, "remark": "", "sni": domain,
+            "fingerprint": "chrome", "alpn": ["h2"]}]
+    r = api("/panel/api/inbounds/add", body={"remark": "chain-users", "enable": True, "listen": "127.0.0.1", "port": uport,
+                                             "protocol": "vless", "settings": json.dumps(settings),
+                                             "streamSettings": stream(upath, ext), "sniffing": sniff, "tag": "chain-users"})
+    if not r.get("success"):
+        sys.exit("не удалось создать инбаунд пользователей: %s" % r.get("msg"))
+
+# туннель: клиент с reverse-тегом; в подписки не попадает
+if "chain-tunnel" in existing:
+    tunnel_id = first_client(existing["chain-tunnel"])["id"]
+else:
+    tunnel_id = str(uuid.uuid4())
+    settings = {"clients": [{"id": tunnel_id, "email": "chain-tunnel", "flow": "", "limitIp": 0, "totalGB": 0, "expiryTime": 0,
+                             "enable": True, "subId": "".join(secrets.choice(alnum) for _ in range(16)), "comment": "",
+                             "reset": 0, "reverse": {"tag": "r-tunnel"}}],
+                "decryption": "none", "fallbacks": []}
+    r = api("/panel/api/inbounds/add", body={"remark": "chain-tunnel", "enable": True, "listen": "127.0.0.1", "port": tport,
+                                             "protocol": "vless", "settings": json.dumps(settings),
+                                             "streamSettings": stream(tpath), "sniffing": sniff, "tag": "chain-tunnel",
+                                             "excludeFromSub": True})
+    if not r.get("success"):
+        sys.exit("не удалось создать инбаунд туннеля: %s" % r.get("msg"))
+
+# маршрутизация: всё из chain-users — только в туннель (если моста нет, соединение сбрасывается, прямого выхода с RELAY нет)
+r = api("/panel/api/xray/", form={})
+o = r["obj"]
+o = json.loads(o) if isinstance(o, str) else o
+xs = o["xraySetting"]
+xs = json.loads(xs) if isinstance(xs, str) else xs
+rules = xs.setdefault("routing", {}).setdefault("rules", [])
+rule = {"type": "field", "inboundTag": ["chain-users"], "outboundTag": "r-tunnel"}
+if rule not in rules:
+    idx = 0
+    for i, x in enumerate(rules):
+        if x.get("outboundTag") in ("api", "blocked"):
+            idx = i + 1
+    rules.insert(idx, rule)
+    r = api("/panel/api/xray/update", form={"xraySetting": json.dumps(xs), "outboundTestUrl": "https://www.google.com/generate_204"})
+    if not r.get("success"):
+        sys.exit("не удалось сохранить маршрутизацию: %s" % r.get("msg"))
+
+print(json.dumps({"user_id": user_id, "sub_id": sub_id, "tunnel_id": tunnel_id}))
+PYEOF
+
+  # BACKEND: мост Xray (обратный туннель к RELAY)
+  cat > "$D/bridge-install.sh" <<'EOF'
+set -Eeuo pipefail
+RELAY="$1"; DOMAIN="$2"; TPATH="$3"; TUUID="$4"
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+case "$(uname -m)" in
+  x86_64 | amd64) ARCH=64 ;;
+  aarch64 | arm64) ARCH=arm64-v8a ;;
+  *) echo "неподдерживаемая архитектура: $(uname -m)" >&2; exit 1 ;;
+esac
+need=()
+for c in curl unzip python3 sha256sum; do command -v "$c" >/dev/null 2>&1 || need+=("$c"); done
+if [ ${#need[@]} -gt 0 ]; then
+  apt-get -o DPkg::Lock::Timeout=300 update -qq
+  apt-get -o DPkg::Lock::Timeout=300 install -y curl unzip python3 coreutils ca-certificates
 fi
-EOF
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$ARCH.zip"
+curl -fsSL --retry 3 -o "$tmp/x.zip" "$URL"
+curl -fsSL --retry 3 -o "$tmp/x.dgst" "$URL.dgst"
+want=$(sed -n 's/^SHA2-256= *//p' "$tmp/x.dgst" | head -n1 | tr -d '[:space:]')
+have=$(sha256sum "$tmp/x.zip" | awk '{ print $1 }')
+[ -n "$want" ] && [ "$want" = "$have" ] || { echo "контрольная сумма Xray не совпала" >&2; exit 1; }
+unzip -oq "$tmp/x.zip" xray -d "$tmp"
+install -m 755 "$tmp/xray" /usr/local/bin/chain-xray
+id chainbridge >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin chainbridge
+mkdir -p /etc/chain-bridge
+python3 - "$RELAY" "$DOMAIN" "$TPATH" "$TUUID" <<'PY'
+import json, sys
+relay, domain, tpath, tuuid = sys.argv[1:5]
+cfg = {
+    "log": {"loglevel": "warning", "access": "none"},
+    "outbounds": [
+        {"tag": "tunnel", "protocol": "vless",
+         "settings": {"address": relay, "port": 443, "id": tuuid, "encryption": "none", "reverse": {"tag": "r-in"}},
+         "streamSettings": {"network": "xhttp", "security": "tls",
+                            "tlsSettings": {"serverName": domain, "fingerprint": "chrome", "alpn": ["h2"]},
+                            "xhttpSettings": {"host": domain, "path": "/" + tpath + "/", "mode": "auto", "xPaddingBytes": "100-1000"}}},
+        {"tag": "direct", "protocol": "freedom"},
+    ],
+    "routing": {"rules": [{"type": "field", "inboundTag": ["r-in"], "outboundTag": "direct"}]},
+}
+json.dump(cfg, open("/etc/chain-bridge/config.json", "w"), indent=2)
+PY
+chown -R root:chainbridge /etc/chain-bridge
+chmod 750 /etc/chain-bridge; chmod 640 /etc/chain-bridge/config.json
+/usr/local/bin/chain-xray run -test -c /etc/chain-bridge/config.json
+cat > /etc/systemd/system/chain-bridge.service <<'EOT'
+[Unit]
+Description=chain bridge (Xray reverse tunnel to RELAY)
+After=network-online.target
+Wants=network-online.target
 
-  # клиент TLS-теста (запускается на RELAY): "Мбит/с байт ошибка"
-  cat > "$D/tlstest-client.py" <<'EOF'
-import socket, ssl, struct, sys, threading, time
+[Service]
+User=chainbridge
+Group=chainbridge
+ExecStart=/usr/local/bin/chain-xray run -c /etc/chain-bridge/config.json
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
 
-kind = sys.argv[1]
-
-def tcp_run():
-    host, port, sni, mode, n, secs = sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], int(sys.argv[6]), float(sys.argv[7])
-    mss = int(sys.argv[8]) if len(sys.argv) > 8 else 0
-    idle = float(sys.argv[9]) if len(sys.argv) > 9 else 0
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    total = [0] * n
-    errs = [""] * n
-    host_hdr = host if sni == "-" else sni
-    req = ("GET /big.bin HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n" % host_hdr).encode()
-
-    def worker(i):
-        phase = "CONNECT"
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            if mss:
-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, mss)
-            s.settimeout(8)
-            s.connect((host, port))
-            conn = s
-            if kind == "tls":
-                phase = "HANDSHAKE"
-                conn = ctx.wrap_socket(s, server_hostname=None if sni == "-" else sni)
-            conn.settimeout(5)
-            phase = "DATA"
-            if idle:
-                time.sleep(idle)
-            if kind == "http":
-                conn.sendall(req)
-                m = "D"
-            else:
-                conn.sendall(mode.encode())
-                m = mode
-            end = time.time() + secs
-            buf = b"x" * 65536
-            while time.time() < end:
-                if m == "D":
-                    d = conn.recv(262144)
-                    if not d:
-                        break
-                    total[i] += len(d)
-                else:
-                    conn.sendall(buf)
-                    total[i] += len(buf)
-        except (socket.timeout, TimeoutError):
-            errs[i] = "STALL" if phase == "DATA" else phase + ": timeout"
-        except Exception as e:
-            msg = str(e)
-            if phase == "DATA" and "timed out" in msg:
-                errs[i] = "STALL"
-            else:
-                errs[i] = phase + ": " + type(e).__name__ + " " + msg[:50].replace("\n", " ")
-
-    th = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
-    t0 = time.time()
-    for x in th:
-        x.start()
-    for x in th:
-        x.join(secs + idle + 12)
-    el = max(time.time() - t0 - idle, 0.001)
-    b = sum(total)
-    print(int(b * 8 / el / 1e6), b, next((e for e in errs if e), ""))
-
-def udp_echo():
-    host, port = sys.argv[2], int(sys.argv[3])
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(0.3)
-    got = 0
-    for i in range(20):
-        s.sendto(b"E" + struct.pack(">I", i) + b"p" * 60, (host, port))
-        try:
-            d, _ = s.recvfrom(2048)
-            if d[:1] == b"E":
-                got += 1
-        except socket.timeout:
-            pass
-        time.sleep(0.05)
-    print(0, got, "")
-
-def udp_blast():
-    host, port, secs = sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(1.0)
-    for _ in range(3):
-        s.sendto(b"D", (host, port))
-    seqs = set()
-    total_hint = 0
-    t0 = time.time()
-    last = t0
-    while time.time() < t0 + secs + 2:
-        try:
-            d, _ = s.recvfrom(2048)
-        except socket.timeout:
-            if seqs and time.time() - last > 1.5:
-                break
-            if not seqs and time.time() - t0 > 3:
-                break
-            continue
-        last = time.time()
-        if d[:1] == b"Z":
-            total_hint = struct.unpack(">I", d[1:5])[0]
-            break
-        seqs.add(struct.unpack(">I", d[:4])[0])
-    recv = len(seqs)
-    sent = max(total_hint, (max(seqs) + 1) if seqs else 0)
-    dur = max(time.time() - t0, 0.001)
-    loss = int(100 * (1 - recv / sent)) if sent else 100
-    print(int(recv * 1200 * 8 / dur / 1e6), recv * 1200, "" if recv and loss < 5 else "loss %d%%" % loss)
-
-{"udp-echo": udp_echo, "udp-blast": udp_blast}.get(kind, tcp_run)()
-EOF
-
-  cat > "$D/uninstall-backend.sh" <<'EOF'
-RELAY="$1"; DOMAIN="$2"; RM_XUI="$3"; RM_WEB="$4"; DIRECT="${5:-0}"
-systemctl disable --now rathole >/dev/null 2>&1 || true
-rm -f /etc/systemd/system/rathole.service /usr/local/bin/rathole /usr/local/bin/switch-relay
-rm -rf /etc/rathole
-systemctl disable --now sync-sub-path.timer >/dev/null 2>&1 || true
-rm -f /etc/systemd/system/sync-sub-path.service /etc/systemd/system/sync-sub-path.timer /usr/local/bin/sync-sub-path
-rm -f /etc/sysctl.d/99-relay-network-tuning.conf /etc/modules-load.d/relay-bbr.conf
+[Install]
+WantedBy=multi-user.target
+EOT
+cat > /usr/local/bin/chain-set-relay <<'EOT'
+#!/bin/bash
+set -e
+NEW="${1:-}"; [ -n "$NEW" ] || { echo "usage: chain-set-relay НОВЫЙ_IP_RELAY"; exit 1; }
+[[ "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "неверный IP"; exit 1; }
+python3 - "$NEW" <<'PY'
+import json, sys
+f = "/etc/chain-bridge/config.json"
+c = json.load(open(f))
+old = c["outbounds"][0]["settings"]["address"]
+c["outbounds"][0]["settings"]["address"] = sys.argv[1]
+json.dump(c, open(f, "w"), indent=2)
+print("RELAY: %s -> %s" % (old, sys.argv[1]))
+PY
+systemctl restart chain-bridge
+sleep 2
+systemctl is-active chain-bridge
+EOT
+chmod +x /usr/local/bin/chain-set-relay
 systemctl daemon-reload
-[ -n "$RELAY" ] && ufw delete allow from "$RELAY" to any port 8443 proto udp >/dev/null 2>&1 || true
-if [ "$DIRECT" = 1 ]; then
-  # если на сервере стоит KeyMaster (server4keymaster.sh), его 80/443 не закрываем
-  if [ -f /etc/keymaster-server.conf ]; then rules="8443/tcp 8443/udp"; else rules="80/tcp 443/tcp 8443/tcp 8443/udp"; fi
-  for r in $rules; do ufw delete allow "$r" >/dev/null 2>&1 || true; done
-fi
-if [ "$RM_XUI" = 1 ]; then
-  systemctl disable --now x-ui >/dev/null 2>&1 || true
-  rm -rf /usr/local/x-ui /etc/x-ui /usr/bin/x-ui /etc/systemd/system/x-ui.service
-  systemctl daemon-reload
-fi
-if [ "$RM_WEB" = 1 ]; then
-  rm -f /etc/nginx/sites-enabled/apex.conf /etc/nginx/sites-available/apex.conf
-  [ -n "$DOMAIN" ] && rm -rf "/var/www/honeypot/$DOMAIN"
-  [ -n "$DOMAIN" ] && certbot delete --cert-name "$DOMAIN" --non-interactive >/dev/null 2>&1 || true
-  rm -f /etc/letsencrypt/renewal-hooks/pre/stop-nginx.sh /etc/letsencrypt/renewal-hooks/post/start-nginx.sh
-  nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
-fi
-true
+systemctl enable chain-bridge >/dev/null 2>&1
+systemctl restart chain-bridge
+sleep 3
+systemctl is-active --quiet chain-bridge
 EOF
 
-  # fail2ban (из «Подготовить сервер») не должен банить RELAY при повторных SSH-подключениях скрипта
-  cat > "$D/f2b-ignore.sh" <<'EOF'
-IP="$1"
-J=/etc/fail2ban/jail.local
-[ -f "$J" ] || exit 0
-if grep -q '^ignoreip' "$J"; then
-  grep -q "$IP" "$J" || sed -i "s|^ignoreip.*|& $IP|" "$J"
-else
-  sed -i "/^\[sshd\]/a ignoreip = 127.0.0.1/8 ::1 $IP" "$J"
-fi
-systemctl restart fail2ban >/dev/null 2>&1 || true
+  # BACKEND: старый rathole-client (прежняя схема) — стоп, чтобы не светил подключениями к RELAY:2333
+  cat > "$D/legacy-backend.sh" <<'EOF'
+systemctl disable --now rathole >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/rathole.service
+systemctl daemon-reload
 exit 0
 EOF
 
-  # firewall для режима «Backend без relay»: порты открыты для всех
-  cat > "$D/ufw-backend-direct.sh" <<'EOF'
+  # BACKEND: firewall — только SSH (все остальные входящие закрыты)
+  cat > "$D/ufw-backend.sh" <<'EOF'
 set -e
 ports=$( {
   ss -tlnp 2>/dev/null | awk '/"sshd"/ { n = split($4, a, ":"); print a[n] }'
@@ -3639,596 +3474,95 @@ ports=$( {
   [ -n "${SSH_CONNECTION:-}" ] && echo "$SSH_CONNECTION" | awk '{ print $4 }'
 } | grep -E '^[0-9]+$' | sort -un || true )
 [ -n "$ports" ] || { echo "sshd port not found" >&2; exit 1; }
+command -v ufw >/dev/null 2>&1 || { apt-get -o DPkg::Lock::Timeout=300 install -y ufw; }
+ufw --force reset >/dev/null
+ufw default deny incoming >/dev/null
+ufw default allow outgoing >/dev/null
 for p in $ports; do ufw allow "$p/tcp"; done
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw allow 8443/tcp
-ufw allow 8443/udp
 ufw --force enable
 ufw status
 EOF
 
-  # служебная команда без switch-relay (режим без relay): только sync-sub-path и таймер
-  sed '/^cat > \/usr\/local\/bin\/switch-relay/,/^chmod +x \/usr\/local\/bin\/switch-relay/d' "$D/helper-backend.sh" > "$D/helper-sub.sh"
-
-  # тест данных через туннель: временный TCP-сервер на BACKEND 127.0.0.1:8443 отдаёт 256 КБ
-  cat > "$D/tuntest.py" <<'EOF'
-import socket
-s = socket.socket()
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", 8443))
-s.listen(1)
-s.settimeout(40)
-c, _ = s.accept()
-c.recv(4096)
-body = b"x" * 262144
-c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
-c.close()
+  # BACKEND: откат моста
+  cat > "$D/uninstall-backend.sh" <<'EOF'
+systemctl disable --now chain-bridge >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/chain-bridge.service /usr/local/bin/chain-xray /usr/local/bin/chain-set-relay
+rm -rf /etc/chain-bridge
+userdel chainbridge >/dev/null 2>&1 || true
+rm -f /etc/sysctl.d/99-relay-network-tuning.conf /etc/modules-load.d/relay-bbr.conf
+systemctl daemon-reload
+sysctl --system >/dev/null 2>&1 || true
+exit 0
 EOF
 }
 
-# ───────────────────────── RELAY: служебная команда switch-backend ─────────────────────────
-install_switch_backend() {
-  cat > /usr/local/bin/switch-backend <<'EOF'
-#!/bin/bash
-set -e
-NEW="$1"; [ -z "$NEW" ] && { echo "usage: switch-backend НОВЫЙ_IP_BACKEND"; exit 1; }
-F=/etc/ufw/before.rules
-OLD=$(sed -n '/# BEGIN relay-setup-nat/,/# END relay-setup-nat/p' $F | grep -oP '(?<=--to-destination )[0-9.]+(?=:8443)' | head -1)
-[ -z "$OLD" ] && { echo "старый BACKEND не найден в $F"; exit 1; }
-sed -i "/# BEGIN relay-setup-nat/,/# END relay-setup-nat/s/$OLD/$NEW/g" $F
-ufw route delete allow proto udp from any to $OLD port 8443 >/dev/null 2>&1 || true
-ufw route allow proto udp from any to $NEW port 8443
-ufw delete allow from $OLD to any port 2333 proto tcp >/dev/null 2>&1 || true
-ufw allow from $NEW to any port 2333 proto tcp
-ufw --force reload >/dev/null
-[ -f /root/.relay-setup.conf ] && sed -i "s/^BACKEND_IP=.*/BACKEND_IP=$NEW/" /root/.relay-setup.conf
-echo "BACKEND: $OLD -> $NEW"
-iptables -t nat -S | grep -E 'DNAT|MASQUERADE' || true
-EOF
-  chmod +x /usr/local/bin/switch-backend
+# ───────────────────────── RELAY: локальные помощники ─────────────────────────
+lscript() { local f="$1"; shift; bash -s -- "$@" < "$f"; }   # запуск скрипта на ЭТОМ сервере
+
+# прежняя схема (rathole) на RELAY
+legacy_found() {
+  [ -f /etc/systemd/system/rathole.service ] || [ -d /etc/rathole ] || [ -f "$LEGACY_MARKER" ] ||
+    grep -q '^# BEGIN relay-setup-nat$' "$UFW_BEFORE" 2>/dev/null
 }
 
-# ───────────────────────── сохранение настроек ─────────────────────────
-load_conf() {
-  [ -f "$CONF_FILE" ] || return 0
-  # shellcheck disable=SC1090
-  . "$CONF_FILE" 2>/dev/null || true
-}
-
-save_conf() {
-  : > "$CONF_FILE"; chmod 600 "$CONF_FILE"
-  cat > "$CONF_FILE" <<EOF
-RELAY_IP=${RELAY_IP:-}
-BACKEND_IP=${BACKEND_IP:-}
-BACKEND_PORT=${BACKEND_PORT:-}
-DOMAIN=${DOMAIN:-}
-EMAIL=${EMAIL:-}
-SECRET=${SECRET:-}
-KEY_PATH=${KEY_PATH:-}
-EOF
-  chmod 600 "$CONF_FILE"
-}
-
-cleanup() {
-  [ -n "${TMPD:-}" ] && [ -d "$TMPD" ] && [ "${IPERF_STARTED:-0}" = 1 ] && { iperf_stop; }
-  [ -n "${TMPD:-}" ] && [ -d "$TMPD" ] && {
-    [ -n "${SSH_OPTS+x}" ] && ssh "${SSH_OPTS[@]}" -O exit "root@${BACKEND_IP:-x}" >/dev/null 2>&1 || true
-    rm -rf "$TMPD"
-  }
-  printf '%s' "$R"
-}
-
-# ───────────────────────── основной сценарий ─────────────────────────
-preflight() {
-  # ── автопроверки окружения (без вопросов)
-  echo "${B}Проверка окружения${R}"
-  thin
-  # shellcheck disable=SC1091
-  . /etc/os-release 2>/dev/null || true
-  if [ "${ID:-}" = "ubuntu" ]; then
-    if version_ge "${VERSION_ID:-0}" 22.04; then ok "ОС: ${PRETTY_NAME:-ubuntu}"; else die "нужна Ubuntu 22.04 или новее (найдена ${VERSION_ID:-?})"; fi
-  elif [ "${ID:-}" = "debian" ]; then
-    warn "ОС ${PRETTY_NAME:-debian}: скрипт проверен на Ubuntu 22.04+, на Debian 12+ должен работать"
-  else
-    warn "ОС ${PRETTY_NAME:-?}: скрипт рассчитан на Ubuntu 22.04+"
-  fi
-  ensure_tools || die "не удалось установить базовые утилиты (curl, dig, ssh, openssl)"
-  RELAY_IP=$(detect_relay_ip)
-  valid_ip "$RELAY_IP" || die "не удалось определить внешний IP этого сервера"
-  ok "IP RELAY: $RELAY_IP"
-  load_conf
-
-}
-
-# ───────────────────────── подготовка сервера (бывший preServer.sh) ─────────────────────────
-# Выполняется на ЭТОМ сервере. PREP_ROOT — только для тестов (префикс путей).
-PR="${PREP_ROOT:-}"
-PREP_MARKER_DIR="$PR/var/lib/preserver"
-PREP_MARKER_FILE="$PREP_MARKER_DIR/.preserver-ran"   # тот же путь, что у автономного preServer.sh
-
-# Убираем противоречащие настройки в drop-in конфигах sshd: Include стоит в начале sshd_config,
-# и sshd берёт ПЕРВОЕ встреченное значение — правки в основном файле иначе молча игнорируются.
-neutralize_sshd_dropins() {
-  local f
-  for f in "$PR"/etc/ssh/sshd_config.d/*.conf; do
-    [ -f "$f" ] || continue
-    [ "$(basename "$f")" = "99-preserver.conf" ] && continue
-    sed -i -E 's/^[[:space:]]*(Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication)\b/# [preServer disabled] \1/' "$f"
-    if ! grep -qE '^[^#[:space:]]' "$f" 2>/dev/null; then
-      rm -f "$f"
-      info "удалён пустой drop-in конфиг: $f"
-    fi
+relay_legacy_cleanup() {
+  local dest ip
+  dest=$(sed -n '/# BEGIN relay-setup-nat/,/# END relay-setup-nat/p' "$UFW_BEFORE" 2>/dev/null | grep -oP '(?<=--to-destination )[0-9.]+(?=:8443)' | head -n1)
+  systemctl disable --now rathole >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/rathole.service /usr/local/bin/rathole /usr/local/bin/switch-backend
+  rm -rf /etc/rathole
+  systemctl daemon-reload
+  for ip in $(ufw status 2>/dev/null | awk '/2333\/tcp/ { print $NF }' | grep -E '^[0-9.]+$'); do
+    ufw delete allow from "$ip" to any port 2333 proto tcp >/dev/null 2>&1 || true
   done
-}
-
-disable_ssh_socket_activation() {
-  if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.socket'; then
-    if systemctl is-enabled ssh.socket &>/dev/null || systemctl is-active ssh.socket &>/dev/null; then
-      systemctl stop ssh.socket >/dev/null 2>&1 || true
-      systemctl disable ssh.socket >/dev/null 2>&1 || true
-      info "обнаружена socket activation (ssh.socket) — отключена, чтобы смена порта применялась без перезагрузки"
-    fi
-  fi
-}
-
-verify_and_restart_sshd() {
-  local want_port="$1" want_pwauth="$2" want_rootlogin="$3"
-  mkdir -p /run/sshd
-  chmod 0755 /run/sshd
-
-  local eff
-  eff="$(sshd -T 2>&1)" || {
-    fail "sshd -T завершился с ошибкой, перезапуск отменён"
-    printf '    Вывод sshd -T:\n%s\n' "$eff"
-    return 1
-  }
-
-  local eff_port eff_pwauth eff_rootlogin eff_ports
-  eff_ports=$(awk '/^port /{print $2}' <<< "$eff")
-  eff_port=$(tr '\n' ',' <<< "$eff_ports")
-  eff_port="${eff_port%,}"
-  eff_pwauth=$(awk '/^passwordauthentication /{print $2; exit}' <<< "$eff")
-  eff_rootlogin=$(awk '/^permitrootlogin /{print $2; exit}' <<< "$eff")
-
-  local nw="$want_rootlogin" ne="$eff_rootlogin"
-  [ "$nw" = "prohibit-password" ] && nw="without-password"
-  [ "$ne" = "prohibit-password" ] && ne="without-password"
-
-  if ! grep -qx "$want_port" <<< "$eff_ports" || [ "$eff_pwauth" != "$want_pwauth" ] || [ "$ne" != "$nw" ]; then
-    fail "эффективный конфиг sshd НЕ совпадает с ожидаемым (port=$eff_port pwauth=$eff_pwauth rootlogin=$eff_rootlogin)"
-    echo "    Проверьте /etc/ssh/sshd_config.d/*.conf вручную. Перезапуск sshd ОТМЕНЁН."
-    return 1
-  fi
-
-  local svc="ssh"
-  systemctl list-unit-files | grep -q "sshd.service" && svc="sshd"
-
-  disable_ssh_socket_activation
-
-  # остановка ssh.socket/ssh.service удаляет /run/sshd — создаём заново перед sshd -t
-  mkdir -p /run/sshd
-  chmod 0755 /run/sshd
-
-  if ! sshd -t 2>&1; then
-    fail "sshd -t: синтаксическая ошибка, перезапуск отменён"
-    return 1
-  fi
-
-  systemctl enable "$svc" >/dev/null 2>&1 || true
-  systemctl restart "$svc" 2>/dev/null || systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-  ok "sshd перезапущен, эффективный конфиг подтверждён (port=$eff_port pwauth=$eff_pwauth rootlogin=$eff_rootlogin)"
+  for ip in 8443/tcp 8443/udp; do ufw delete allow "$ip" >/dev/null 2>&1 || true; done
+  [ -n "$dest" ] && { ufw route delete allow proto udp from any to "$dest" port 8443 >/dev/null 2>&1 || true; }
+  [ -f "$UFW_BEFORE" ] && sed -i '/^# BEGIN relay-setup-nat$/,/^# END relay-setup-nat$/d' "$UFW_BEFORE"
+  rm -f /etc/sysctl.d/99-relay-forward.conf "$LEGACY_MARKER" "$LEGACY_CONF"
+  ufw --force reload >/dev/null 2>&1 || true
   return 0
 }
 
-prep_rollback() {
-  local cfg="$PR/etc/ssh/sshd_config" old_port=""
-  echo
-  echo "${B}Откат настроек подготовки сервера${R}"
-  thin
-  [ -f "$PREP_MARKER_FILE" ] && old_port="$(awk -F= '/^ssh_port=/{print $2; exit}' "$PREP_MARKER_FILE" 2>/dev/null || true)"
-
-  mkdir -p /run/sshd
-  chmod 0755 /run/sshd
-
-  if [ -f "$cfg" ]; then
-    cp "$cfg" "${cfg}.bak.$(date +%s)"
-    neutralize_sshd_dropins
-
-    if grep -qE '^\s*#?\s*Port\b' "$cfg"; then
-      sed -i -E 's/^\s*#?\s*Port\b.*/Port 22/' "$cfg"
-    else
-      echo "Port 22" >> "$cfg"
-    fi
-    sed -i -E 's/^\s*#?\s*PermitRootLogin\b.*/PermitRootLogin yes/' "$cfg"
-    sed -i -E 's/^\s*#?\s*PasswordAuthentication\b.*/PasswordAuthentication yes/' "$cfg"
-    sed -i -E 's/^\s*#?\s*PrintMotd\b.*/PrintMotd yes/' "$cfg"
-    sed -i -E 's/^\s*#?\s*PrintLastLog\b.*/PrintLastLog yes/' "$cfg"
-
-    if passwd -S root 2>/dev/null | awk '{print $2}' | grep -qE '^(L|LK|NP)$'; then
-      warn "у root не задан пароль. Вход по паролю не заработает без: passwd root"
-    fi
-
-    if command -v ufw &>/dev/null; then
-      ufw allow 22/tcp comment 'SSH (preServer rollback)' >/dev/null 2>&1 || true
-      if [[ "$old_port" =~ ^[0-9]+$ ]] && [ "$old_port" != "22" ]; then
-        ufw --force delete allow "${old_port}/tcp" >/dev/null 2>&1 || true
-        info "правило ufw для порта $old_port (подготовка) удалено, остальные правила не тронуты"
-      fi
-    fi
-
-    verify_and_restart_sshd 22 yes yes || warn "порт/пароль отредактированы, но перезапуск не выполнен — проверьте вручную!"
-  fi
-
-  if dpkg -s fail2ban &>/dev/null; then
-    systemctl stop fail2ban >/dev/null 2>&1 || true
-    systemctl disable fail2ban >/dev/null 2>&1 || true
-    apt-get purge -y fail2ban >/dev/null 2>&1 || true
-    rm -f "$PR/etc/fail2ban/jail.local"
-    ok "fail2ban удалён"
-  fi
-
-  if dpkg -s fastfetch &>/dev/null; then
-    apt-get purge -y fastfetch >/dev/null 2>&1 || true
-    ok "fastfetch удалён"
-  elif command -v fastfetch &>/dev/null; then
-    rm -f "$(command -v fastfetch)"
-  fi
-  rm -rf "$PR/root/.config/fastfetch"
-  rm -f "$PR/etc/profile.d/fastfetch-ssh.sh"
-  if [ -d "$PR/etc/update-motd.d" ]; then
-    chmod +x "$PR"/etc/update-motd.d/* 2>/dev/null || true
-  fi
-
-  rm -f "$PR/usr/local/sbin/daily-security-update.sh"
-  rm -f "$PR/etc/cron.d/daily-security-update"
-  rm -f "$PREP_MARKER_FILE"
-
-  echo
-  ok "откат завершён"
-  [ -f "$MARKER_FILE" ] && info "установка туннеля/панели этим откатом не затрагивается (для неё — пункт «Отменить установку»)"
-  return 0
-}
-
-prep_fastfetch_ppa() {
-  add-apt-repository -y ppa:zhangsongcui3371/fastfetch &&
-    apt-get -o DPkg::Lock::Timeout=300 update -qq &&
-    apt-get -o DPkg::Lock::Timeout=300 install -y fastfetch
-}
-
-prep_fastfetch_deb() {
-  local arch url tmp
-  arch=$(dpkg --print-architecture)
-  url=$(curl -fsSL "https://api.github.com/repos/fastfetch-cli/fastfetch/releases/latest" |
-    grep "browser_download_url" | grep "linux-${arch}.deb" | head -1 | cut -d '"' -f 4) || true
-  [ -n "$url" ] || return 1
-  tmp=$(mktemp)
-  curl -fsSL "$url" -o "$tmp"
-  dpkg -i "$tmp" || apt-get install -f -y
-  rm -f "$tmp"
-}
-
-run_prepare() {
-  STEP=0; TOTAL=7
-  if [ -f "$PREP_MARKER_FILE" ]; then
-    echo
-    warn "обнаружена метка предыдущей подготовки сервера:"
-    sed 's/^/     /' "$PREP_MARKER_FILE"
-    echo
-    if confirm "Выполнить откат настроек подготовки?" n; then
-      prep_rollback
-    else
-      echo "  Отменено."
-    fi
-    return 0
-  fi
-
-  echo
-  echo "${B}Подготовка сервера${R}"
-  thin
-  info "обновление системы, fail2ban, SSH (свой порт, вход только по ключу), автообновления, fastfetch"
-  info "выполняется на ЭТОМ сервере: запустите скрипт отдельно на RELAY и на BACKEND"
-  [ -f "$MARKER_FILE" ] && warn "установка туннеля/панели уже выполнена: после смены SSH-порта укажите новый порт при следующих запусках"
-  confirm "Начать подготовку?" || { echo "  Отменено."; return 0; }
-
-  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 APT_LISTCHANGES_FRONTEND=none
-  export PYTHONWARNINGS="ignore::SyntaxWarning"
-  local APT_OPTS=(-o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
-
-  # [1] пакетная база
-  section "Проверка пакетной базы"
-  if [ -d "$PR/var/lib/dpkg/updates" ] && ls "$PR"/var/lib/dpkg/updates/* >/dev/null 2>&1; then
-    warn "обнаружены незавершённые операции dpkg, восстанавливаю..."
-    if pgrep -x dpkg >/dev/null 2>&1 || pgrep -x apt-get >/dev/null 2>&1; then
-      info "apt/dpkg сейчас занят другим процессом — блокировки не трогаю, ждём освобождения"
-    else
-      rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock /var/lib/apt/lists/lock
-    fi
-    step_run -s "dpkg --configure -a" dpkg --configure -a --force-confdef --force-confold
-    rm -f "$PR"/var/lib/dpkg/updates/*
-    step_run -s "dpkg --configure -a (повторно)" dpkg --configure -a
-  fi
-  ok "пакетная база в порядке"
-
-  # [2] обновление системы
-  section "Обновление системы"
-  step_run "Обновление списков пакетов" apt-get "${APT_OPTS[@]}" update -qq || die "apt update не удался"
-  step_run "Обновление пакетов (upgrade)" apt-get "${APT_OPTS[@]}" upgrade -y || die "apt upgrade не удался"
-  step_run "Обновление дистрибутива (dist-upgrade, лимит 30 минут)" timeout --foreground 1800 apt-get "${APT_OPTS[@]}" dist-upgrade -y || {
-    rc=$?
-    if [ "$rc" -eq 124 ]; then die "apt dist-upgrade завис или превысил лимит 30 минут. Проверьте /var/log/apt/term.log и /var/log/dpkg.log; возможен незавершённый dpkg или запрос действия.";
-    else die "apt dist-upgrade завершился с ошибкой (код $rc). Подробности — в $LOG и /var/log/apt/term.log"; fi
-  }
-  step_run "Удаление ненужных пакетов" apt-get "${APT_OPTS[@]}" autoremove -y || warn "autoremove не выполнен"
-
-  # [3] утилиты и fail2ban
-  section "Установка утилит"
-  local PACKAGES=(unattended-upgrades fail2ban htop iotop nethogs curl wget git cron ripgrep)
-  local missing=() pkg
-  for pkg in "${PACKAGES[@]}"; do
-    dpkg -s "$pkg" &>/dev/null || missing+=("$pkg")
+# порты 80/443 не должны быть заняты чужими процессами (nginx свой — допустим)
+relay_port_conflicts() {
+  local bad="" p owner
+  for p in 80 443; do
+    owner=$(ss -tlnp 2>/dev/null | awk -v p=":$p" '$4 ~ p"$" { print $0 }' | grep -v nginx | head -n1)
+    [ -n "$owner" ] && bad="$bad $p"
   done
-  if [ ${#missing[@]} -gt 0 ]; then
-    step_run "Установка пакетов: ${missing[*]}" apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "${missing[@]}" || die "не удалось установить пакеты"
-  else
-    ok "все утилиты уже установлены"
-  fi
-  mkdir -p "$PR/etc/fail2ban"
-  cat > "$PR/etc/fail2ban/jail.local" << 'F2BEOF'
-[sshd]
-enabled = true
-port = 1119
-backend = systemd
-maxretry = 5
-bantime = 1h
-findtime = 10m
-F2BEOF
-  systemctl enable fail2ban >/dev/null 2>&1 || true
-  systemctl restart fail2ban >/dev/null 2>&1 || true
-  systemctl enable cron >/dev/null 2>&1 || true
-  systemctl start cron >/dev/null 2>&1 || true
-  ok "fail2ban и утилиты настроены"
-
-  # [4] SSH
-  section "Настройка SSH"
-  mkdir -p /run/sshd
-  chmod 0755 /run/sshd
-  local cfg="$PR/etc/ssh/sshd_config" in_port ssh_port key tmpf p
-  while true; do
-    ask in_port "Введите внутренний порт SSH" "1119"
-    ssh_port="$in_port"
-    if [[ "$ssh_port" =~ ^[0-9]+$ ]] && [ "$ssh_port" -ge 1 ] && [ "$ssh_port" -le 65535 ]; then
-      if command -v ss &>/dev/null && ss -tulnp | grep ":${ssh_port} " | grep -vq sshd; then
-        warn "порт $ssh_port занят."
-        confirm "Продолжить?" && break || continue
-      fi
-      break
-    else
-      fail "порт должен быть числом 1-65535"
-    fi
-  done
-  ok "выбран порт SSH: $ssh_port"
-
-  while true; do
-    rd -r -p "${B}?${R} Введите SSH публичный ключ: " key
-    if [[ "$key" =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521)\  ]]; then
-      break
-    else
-      fail "неверный формат ключа"
-    fi
-  done
-  ok "ключ принят"
-
-  if [ -f "$cfg" ]; then
-    info "sshd будет слушать только порт: $ssh_port (старые порты, включая 22, не сохраняются)"
-    cp "$cfg" "${cfg}.bak.$(date +%s)"
-    ls -1t "${cfg}".bak.* 2>/dev/null | tail -n +6 | xargs -r rm -f
-    neutralize_sshd_dropins
-
-    # Port-строка — в начало файла (чтобы не попасть внутрь блока Match)
-    sed -i -E '/^[[:space:]]*#?[[:space:]]*Port[[:space:]]/d' "$cfg"
-    tmpf=$(mktemp)
-    echo "Port $ssh_port" | cat - "$cfg" > "$tmpf"
-    cat "$tmpf" > "$cfg"
-    rm -f "$tmpf"
-
-    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "$cfg"
-    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$cfg"
-    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$cfg"
-    sed -i 's/^#\?UseDNS.*/UseDNS no/' "$cfg"
-
-    mkdir -p "$PR/root/.ssh" && chmod 700 "$PR/root/.ssh"
-    grep -qF "$key" "$PR/root/.ssh/authorized_keys" 2>/dev/null || echo "$key" >> "$PR/root/.ssh/authorized_keys"
-    chmod 600 "$PR/root/.ssh/authorized_keys"
-
-    if [ -f "$PR/etc/fail2ban/jail.local" ]; then
-      sed -i "s/^port = .*/port = $ssh_port/" "$PR/etc/fail2ban/jail.local"
-      systemctl restart fail2ban >/dev/null 2>&1 || true
-    fi
-
-    if command -v ufw &>/dev/null; then
-      ufw allow "${ssh_port}/tcp" comment 'SSH (preServer)' >/dev/null 2>&1 || true
-      ok "порт $ssh_port открыт в ufw"
-    fi
-
-    verify_and_restart_sshd "$ssh_port" no prohibit-password || die "ошибка применения настроек SSH: проверьте конфиги вручную"
-  else
-    warn "файл $cfg не найден — настройка SSH пропущена"
-  fi
-
-  # [5] автообновления
-  section "Автообновления"
-  local UPDATE_SCRIPT="$PR/usr/local/sbin/daily-security-update.sh"
-  mkdir -p "$(dirname "$UPDATE_SCRIPT")" "$PR/etc/cron.d"
-  cat > "$UPDATE_SCRIPT" << 'EOF'
-#!/bin/bash
-export DEBIAN_FRONTEND=noninteractive
-export NEEDRESTART_MODE=a
-LOG_FILE="/var/log/auto-update.log"
-{
-    echo "===== $(date '+%F %T') start ====="
-    apt-get -o DPkg::Lock::Timeout=600 update -qq
-    apt-get -o DPkg::Lock::Timeout=600 upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-    apt-get autoremove -y
-    echo "===== $(date '+%F %T') done ====="
-} >> "$LOG_FILE" 2>&1
-EOF
-  chmod 0755 "$UPDATE_SCRIPT"
-  cat > "$PR/etc/cron.d/daily-security-update" << EOF
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-0 3 * * * root /usr/local/sbin/daily-security-update.sh
-EOF
-  chmod 0644 "$PR/etc/cron.d/daily-security-update"
-  systemctl is-active --quiet cron || systemctl start cron >/dev/null 2>&1 || true
-  ok "автообновления настроены (ежедневно в 03:00)"
-
-  # [6] fastfetch
-  section "Fastfetch"
-  local ff=false
-  if command -v fastfetch &>/dev/null; then
-    ff=true
-    ok "fastfetch уже установлен"
-  else
-    if command -v add-apt-repository &>/dev/null; then
-      step_run -s "Установка Fastfetch (PPA)" prep_fastfetch_ppa && ff=true
-    fi
-    if ! $ff; then
-      step_run -s "Установка Fastfetch (.deb с GitHub)" prep_fastfetch_deb && ff=true
-    fi
-  fi
-
-  if $ff; then
-    mkdir -p "$PR/root/.config/fastfetch"
-    cat > "$PR/root/.config/fastfetch/logo.txt" << 'ASCII_LOGO'
-+------------------------------+
-| +--------------------------+ |
-| | +----------------------+ | |
-| | | +------------------+ | | |
-| | | | +--------------+ | | | |
-| | | | | +----------+ | | | | |
-| | | | | |          | | | | | |
-| | | | | |    ●●    | | | | | |
-| | | | | |          | | | | | |
-| | | | | +----------+ | | | | |
-| | | | +--------------+ | | | |
-| | | +------------------+ | | |
-| | +----------------------+ | |
-| +--------------------------+ |
-+------------------------------+
-ASCII_LOGO
-
-    cat > "$PR/root/.config/fastfetch/config.jsonc" << 'FFCONFIG'
-{
-    "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
-    "logo": {
-        "type": "file",
-        "source": "/root/.config/fastfetch/logo.txt",
-        "padding": { "top": 1, "left": 2, "right": 4 }
-    },
-    "display": {
-        "color": { "keys": "blue", "title": "bright_magenta", "separator": "white" }
-    },
-    "modules": [
-        { "type": "custom", "format": "\u001b[97m┌──────────────────────────────────────Hardware──────────────────────────────────────┐\u001b[0m" },
-        { "type": "host", "key": "▣ PC : ", "keyColor": "green" },
-        { "type": "cpu", "key": "   ├▢ CPU: ", "keyColor": "green" },
-        { "type": "cpuusage", "key": "   ├▢ Usage: ", "keyColor": "green" },
-        { "type": "loadavg", "key": "   ├▢ Load: ", "keyColor": "green" },
-        { "type": "gpu", "key": "   ├▢ GPU: ", "keyColor": "green" },
-        { "type": "memory", "key": "   ├▢ RAM: ", "keyColor": "green" },
-        { "type": "swap", "key": "   ├▢ Swap: ", "keyColor": "green" },
-        { "type": "disk", "key": "   ├▢ Disk: ", "keyColor": "green" },
-        { "type": "custom", "format": "\u001b[97m└────────────────────────────────────────────────────────────────────────────────────┘\u001b[0m" },
-        "break",
-        { "type": "custom", "format": "\u001b[97m┌──────────────────────────────────────Software──────────────────────────────────────┐\u001b[0m" },
-        { "type": "os", "key": "▣ OS : ", "keyColor": "yellow" },
-        { "type": "kernel", "key": "   ├▢ Kernel: ", "keyColor": "yellow" },
-        { "type": "packages", "key": "   ├▢ Packages: ", "keyColor": "yellow" },
-        { "type": "shell", "key": "   ├▢ Shell: ", "keyColor": "yellow" },
-        { "type": "custom", "format": "\u001b[97m└────────────────────────────────────────────────────────────────────────────────────┘\u001b[0m" },
-        "break",
-        { "type": "custom", "format": "\u001b[97m┌───────────────────────────────────────Network──────────────────────────────────────┐\u001b[0m" },
-        { "type": "localip", "key": "▣ IP : ", "keyColor": "cyan" },
-        { "type": "command", "key": "   └▢ Location: ", "keyColor": "cyan", "text": "curl -s --max-time 2 https://ipinfo.io/city" },
-        { "type": "custom", "format": "\u001b[97m└────────────────────────────────────────────────────────────────────────────────────┘\u001b[0m" },
-        "break",
-        { "type": "uptime", "key": "▣ UP : ", "keyColor": "magenta" },
-        { "type": "datetime", "key": "   └⏰ : ", "keyColor": "magenta" },
-        { "type": "colors", "paddingLeft": 2, "symbol": "circle" }
-    ]
-}
-FFCONFIG
-
-    if [ -d "$PR/etc/update-motd.d" ]; then
-      chmod -x "$PR"/etc/update-motd.d/* 2>/dev/null || true
-    fi
-    truncate -s 0 "$PR/etc/motd" 2>/dev/null || true
-    if [ -f "$cfg" ]; then
-      if grep -q "^PrintMotd" "$cfg" 2>/dev/null; then
-        sed -i 's/^PrintMotd.*/PrintMotd no/' "$cfg"
-      else
-        echo "PrintMotd no" >> "$cfg"
-      fi
-    fi
-
-    mkdir -p "$PR/etc/profile.d"
-    cat > "$PR/etc/profile.d/fastfetch-ssh.sh" << 'PROFEOF'
-if [ -n "${FASTFETCH_RAN:-}" ]; then return 0; fi
-if [ -n "$SSH_CONNECTION" ] && command -v fastfetch >/dev/null 2>&1; then
-    fastfetch
-    export FASTFETCH_RAN=1
-fi
-PROFEOF
-    chmod 0644 "$PR/etc/profile.d/fastfetch-ssh.sh"
-    ok "fastfetch настроен"
-  fi
-
-  # [7] итог
-  section "Завершение"
-  ok "подготовка сервера завершена"
-  kv "SSH port" "${ssh_port:-пропущено}"
-  kv "Fail2ban" "активен"
-  kv "Fastfetch" "$($ff && echo 'установлен' || echo 'пропущен')"
-  kv "Log" "$LOG"
-  mkdir -p "$PREP_MARKER_DIR"
-  {
-    echo "version=$VERSION"
-    echo "ran_at=$(date '+%F %T')"
-    echo "ssh_port=${ssh_port:-skipped}"
-  } > "$PREP_MARKER_FILE"
-  warn "проверьте вход по ключу на новом порту ($ssh_port) ДО перезагрузки!"
-
-  if [ -z "$PR" ] && [ -t 1 ] && [ -e /dev/tty ]; then
-    echo
-    if confirm "Перезагрузить сейчас?" n; then
-      reboot
-    fi
-  fi
-  return 0
+  printf '%s' "$bad"
 }
 
-check_reinstall() {
-  if [ -f "$MARKER_FILE" ]; then
-    warn "установка уже выполнялась (метка: $(marker_get INSTALLED_AT), статус: $(marker_get STATUS))"
-    confirm "Удалить всё и установить заново?" n || { echo "  Отменено."; exit 0; }
-    do_uninstall || exit 0
-    SECRET=""   # новая установка — новый ключ туннеля
-  fi
+relay_firewall() {
+  local p ports
+  ports=$(ssh_ports)
+  [ -n "$ports" ] || { echo "SSH-порт RELAY не определён: firewall не включаю, чтобы не потерять доступ" >&2; return 1; }
+  for p in $ports; do ufw allow "$p/tcp" || return 1; done
+  ufw allow 80/tcp && ufw allow 443/tcp || return 1
+  ufw default deny incoming >/dev/null && ufw default allow outgoing >/dev/null || return 1
+  ufw --force enable >/dev/null && ufw --force reload >/dev/null
 }
 
-# установка 3x-ui и вывод данных панели (глобальные xu xp xw xt)
+# 3x-ui на RELAY: GitHub из РФ бывает недоступен — тогда качаем через BACKEND (SOCKS поверх SSH)
 xui_stage() {
-  step_run "Установка 3x-ui (SQLite, порт $PANEL_PORT, панель на 127.0.0.1)" rscript "$TMPD/xui.sh" "$PANEL_PORT" || die "3x-ui не установился"
-  local res
-  res=$(bk 'cat /etc/x-ui/install-result.env' 2>>"$LOG")
-  getv() { printf '%s\n' "$res" | sed -n "s/^$1=//p" | head -1 | sed "s/^'//; s/'$//"; }
+  local proxy="" res rc=0
+  if ! curl -fsS --max-time 12 -o /dev/null -I https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh >>"$LOG" 2>&1; then
+    warn "GitHub с RELAY недоступен напрямую: 3x-ui загрузится через BACKEND (SOCKS поверх SSH)"
+    if ssh "${SSH_OPTS[@]}" -O forward -D 127.0.0.1:1080 "root@$BACKEND_IP" >>"$LOG" 2>&1; then proxy="socks5h://127.0.0.1:1080"; fi
+  fi
+  step_run "Установка 3x-ui (SQLite, порт $PANEL_PORT, панель на 127.0.0.1)" env ALL_PROXY="$proxy" bash "$TMPD/xui.sh" "$PANEL_PORT" || rc=1
+  [ -n "$proxy" ] && { ssh "${SSH_OPTS[@]}" -O cancel -D 127.0.0.1:1080 "root@$BACKEND_IP" >>"$LOG" 2>&1 || true; }
+  [ $rc -eq 0 ] || die "3x-ui не установился"
+  res=$(cat /etc/x-ui/install-result.env 2>>"$LOG")
+  getv() { printf '%s\n' "$res" | sed -n "s/^$1=//p" | head -n1 | sed "s/^'//; s/'$//"; }
   xu=$(getv XUI_USERNAME); xp=$(getv XUI_PASSWORD); xw=$(getv XUI_WEB_BASE_PATH); xt=$(getv XUI_API_TOKEN)
   if ! { [ -n "$xu" ] && [ -n "$xp" ] && [ -n "$xw" ]; }; then
     warn "файл данных установщика не найден (панель уже была установлена?) — задаю новые данные входа"
     xu=$(openssl rand -hex 5); xp=$(openssl rand -hex 5); xw=$(openssl rand -hex 9)
-    bk "/usr/local/x-ui/x-ui setting -username '$xu' -password '$xp' -port $PANEL_PORT -webBasePath '$xw' -listenIP 127.0.0.1 && systemctl restart x-ui" >>"$LOG" 2>&1 || die "не удалось задать данные панели"
-    xt=$(bk "/usr/local/x-ui/x-ui setting -getApiToken" 2>>"$LOG" | grep -Eo 'apiToken: .+' | awk '{print $2}')
+    /usr/local/x-ui/x-ui setting -username "$xu" -password "$xp" -port "$PANEL_PORT" -webBasePath "$xw" -listenIP 127.0.0.1 >>"$LOG" 2>&1 &&
+      systemctl restart x-ui >>"$LOG" 2>&1 || die "не удалось задать данные панели"
   fi
+  [ -n "$xt" ] || xt=$(/usr/local/x-ui/x-ui setting -getApiToken 2>>"$LOG" | grep -Eo 'apiToken: .+' | awk '{print $2}')
   echo
   rule
   printf '  %sPanel Installation Complete!%s\n' "$GRN" "$R"
@@ -4241,213 +3575,78 @@ xui_stage() {
   printf '%sAccess URL:  http://127.0.0.1:%s/%s%s\n' "$GRN" "$PANEL_PORT" "$xw" "$R"
   printf '%sAPI Token:   %s%s\n' "$GRN" "${xt:-—}" "$R"
   rule
-
 }
 
-backend_os_check() {
-  local bos
-  bos=$(bk '. /etc/os-release; echo "$ID $VERSION_ID"' 2>>"$LOG")
-  case "$bos" in
-    ubuntu\ *) if version_ge "${bos#ubuntu }" 22.04; then ok "ОС: Ubuntu ${bos#ubuntu }"; else die "нужна Ubuntu 22.04 или новее (найдена ${bos#ubuntu })"; fi ;;
-    debian\ *) warn "ОС: $bos (скрипт рассчитан на Ubuntu 22.04+)" ;;
-    *) warn "ОС не определена: ${bos:-?}" ;;
-  esac
+# инбаунды и маршрутизация в 3x-ui; результат: CHAIN_USER_ID, CHAIN_SUB_ID, TUNNEL_UUID
+chain_inbounds() {
+  local out
+  [ -n "${xt:-}" ] || return 1
+  out=$(python3 "$TMPD/chain-inbounds.py" "http://127.0.0.1:$PANEL_PORT/${xw#/}" "$xt" "$DOMAIN" "$USER_PATH" "$TUNNEL_PATH" "$CHAIN_USER_PORT" "$CHAIN_TUNNEL_PORT" 2>>"$LOG") || return 1
+  CHAIN_USER_ID=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["user_id"])') || return 1
+  CHAIN_SUB_ID=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sub_id"])') || return 1
+  TUNNEL_UUID=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tunnel_id"])') || return 1
+  [ -n "$CHAIN_USER_ID" ] && [ -n "$TUNNEL_UUID" ]
 }
 
-# ───────────────────────── режим 1: Backend без relay ─────────────────────────
-run_install_backend() {
-  INSTALL_KIND="backend"
-  STEP=0; TOTAL=10
-  check_reinstall
-  STEP=0; TOTAL=10
-  SECRET="${SECRET:-}"
-
-  echo
-  echo "${B}Параметры${R}"
-  thin
-  while true; do
-    ask BACKEND_IP "IP сервера (этот сервер или удалённый, настраивается по SSH)" ""
-    valid_ip "$BACKEND_IP" && break
-    fail "неверный IP"
-    BACKEND_IP=""
-  done
-  LOCAL_BACKEND=0
-  if [ "$BACKEND_IP" = "$RELAY_IP" ]; then
-    LOCAL_BACKEND=1
-    ok "это текущий сервер: установка выполняется локально (без SSH)"
-  else
-    while true; do
-      ask BACKEND_PORT "SSH-порт сервера" "${BACKEND_PORT:-1119}"
-      valid_port "$BACKEND_PORT" && break
-      fail "неверный порт"
-    done
-    [ -n "${KEY_FILE:-}" ] || read_key
-  fi
-  while true; do
-    ask DOMAIN "Домен панели (A-запись → IP сервера)" "${DOMAIN:-}"
-    valid_dom "$DOMAIN" && break
-    fail "неверный домен"
-    DOMAIN=""
-  done
-  EMAIL="admin@$DOMAIN"   # e-mail для Let's Encrypt: не спрашиваем
-  DNS_TARGET="$BACKEND_IP"
-  echo
-  dns_check
-  DNS_OK=$?
-
-  echo
-  rule
-  printf '  %sПлан установки (Backend без relay)%s\n' "$B" "$R"
-  rule
-  if [ $LOCAL_BACKEND -eq 1 ]; then kv "Server" "$BACKEND_IP (этот сервер, локально)"; else kv "Server" "$BACKEND_IP (SSH :$BACKEND_PORT)"; fi
-  kv "Domain" "$DOMAIN"
-  kv "Honeypot" "https://$DOMAIN/ → сайт в /var/www/honeypot/$DOMAIN"
-  kv "3x-ui panel" "https://$DOMAIN/<WebBasePath> → 127.0.0.1:$PANEL_PORT"
-  kv "E-mail" "$EMAIL"
-  kv "Ports" "открываются 80, 443, 8443/tcp, 8443/udp; SSH сохраняется (ufw)"
-  kv "Panel" "3x-ui на 127.0.0.1:$PANEL_PORT (SQLite), nginx + Let's Encrypt"
-  kv "Network" "BBR, буферы TCP/UDP, MTU probing"
-  rule
-  echo
-  confirm "Всё верно, начать установку?" || { echo "  Отменено."; exit 0; }
-  write_marker in-progress
-  make_remote_scripts
-
-  # [1]
-  section "Подключение к серверу"
-  if [ $LOCAL_BACKEND -eq 1 ]; then ok "локальный режим (SSH не нужен)"; else ssh_connect; fi
-  backend_os_check
-
-  # [2]
-  section "Сетевая оптимизация"
-  step_run "BBR, буферы TCP/UDP, MTU probing, keepalive" rscript "$TMPD/tune.sh" || warn "твики применены не полностью"
-  local cc
-  cc=$(bk 'sysctl -n net.ipv4.tcp_congestion_control' 2>>"$LOG")
-  if [ "$cc" = bbr ]; then ok "congestion control = bbr"; else warn "congestion control = ${cc:-?} (BBR недоступен: ядро или виртуализация)"; fi
-
-  # [3]
-  section "Пакеты и обновление системы"
-  step_run "apt update/upgrade, nginx, certbot, ufw" rscript "$TMPD/pkgs.sh" || die "не удалось подготовить сервер"
-
-  # [4] firewall до выпуска сертификата
-  section "Firewall"
-  step_run "ufw: SSH сохранён, открыты 80, 443, 8443/tcp, 8443/udp" rscript "$TMPD/ufw-backend-direct.sh" || die "не удалось настроить firewall"
-
-  # [5]
-  section "3x-ui"
-  xui_stage
-
-  # [6] Полноценный отдельный этап установки Honeypot
-  section "Отдельный этап: установка и настройка Honeypot"
-  info "Публичный сайт: https://$DOMAIN/"
-  info "Каталог сайта: /var/www/honeypot/$DOMAIN"
-  info "Панель 3x-ui будет доступна отдельно: https://$DOMAIN/<WebBasePath>"
-  step_run "Генерация файлов Honeypot" rscript "$TMPD/honeypot.sh" "$DOMAIN" || die "не удалось сгенерировать Honeypot"
-  if bk "test -s '/var/www/honeypot/$DOMAIN/index.html'" 2>>"$LOG"; then
-    ok "Главная страница создана: /var/www/honeypot/$DOMAIN/index.html"
-  else
-    die "Honeypot не создал index.html в /var/www/honeypot/$DOMAIN"
-  fi
-  ok "Этап Honeypot завершён; сайт будет опубликован на https://$DOMAIN/ после настройки nginx и сертификата"
-
-  # [7]
-  section "nginx (временный конфиг)"
-  step_run "nginx: временный HTTP-конфиг для выпуска сертификата" rscript "$TMPD/nginx-temp.sh" "$DOMAIN" "$xw" || die "nginx не настроился"
-  local code
-  code=$(bk "curl -s -o /dev/null --max-time 15 -w '%{http_code}' -H 'Host: $DOMAIN' http://127.0.0.1:80/" 2>>"$LOG")
-  if [ -n "$code" ] && [ "$code" != "000" ]; then ok "nginx отвечает на порту 80 (HTTP $code)"; else warn "nginx не отвечает на порту 80"; fi
-
-  # [7]
-  section "Сертификат Let's Encrypt"
-  CERT_OK=0
-  if [ "$DNS_OK" -ne 0 ]; then warn "DNS не подтверждён — попытка выпуска может не удаться"; fi
-  while true; do
-    if step_run "certbot --webroot для $DOMAIN" rscript "$TMPD/cert.sh" "$DOMAIN" "$EMAIL"; then CERT_OK=1; break; fi
-    warn "не удалось выпустить сертификат (DNS ещё не разошёлся? порт 80 недоступен?)"
-    confirm "Повторить?" || break
-  done
-
-  # [8]
-  section "Honeypot + nginx: публикация сайта, панель и подписка"
-  step_run "Служебная команда sync-sub-path (автосинхронизация подписки)" rscript "$TMPD/helper-sub.sh" || warn "sync-sub-path не установлен"
-  local scheme=http
-  [ $CERT_OK -eq 1 ] && scheme=https
-  SUB_PATHS=$(rscript "$TMPD/sub-setup.sh" "$DOMAIN" "$scheme" 2>>"$LOG" | tail -n1)
-  bk "/usr/local/bin/sync-sub-path" >>"$LOG" 2>&1 || true
-  if [ -n "$SUB_PATHS" ]; then ok "подписка: путь из панели $SUB_PATHS внесён в nginx (смена пути в панели подхватывается за ~15 с)"; else warn "не удалось настроить подписку (см. лог)"; fi
-  if [ $CERT_OK -eq 1 ]; then
-    step_run "nginx: сертификат, пути подписки из панели, автопродление" rscript "$TMPD/nginx-final.sh" "$DOMAIN" "$xw" || die "не удалось включить финальный конфиг nginx"
-  else
-    warn "без сертификата оставлен временный конфиг: панель доступна по http://$DOMAIN/$xw"
-  fi
-
-  # [9]
-  section "Проверка и итог"
-  save_conf
-  write_marker "done"
-  ok "настройки сохранены: $CONF_FILE, метка установки: $MARKER_FILE"
-  local final_url final_code
-  if [ $CERT_OK -eq 1 ]; then
-    final_url="https://$DOMAIN/$xw"
-    final_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' "${final_url%/}/" 2>/dev/null)
-    if [ "$final_code" = "200" ]; then ok "HTTPS: $final_url → HTTP 200 (сертификат валиден)"; else warn "HTTPS-проверка вернула HTTP ${final_code:-000} (DNS мог ещё не разойтись)"; fi
-  else
-    final_url="http://$DOMAIN/$xw"
-  fi
-  local site_url site_code
-  if [ "$CERT_OK" -eq 1 ]; then
-    site_url="https://$DOMAIN/"
-    site_code=$(bk "curl -s -o /dev/null --max-time 15 -w '%{http_code}' --resolve '$DOMAIN:443:127.0.0.1' '$site_url'" 2>>"$LOG" || true)
-  else
-    site_url="http://$DOMAIN/"
-    site_code=$(bk "curl -s -o /dev/null --max-time 15 -w '%{http_code}' -H 'Host: $DOMAIN' http://127.0.0.1:80/" 2>>"$LOG" || true)
-  fi
-  {
-    echo "Backend Setup (без relay) v$VERSION — $(date '+%F %T')"
-    echo "Server:       $BACKEND_IP"
-    echo "Domain:       $DOMAIN"
-    echo "Honeypot URL: $site_url"
-    echo "Honeypot dir: /var/www/honeypot/$DOMAIN"
-    echo "Honeypot HTTP: ${site_code:-000}"
-    echo "Panel URL:    $final_url"
-    echo "Username:     $xu"
-    echo "Password:     $xp"
-    echo "API Token:    ${xt:-—}"
-  } > "$REPORT_FILE"
-  chmod 600 "$REPORT_FILE"
-
-  echo
-  rule
-  printf '  %sУСТАНОВКА ЗАВЕРШЕНА%s\n' "$GRN" "$R"
-  rule
-  printf '  %sСАЙТ HONEYPOT%s\n' "$B" "$R"
-  printf '  URL:       %s%s%s\n' "$B" "$site_url" "$R"
-  printf '  Каталог:   %s/var/www/honeypot/%s%s\n' "$DIM" "$DOMAIN" "$R"
-  if [ "$site_code" = "200" ]; then ok "Проверка сайта: HTTP 200"; else warn "Проверка сайта вернула HTTP ${site_code:-000}; проверьте DNS, nginx и лог"; fi
-  echo
-  printf '  %sПАНЕЛЬ 3X-UI%s\n' "$B" "$R"
-  printf '  URL:       %s%s%s\n' "$B" "$final_url" "$R"
-  printf '  Username:  %s%s%s\n' "$GRN" "$xu" "$R"
-  printf '  Password:  %s%s%s\n' "$GRN" "$xp" "$R"
-  rule
-  echo "  ${DIM}Отчёт: $REPORT_FILE (права 600)${R}"
-  echo "  ${DIM}Лог:   $LOG${R}"
-  echo
-  echo "  ${B}Дальше — в панели:${R}"
-  echo "   • VLESS Reality: Listen IP пусто (все интерфейсы), порт 8443, пользовательский адрес $DOMAIN"
-  echo "   • Hysteria2: Listen пусто, порт 8443/udp, SNI $DOMAIN, сертификат /etc/letsencrypt/live/$DOMAIN/"
-  echo "   • Подписка уже настроена: путь ${SUB_PATHS:-?}, ссылки вида $scheme://$DOMAIN${SUB_PATHS:-/}<subId>."
-  echo "     Если смените путь в панели — nginx подхватит сам за ~15 секунд (вручную: sync-sub-path)"
-  echo "   • KeyMaster (если нужен): запустите server4keymaster.sh на этом сервере; A-запись его домена (например keygen.$DOMAIN) → $BACKEND_IP"
-  echo "   • Панель безопаснее открывать через SSH-туннель: ssh -L 9999:127.0.0.1:$PANEL_PORT root@$BACKEND_IP → http://127.0.0.1:9999/$xw"
-  echo
+# мост BACKEND: установка и запуск
+backend_bridge() {
+  rscript "$TMPD/bridge-install.sh" "$RELAY_IP" "$DOMAIN" "$TUNNEL_PATH" "$TUNNEL_UUID"
 }
 
+# число соединений моста, пришедших на инбаунд туннеля
+tunnel_conns() { ss -tnH state established "( sport = :$CHAIN_TUNNEL_PORT )" 2>/dev/null | wc -l; }
+
+# сквозная проверка: временный клиент на RELAY → nginx → туннель → BACKEND → интернет; выходной IP должен быть IP BACKEND
+chain_selftest() {
+  local xray cfg exit_ip be_ip
+  xray=$(ls /usr/local/x-ui/bin/xray-linux-* 2>/dev/null | head -n1)
+  [ -x "$xray" ] || { echo "Xray из 3x-ui не найден" >&2; return 1; }
+  cfg="$TMPD/selftest.json"
+  cat > "$cfg" <<EOT
+{"log":{"loglevel":"warning"},
+ "inbounds":[{"tag":"s","listen":"127.0.0.1","port":$SELFTEST_PORT,"protocol":"socks","settings":{"udp":false}}],
+ "outbounds":[{"tag":"p","protocol":"vless","settings":{"address":"127.0.0.1","port":443,"id":"$CHAIN_USER_ID","encryption":"none"},
+  "streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"$DOMAIN","fingerprint":"chrome","alpn":["h2"]},
+   "xhttpSettings":{"host":"$DOMAIN","path":"/$USER_PATH/","mode":"auto"}}}]}
+EOT
+  "$xray" run -c "$cfg" >"$TMPD/selftest.log" 2>&1 </dev/null &
+  SELFTEST_PID=$!
+  sleep 2
+  exit_ip=$(curl -4 -s --max-time 25 -x "socks5h://127.0.0.1:$SELFTEST_PORT" https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
+  kill "$SELFTEST_PID" >/dev/null 2>&1 || true
+  SELFTEST_PID=""
+  be_ip=$(bk 'curl -4 -fsS --max-time 10 https://api.ipify.org' 2>>"$LOG" | tr -d '[:space:]')
+  echo "выходной IP цепочки: ${exit_ip:-нет ответа}; внешний IP BACKEND: ${be_ip:-?}"
+  [ -n "$exit_ip" ] && [ "$exit_ip" = "$be_ip" ]
+}
+
+# ссылка первого пользователя из подписки (для Incy)
+chain_client_link() {
+  local port
+  port=$(sqlite3 /etc/x-ui/x-ui.db "select value from settings where key='subPort'" 2>/dev/null)
+  port="${port:-2096}"
+  curl -s --max-time 10 -H 'Accept-Encoding: identity' "http://127.0.0.1:$port${SUB_PATHS}${CHAIN_SUB_ID}" 2>/dev/null |
+    python3 -c 'import base64,sys; d=sys.stdin.buffer.read().strip(); 
+try: t=base64.b64decode(d+b"==").decode()
+except Exception: t=d.decode("utf-8","replace")
+print(t.splitlines()[0] if t.strip() else "")' 2>/dev/null
+}
+
+check_reinstall() {
+  if [ -f "$MARKER_FILE" ]; then
+    warn "установка уже выполнялась (метка: $(marker_get INSTALLED_AT), статус: $(marker_get STATUS))"
+    confirm "Удалить всё и установить заново?" n || { echo "  Отменено."; exit 0; }
+    do_uninstall || exit 0
+    USER_PATH=""; TUNNEL_PATH=""; TUNNEL_UUID=""   # новая установка — новые секретные пути
+  fi
+}
+
+# ───────────────────────── настройка цепочки ─────────────────────────
 run_install() {
-  INSTALL_KIND="relay"
-  STEP=0; TOTAL=15
+  INSTALL_KIND="chain"
+  STEP=0; TOTAL=12
   check_reinstall
-  STEP=0; TOTAL=15
+  STEP=0; TOTAL=12
 
   # ── вопросы
   echo
@@ -4467,44 +3666,51 @@ run_install() {
   done
   [ -n "${KEY_FILE:-}" ] || read_key
   while true; do
-    ask DOMAIN "Домен панели (A-запись → IP RELAY)" "${DOMAIN:-}"
+    ask DOMAIN "Домен (A-запись → IP RELAY)" "${DOMAIN:-}"
     valid_dom "$DOMAIN" && break
     fail "неверный домен"
     DOMAIN=""
   done
   EMAIL="admin@$DOMAIN"   # e-mail для Let's Encrypt: не спрашиваем
+  LEGACY=0
+  if legacy_found; then
+    warn "найдена прежняя схема (rathole): она занимает порты 80/443 и подключается к BACKEND:2333"
+    if confirm "Остановить rathole на RELAY и BACKEND и освободить порты?"; then LEGACY=1; fi
+  fi
+  LOCKDOWN=0
+  if confirm "Закрыть на BACKEND все входящие порты, кроме SSH?"; then LOCKDOWN=1; fi
 
   # ── скрытая проверка DNS: молчит, если всё в порядке
   echo
   dns_check
   DNS_OK=$?
 
-  SECRET="${SECRET:-$(openssl rand -hex 16)}"
+  USER_PATH="${USER_PATH:-$(openssl rand -hex 12)}"
+  TUNNEL_PATH="${TUNNEL_PATH:-$(openssl rand -hex 12)}"
 
   # ── сводка
   echo
   rule
   printf '  %sПлан установки%s\n' "$B" "$R"
   rule
-  kv "RELAY" "$RELAY_IP  (rathole-server, ufw, UDP 8443 → BACKEND)"
-  kv "BACKEND" "$BACKEND_IP  (SSH :$BACKEND_PORT)"
+  kv "RELAY" "$RELAY_IP  (nginx, 3x-ui, Honeypot; ufw: SSH, 80, 443)"
+  kv "BACKEND" "$BACKEND_IP  (SSH :$BACKEND_PORT; мост Xray сам подключается к RELAY)"
   kv "Domain" "$DOMAIN"
-  kv "Honeypot" "https://$DOMAIN/ → сайт на BACKEND: /var/www/honeypot/$DOMAIN"
-  kv "3x-ui panel" "https://$DOMAIN/<WebBasePath> → BACKEND 127.0.0.1:$PANEL_PORT"
+  kv "Канал" "клиент → https://$DOMAIN:443 (VLESS + XHTTP, HTTP/2) → RELAY ⇄ обратный туннель ⇄ BACKEND → интернет"
+  kv "Honeypot" "https://$DOMAIN/ — сайт на RELAY; /status/, /api/v1/health; чужие пути — 404"
+  kv "3x-ui panel" "https://$DOMAIN/<WebBasePath> → RELAY 127.0.0.1:$PANEL_PORT; подписка для Incy там же"
+  kv "Tunnel" "BACKEND → RELAY:443, TLS 1.3, отпечаток Chrome; секретный путь принимает только IP BACKEND"
   kv "E-mail" "$EMAIL"
-  kv "RELAY ports" "443, 80, 8443/tcp → туннель; 2333 (только с BACKEND); 8443/udp → DNAT; прочее входящее закрывается (ufw)"
-  kv "BACKEND ports" "входящие TCP 443/80/8443 закрываются; 8443/udp только от RELAY"
-  kv "Tunnel" "rathole с TLS-транспортом (свой CA, SNI $DOMAIN); Noise не используется"
-  kv "Panel" "3x-ui на 127.0.0.1:$PANEL_PORT (SQLite), nginx + Let's Encrypt"
+  if [ $LEGACY -eq 1 ]; then kv "Прежняя схема" "rathole на RELAY и BACKEND останавливается и удаляется"; fi
+  if [ $LOCKDOWN -eq 1 ]; then kv "BACKEND ports" "все входящие закрываются, остаётся только SSH"; else kv "BACKEND ports" "firewall не меняется"; fi
   rule
   echo
   confirm "Всё верно, начать установку?" || { echo "  Отменено."; exit 0; }
   write_marker in-progress
 
-  make_remote_scripts
-  install_switch_backend
+  make_scripts
 
-  # [1] SSH (первым: если GitHub недоступен с RELAY, rathole скачает BACKEND)
+  # [1] SSH
   section "Подключение к BACKEND"
   ssh_connect
   local bos
@@ -4514,158 +3720,117 @@ run_install() {
     debian\ *) warn "ОС BACKEND: $bos (скрипт рассчитан на Ubuntu 22.04+)" ;;
     *) warn "ОС BACKEND не определена: ${bos:-?}" ;;
   esac
-
   rscript "$TMPD/f2b-ignore.sh" "$RELAY_IP" >>"$LOG" 2>&1 || true
 
-  # [2] подготовка RELAY
-  section "RELAY: пакеты и rathole"
-  step_run "Установка пакетов и rathole" relay_prepare || die "не удалось подготовить RELAY"
+  # [2] прежняя схема
+  section "Прежняя схема (rathole)"
+  if [ $LEGACY -eq 1 ]; then
+    step_run "RELAY: остановка rathole-server, удаление правил ufw и NAT" relay_legacy_cleanup || warn "прежняя схема на RELAY удалена не полностью"
+    step_run "BACKEND: остановка rathole-client" rscript "$TMPD/legacy-backend.sh" || warn "rathole-client на BACKEND не остановлен"
+  else
+    info "не требуется"
+  fi
 
-  # [3] сетевые твики (до запуска туннеля)
+  # [3] сеть
   section "Сетевая оптимизация (RELAY и BACKEND)"
   step_run "RELAY: BBR, буферы TCP/UDP, MTU probing, keepalive" tune_network || warn "твики на RELAY применены не полностью"
   step_run "BACKEND: BBR, буферы TCP/UDP, MTU probing, keepalive" rscript "$TMPD/tune.sh" || warn "твики на BACKEND применены не полностью"
-  local cc_r cc_b
-  cc_r=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-  cc_b=$(bk 'sysctl -n net.ipv4.tcp_congestion_control' 2>>"$LOG")
-  if [ "$cc_r" = bbr ]; then ok "RELAY: congestion control = bbr"; else warn "RELAY: congestion control = ${cc_r:-?} (BBR недоступен: ядро или виртуализация)"; fi
-  if [ "$cc_b" = bbr ]; then ok "BACKEND: congestion control = bbr"; else warn "BACKEND: congestion control = ${cc_b:-?} (BBR недоступен: ядро или виртуализация)"; fi
 
-  # [3] rathole-server
-  section "RELAY: rathole-server"
+  # [4] пакеты и firewall RELAY
+  section "RELAY: пакеты и firewall"
+  step_run "Установка nginx, certbot, ufw, sqlite3" lscript "$TMPD/relay-pkgs.sh" || die "не удалось подготовить RELAY"
   local conflicts
   conflicts=$(relay_port_conflicts)
-  [ -z "$conflicts" ] || die "на RELAY заняты порты:$conflicts (остановите nginx/apache/другие сервисы на этих портах)"
-  step_run "TLS: свой CA и сертификат для $DOMAIN" relay_tls_setup || die "не удалось создать TLS-сертификат туннеля"
-  step_run "Конфиг и запуск rathole-server (TLS)" relay_rathole_server || die "rathole-server не запустился"
+  [ -z "$conflicts" ] || die "на RELAY заняты порты:$conflicts (остановите чужие сервисы на этих портах)"
+  step_run "ufw: SSH, 80/tcp, 443/tcp; прочее входящее закрыто" relay_firewall || die "не удалось настроить firewall RELAY"
 
-  # [4] firewall + UDP
-  section "RELAY: firewall и пересылка UDP 8443"
-  step_run "ufw, форвардинг, NAT для 8443/udp" relay_firewall || die "не удалось настроить firewall RELAY"
-
-  # [5] BACKEND: пакеты
-  section "BACKEND: пакеты и обновление системы"
-  step_run "apt update/upgrade, nginx, certbot, ufw" rscript "$TMPD/pkgs.sh" || die "не удалось подготовить BACKEND"
-
-  # [6] rathole-client
-  section "BACKEND: rathole-client"
-  step_run "Установка rathole и подключение к RELAY (TLS)" backend_rathole || die "rathole-client не запустился (проверьте TLS-сертификат и порт 2333)"
-
-  # [7] проверка туннеля
-  section "Проверка туннеля"
-  local i listening=0
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    if [ "$(ss -tlnH 2>/dev/null | grep -cE ':(443|80|8443) ')" -ge 3 ]; then listening=1; break; fi
-    sleep 1
-  done
-  if [ $listening -eq 1 ]; then ok "RELAY слушает 443, 80, 8443 — BACKEND подключился"; else die "BACKEND не подключился к rathole-server (проверьте порт 2333 и секрет)"; fi
-  bk "cat > /tmp/tuntest.py" < "$TMPD/tuntest.py" 2>>"$LOG"
-  bk "nohup timeout 45 python3 /tmp/tuntest.py >/dev/null 2>&1 </dev/null &" >>"$LOG" 2>&1
-  sleep 2
-  local got
-  got=$(curl -s --max-time 25 http://127.0.0.1:8443/ -o /dev/null -w '%{size_download}' 2>/dev/null || echo 0)
-  if [ "${got:-0}" -ge 262144 ]; then
-    ok "поток данных через туннель: 256 КБ без зависаний"
-  elif [ "${got:-0}" -gt 0 ]; then
-    warn "через туннель пришло только $((got / 1024)) КБ из 256 — возможна заморозка TCP на участке BACKEND→RELAY (см. раздел «Разбор неполадок» гайда)"
-  else
-    warn "тест потока пропущен (порт 8443 на BACKEND занят или туннель не отвечает)"
-  fi
-  bk "rm -f /tmp/tuntest.py; pkill -f tuntest.py || true" >>"$LOG" 2>&1 || true
-
-  # [8] 3x-ui
-  section "BACKEND: 3x-ui"
+  # [5] 3x-ui
+  section "RELAY: 3x-ui"
   xui_stage
 
-  # [9] Полноценный отдельный этап установки Honeypot
-  section "BACKEND: отдельный этап установки и настройки Honeypot"
-  info "Публичный сайт: https://$DOMAIN/"
-  info "Каталог сайта на BACKEND: /var/www/honeypot/$DOMAIN"
-  info "Панель 3x-ui будет доступна отдельно: https://$DOMAIN/<WebBasePath>"
-  step_run "Генерация файлов Honeypot на BACKEND" rscript "$TMPD/honeypot.sh" "$DOMAIN" || die "не удалось сгенерировать Honeypot"
-  if bk "test -s '/var/www/honeypot/$DOMAIN/index.html'" 2>>"$LOG"; then
-    ok "Главная страница создана на BACKEND: /var/www/honeypot/$DOMAIN/index.html"
-  else
-    die "Honeypot не создал index.html в /var/www/honeypot/$DOMAIN на BACKEND"
-  fi
-  ok "Этап Honeypot завершён; публикация на https://$DOMAIN/ будет активирована финальным nginx-конфигом"
+  # [6] Honeypot
+  section "RELAY: «живой» сайт (Honeypot)"
+  info "Публичный сайт: https://$DOMAIN/ (+ /status/, /api/v1/health)"
+  info "Каталог сайта на RELAY: /var/www/honeypot/$DOMAIN"
+  step_run "Генерация файлов Honeypot на RELAY" lscript "$TMPD/honeypot.sh" "$DOMAIN" || die "не удалось сгенерировать Honeypot"
+  if test -s "/var/www/honeypot/$DOMAIN/index.html"; then ok "Главная страница создана: /var/www/honeypot/$DOMAIN/index.html"; else die "Honeypot не создал index.html"; fi
 
-  # [10] nginx временный
-  section "BACKEND: nginx (временный конфиг)"
-  step_run "nginx: временный HTTP-конфиг для выпуска сертификата" rscript "$TMPD/nginx-temp.sh" "$DOMAIN" "$xw" || die "nginx не настроился"
-  local code
-  code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' -H "Host: $DOMAIN" http://127.0.0.1:80/ 2>/dev/null)
-  if [ "$code" != "000" ] && [ -n "$code" ]; then ok "порт 80 доходит до BACKEND через туннель (HTTP $code)"; else warn "порт 80 через туннель не отвечает — сертификат, скорее всего, не выпустится"; fi
+  # [7] nginx временный
+  section "RELAY: nginx (временный конфиг)"
+  step_run "nginx: временный HTTP-конфиг для выпуска сертификата" lscript "$TMPD/nginx-temp.sh" "$DOMAIN" "$xw" || die "nginx не настроился"
 
-  # [10] сертификат
+  # [8] сертификат
   section "Сертификат Let's Encrypt"
   CERT_OK=0
   if [ "$DNS_OK" -ne 0 ]; then warn "DNS не подтверждён — попытка выпуска может не удаться"; fi
   while true; do
-    if step_run "certbot --webroot для $DOMAIN" rscript "$TMPD/cert.sh" "$DOMAIN" "$EMAIL"; then CERT_OK=1; break; fi
+    if step_run "certbot --webroot для $DOMAIN" lscript "$TMPD/cert.sh" "$DOMAIN" "$EMAIL"; then CERT_OK=1; break; fi
     warn "не удалось выпустить сертификат (DNS ещё не разошёлся? порт 80 недоступен?)"
     confirm "Повторить?" || break
   done
+  [ $CERT_OK -eq 1 ] || die "без сертификата канал HTTPS не заработает: исправьте DNS и запустите установку снова"
 
-  # [12] nginx финальный, служебные команды и подписка
-  section "BACKEND: Honeypot + nginx — публикация сайта, панель и подписка"
-  step_run "Служебные команды: switch-relay, sync-sub-path (автосинхронизация подписки)" rscript "$TMPD/helper-backend.sh" || warn "служебные команды не установлены"
-  local scheme=http
-  [ $CERT_OK -eq 1 ] && scheme=https
-  SUB_PATHS=$(rscript "$TMPD/sub-setup.sh" "$DOMAIN" "$scheme" 2>>"$LOG" | tail -n1)
-  bk "/usr/local/bin/sync-sub-path" >>"$LOG" 2>&1 || true
-  if [ -n "$SUB_PATHS" ]; then ok "подписка: путь из панели $SUB_PATHS внесён в nginx (смена пути в панели подхватывается за ~15 с)"; else warn "не удалось настроить подписку (см. лог)"; fi
-  if [ $CERT_OK -eq 1 ]; then
-    step_run "nginx: сертификат, пути подписки из панели, автопродление" rscript "$TMPD/nginx-final.sh" "$DOMAIN" "$xw" || die "не удалось включить финальный конфиг nginx"
-  else
-    warn "без сертификата оставлен временный конфиг: панель доступна по http://$DOMAIN/$xw"
-  fi
-
-  # [12] firewall BACKEND
-  section "BACKEND: firewall"
-  step_run "ufw: SSH сохранён, TCP 443/80/8443 закрыты, 8443/udp только от RELAY" rscript "$TMPD/ufw-backend.sh" "$RELAY_IP" || die "не удалось настроить firewall BACKEND"
-
-  # [13] итог
-  section "Проверка связки и служебные команды"
-  ok "switch-backend установлен на RELAY"
+  # [9] служебные команды, подписка, инбаунды, финальный nginx
+  section "RELAY: подписка, инбаунды 3x-ui, nginx"
+  step_run "Служебные команды: chain-status, chain-set-backend, sync-sub-path, обновление «живых» страниц" lscript "$TMPD/helper-relay.sh" || warn "служебные команды установлены не полностью"
+  printf '%s\n' "$DOMAIN" > /etc/chain-site.domain
+  /usr/local/bin/chain-site-refresh >>"$LOG" 2>&1 || warn "страницы статуса не созданы"
+  SUB_PATHS=$(lscript "$TMPD/sub-setup.sh" "$DOMAIN" https 2>>"$LOG" | tail -n1)
+  if [ -n "$SUB_PATHS" ]; then ok "подписка: путь из панели $SUB_PATHS (nginx подхватит за ~15 с)"; else warn "не удалось настроить подписку (см. лог)"; fi
+  step_run "3x-ui: инбаунд пользователей (VLESS+XHTTP), инбаунд туннеля (reverse), маршрутизация" chain_inbounds || die "не удалось настроить 3x-ui через API (см. лог)"
   save_conf
+  step_run "nginx: сертификат, секретные пути, панель, «живые» эндпоинты, автопродление" python3 "$TMPD/nginx-final.py" "$DOMAIN" "$xw" "$USER_PATH" "$TUNNEL_PATH" "$CHAIN_USER_PORT" "$CHAIN_TUNNEL_PORT" "$BACKEND_IP" || die "не удалось включить финальный конфиг nginx"
+  /usr/local/bin/sync-sub-path >>"$LOG" 2>&1 || true
+  step_run "Перезапуск 3x-ui (применение маршрутизации)" bash -c 'systemctl restart x-ui && sleep 4 && systemctl is-active --quiet x-ui' || warn "x-ui не перезапустился"
+
+  # [10] мост на BACKEND
+  section "BACKEND: мост Xray"
+  step_run "Установка Xray (проверка SHA-256) и запуск chain-bridge" backend_bridge || die "мост не запустился (journalctl -u chain-bridge на BACKEND)"
+
+  # [11] проверка цепочки
+  section "Проверка цепочки"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    [ "$(tunnel_conns)" -ge 1 ] && break
+    sleep 2
+  done
+  if [ "$(tunnel_conns)" -ge 1 ]; then ok "мост подключился к RELAY (туннельный путь, HTTP/2)"; else warn "мост пока не подключился: проверьте journalctl -u chain-bridge на BACKEND"; fi
+  local st=1 stout=""
+  for i in 1 2 3; do
+    if stout=$(chain_selftest 2>>"$LOG"); then st=0; break; fi
+    sleep 5
+  done
+  [ -n "$stout" ] && info "$stout"
+  if [ $st -eq 0 ]; then ok "поток через цепочку работает: выходной IP совпадает с BACKEND"; else warn "сквозная проверка не прошла (при общем IP/NAT у BACKEND IP может отличаться) — см. chain-status"; fi
+
+  # [12] firewall BACKEND и итог
+  section "BACKEND: firewall и итог"
+  if [ $LOCKDOWN -eq 1 ]; then
+    step_run "ufw: SSH сохранён, все остальные входящие закрыты" rscript "$TMPD/ufw-backend.sh" || warn "firewall BACKEND не настроен (см. лог)"
+  else
+    info "firewall BACKEND не менялся"
+  fi
   write_marker "done"
   ok "настройки сохранены: $CONF_FILE, метка установки: $MARKER_FILE"
-  local final_url final_code
-  if [ $CERT_OK -eq 1 ]; then
-    final_url="https://$DOMAIN/$xw"
-    final_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' --resolve "$DOMAIN:443:127.0.0.1" "${final_url%/}/" 2>/dev/null)
-    if [ "$final_code" = "200" ]; then ok "HTTPS через туннель: $final_url → HTTP 200 (сертификат валиден)"; else warn "HTTPS-проверка вернула HTTP ${final_code:-000}: проверьте nginx и сертификат на BACKEND"; fi
-  else
-    final_url="http://$DOMAIN/$xw"
-  fi
 
-  # UDP-предупреждение: у BACKEND нет собственного IPv4?
-  if ! bk "ip -4 -o addr show scope global | awk '{print \$4}' | cut -d/ -f1 | grep -qx '$BACKEND_IP'" 2>>"$LOG"; then
-    warn "IP $BACKEND_IP не назначен на интерфейсе BACKEND (общий IP/NAT): пересылка UDP 8443 на него работать не будет — Hysteria2 через RELAY недоступна"
-  fi
-
-  local site_url site_code
-  if [ "$CERT_OK" -eq 1 ]; then
-    site_url="https://$DOMAIN/"
-    site_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' --resolve "$DOMAIN:443:127.0.0.1" "$site_url" 2>/dev/null || true)
-  else
-    site_url="http://$DOMAIN/"
-    site_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' -H "Host: $DOMAIN" http://127.0.0.1:80/ 2>/dev/null || true)
-  fi
+  local site_code panel_url link
+  panel_url="https://$DOMAIN/$xw"
+  site_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" 2>/dev/null || true)
+  link=$(chain_client_link)
   {
     echo "RatBurrow v$VERSION — $(date '+%F %T')"
     echo "RELAY:        $RELAY_IP"
     echo "BACKEND:      $BACKEND_IP (SSH :$BACKEND_PORT)"
     echo "Domain:       $DOMAIN"
-    echo "Honeypot URL: $site_url"
-    echo "Honeypot dir: /var/www/honeypot/$DOMAIN (BACKEND)"
-    echo "Honeypot HTTP: ${site_code:-000}"
-    echo "Panel URL:    $final_url"
+    echo "Honeypot URL: https://$DOMAIN/ (HTTP ${site_code:-000})"
+    echo "Panel URL:    $panel_url"
     echo "Username:     $xu"
     echo "Password:     $xp"
     echo "API Token:    ${xt:-—}"
-    echo "rathole key:  $SECRET"
+    echo "Подписка:     https://$DOMAIN${SUB_PATHS}${CHAIN_SUB_ID}"
+    echo "Ссылка:       ${link:-—}"
+    echo "Путь клиентов: /$USER_PATH/"
+    echo "Путь туннеля:  /$TUNNEL_PATH/"
   } > "$REPORT_FILE"
   chmod 600 "$REPORT_FILE"
 
@@ -4674,37 +3839,104 @@ run_install() {
   printf '  %sУСТАНОВКА ЗАВЕРШЕНА%s\n' "$GRN" "$R"
   rule
   printf '  %sСАЙТ HONEYPOT%s\n' "$B" "$R"
-  printf '  URL:       %s%s%s\n' "$B" "$site_url" "$R"
-  printf '  Каталог:   %s/var/www/honeypot/%s%s\n' "$DIM" "$DOMAIN" "$R"
-  printf '  Размещение: BACKEND%s\n' "$R"
-  if [ "$site_code" = "200" ]; then ok "Проверка сайта через RELAY: HTTP 200"; else warn "Проверка сайта вернула HTTP ${site_code:-000}; проверьте DNS, туннель, nginx и лог"; fi
+  printf '  URL:       %shttps://%s/%s\n' "$B" "$DOMAIN" "$R"
+  printf '  Каталог:   %s/var/www/honeypot/%s%s (RELAY)\n' "$DIM" "$DOMAIN" "$R"
+  if [ "$site_code" = "200" ]; then ok "Проверка сайта: HTTP 200"; else warn "Проверка сайта вернула HTTP ${site_code:-000}; проверьте DNS, nginx и лог"; fi
   echo
   printf '  %sПАНЕЛЬ 3X-UI%s\n' "$B" "$R"
-  printf '  URL:       %s%s%s\n' "$B" "$final_url" "$R"
+  printf '  URL:       %s%s%s\n' "$B" "$panel_url" "$R"
   printf '  Username:  %s%s%s\n' "$GRN" "$xu" "$R"
   printf '  Password:  %s%s%s\n' "$GRN" "$xp" "$R"
   echo
+  printf '  %sКЛИЕНТ (Incy)%s\n' "$B" "$R"
+  printf '  Подписка:  %shttps://%s%s%s%s\n' "$B" "$DOMAIN" "${SUB_PATHS:-/}" "$CHAIN_SUB_ID" "$R"
+  [ -n "$link" ] && printf '  Ссылка:    %s%s%s\n' "$DIM" "$link" "$R"
+  echo
   printf '  %sТУННЕЛЬ%s\n' "$B" "$R"
-  ok "RELAY ↔ BACKEND: rathole подключён"
+  if [ "$(tunnel_conns)" -ge 1 ]; then ok "BACKEND → RELAY: мост подключён"; else warn "мост не подключён"; fi
   rule
   echo "  ${DIM}Отчёт: $REPORT_FILE (права 600)${R}"
   echo "  ${DIM}Лог:   $LOG${R}"
-  echo "  ${DIM}Служебные команды:     switch-relay (BACKEND), switch-backend (RELAY), sync-sub-path (BACKEND)${R}"
+  echo "  ${DIM}Служебные команды: chain-status, chain-set-backend (RELAY); chain-set-relay (BACKEND)${R}"
   echo
-  echo "  ${B}Дальше — в панели:${R}"
-  echo "   • VLESS Reality: Listen IP 127.0.0.1, порт 8443, пользовательский адрес $DOMAIN"
-  echo "   • Hysteria2: Listen пусто, порт 8443/udp, SNI $DOMAIN, сертификат /etc/letsencrypt/live/$DOMAIN/"
-  echo "   • Подписка уже настроена: путь ${SUB_PATHS:-?}, ссылки вида $scheme://$DOMAIN${SUB_PATHS:-/}<subId>."
-  echo "     Если смените путь в панели — nginx подхватит сам за ~15 секунд (вручную: sync-sub-path на BACKEND)"
-  echo "   • KeyMaster (если нужен): запустите server4keymaster.sh на BACKEND; A-запись его домена (например keygen.$DOMAIN) → $RELAY_IP"
+  echo "  ${B}Дальше:${R}"
+  echo "   • В Incy добавьте подписку по ссылке выше; новых пользователей создавайте в панели в инбаунде chain-users"
+  echo "   • Инбаунд chain-tunnel служебный (туннель) — не удаляйте и не меняйте"
+  echo "   • Сменили IP BACKEND у провайдера: на RELAY выполните chain-set-backend НОВЫЙ_IP (мост подключится сам)"
   echo
+}
+
+# ───────────────────────── откат ─────────────────────────
+relay_uninstall() {  # relay_uninstall rm_xui rm_web
+  local rm_xui="$1" rm_web="$2" d="${DOMAIN:-$(marker_get DOMAIN)}"
+  systemctl disable --now chain-site-refresh.timer sync-sub-path.timer >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/chain-site-refresh.service /etc/systemd/system/chain-site-refresh.timer \
+    /etc/systemd/system/sync-sub-path.service /etc/systemd/system/sync-sub-path.timer \
+    /usr/local/bin/chain-status /usr/local/bin/chain-set-backend /usr/local/bin/chain-site-refresh /usr/local/bin/sync-sub-path \
+    /etc/chain-site.domain
+  if [ "$rm_web" = 1 ]; then
+    rm -f /etc/nginx/sites-enabled/apex.conf /etc/nginx/sites-available/apex.conf \
+      /etc/nginx/conf.d/chain-limit.conf /etc/nginx/snippets/chain-headers.conf /etc/nginx/chain-backend.conf
+    [ -n "$d" ] && { certbot delete --cert-name "$d" --non-interactive >/dev/null 2>&1 || true; rm -rf "/var/www/honeypot/$d"; }
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+    ufw delete allow 80/tcp >/dev/null 2>&1 || true
+    ufw delete allow 443/tcp >/dev/null 2>&1 || true
+  fi
+  if [ "$rm_xui" = 1 ]; then
+    systemctl disable --now x-ui >/dev/null 2>&1 || true
+    rm -rf /usr/local/x-ui /etc/x-ui /etc/systemd/system/x-ui.service /usr/bin/x-ui
+  fi
+  rm -f /etc/sysctl.d/99-relay-network-tuning.conf /etc/modules-load.d/relay-bbr.conf
+  systemctl daemon-reload
+  ufw --force reload >/dev/null 2>&1 || true
+  rm -f "$CONF_FILE" "$REPORT_FILE" "$MARKER_FILE"
+}
+
+do_uninstall() {
+  STEP=0; TOTAL=2
+  echo
+  echo "${B}Откат установки${R}"
+  thin
+  info "RELAY: сайт, служебные команды chain-*, sync-sub-path, сетевые твики"
+  info "BACKEND: мост chain-bridge, chain-xray, команда chain-set-relay, сетевые твики"
+  confirm "Удалить эти настройки?" n || { echo "  Отменено."; return 1; }
+  local rm_xui=0 rm_web=0 reach=0
+  ask_backend
+  if [ "${LOCAL_BACKEND:-0}" = 1 ]; then
+    reach=1
+  else
+    ssh_opts
+    if ssh "${SSH_OPTS[@]}" -o BatchMode=yes "root@$BACKEND_IP" true >/dev/null 2>"$TMPD/ssh.err"; then
+      reach=1
+      ok "SSH: root@$BACKEND_IP:$BACKEND_PORT"
+    else
+      fail "BACKEND недоступен: $(tail -n1 "$TMPD/ssh.err")"
+      confirm "Удалить только настройки RELAY (BACKEND останется как есть)?" n || { echo "  Отменено."; return 1; }
+    fi
+  fi
+  confirm "Удалить на RELAY также 3x-ui (панель, пользователи, инбаунды)?" n && rm_xui=1
+  confirm "Удалить на RELAY также конфиг nginx, сайт и сертификат домена ${DOMAIN:-$(marker_get DOMAIN)}?" n && rm_web=1
+  make_scripts
+  section "BACKEND"
+  if [ $reach -eq 1 ]; then
+    step_run "Удаление моста, служебных команд и настроек" rscript "$TMPD/uninstall-backend.sh" || warn "часть действий на BACKEND не выполнена (см. лог)"
+  else
+    warn "пропущено: BACKEND недоступен"
+  fi
+  section "RELAY"
+  step_run "Удаление служебных команд, сайта, настроек сети" relay_uninstall "$rm_xui" "$rm_web" || warn "часть действий на RELAY не выполнена (см. лог)"
+  echo
+  ok "метка установки удалена"
+  [ $reach -eq 1 ] && info "firewall BACKEND остался закрытым (только SSH); при необходимости: ufw allow <порт>/tcp"
+  [ $rm_web -eq 0 ] && info "конфиг nginx и сертификат оставлены (каналы пользователей без моста не работают)"
+  return 0
 }
 
 main() {
   [ "$(id -u)" -eq 0 ] || { echo "Запустите от root: sudo bash $0"; exit 1; }
   mkdir -p "$(dirname "$LOG")"
   ( umask 077; : > "$LOG" ); chmod 600 "$LOG"
-  TMPD=$(mktemp -d /tmp/relay-setup.XXXXXX)
+  TMPD=$(mktemp -d /tmp/chain-setup.XXXXXX)
   trap cleanup EXIT
   trap 'echo; warn "прервано"; exit 130' INT TERM
 
@@ -4714,9 +3946,7 @@ main() {
   menu
   case "$MODE" in
     prepare) run_prepare ;;
-    install_backend) run_install_backend ;;
-    install_relay) run_install ;;
-    test) run_test ;;
+    install) run_install ;;
     uninstall) do_uninstall ;;
   esac
 }
