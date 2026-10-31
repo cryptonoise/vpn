@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-VERSION="3.2"
+VERSION="3.3"
 NAME="RatBurrow"
 
 set -u
@@ -951,13 +951,12 @@ show_marks() {
       warn "Настройка защищённого канала RELAY ← BACKEND: начата $(marker_get INSTALLED_AT), не завершена"
     fi
     info "роль этого сервера: ${role^^}; RELAY $(marker_get RELAY_IP), BACKEND $(marker_get BACKEND_IP), домен $(marker_get DOMAIN)"
-    [ "$role" = backend ] && info "откат настройки канала выполняется с сервера RELAY"
   fi
 }
 
 menu() {
   local has=0 c
-  [ -f "$MARKER_FILE" ] && [ "$(marker_get ROLE)" != backend ] && has=1
+  [ -f "$MARKER_FILE" ] && has=1
   echo
   echo "${B}Что делаем?${R}"
   thin
@@ -3045,6 +3044,43 @@ code=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --resolve "$D:443:127.0.
 echo "проба пути:   HTTP ${code:-000} для чужого запроса (ожидается 404)"
 EOT5
 chmod +x /usr/local/bin/chain-status
+cat > /usr/local/bin/chain-test <<'EOT9'
+#!/bin/bash
+# Сквозная проверка цепочки на RELAY: клиент → nginx → туннель → BACKEND → интернет (настройки берутся из инбаунда chain-users)
+conf=/root/.chain-setup.conf
+get() { sed -n "s/^$1=//p" "$conf" 2>/dev/null | head -n1; }
+D=$(get DOMAIN); UP=$(get USER_PATH)
+xray=$(ls /usr/local/x-ui/bin/xray-linux-* 2>/dev/null | head -n1)
+[ -n "$D" ] && [ -n "$UP" ] && [ -x "$xray" ] || { echo "нет данных установки или Xray из 3x-ui"; exit 1; }
+tmp=$(mktemp -d); trap 'kill $PID 2>/dev/null; rm -rf "$tmp"' EXIT
+python3 - "$D" "$tmp/c.json" <<'PY' || { echo "не удалось прочитать инбаунд chain-users из базы 3x-ui"; exit 1; }
+import json, sqlite3, sys
+domain, out = sys.argv[1:3]
+db = sqlite3.connect("/etc/x-ui/x-ui.db")
+st, se = db.execute("select stream_settings, settings from inbounds where remark='chain-users' limit 1").fetchone()
+xh = json.loads(st)["xhttpSettings"]
+uid = json.loads(se)["clients"][0]["id"]
+json.dump({"log": {"loglevel": "warning"},
+           "inbounds": [{"listen": "127.0.0.1", "port": 21482, "protocol": "socks", "settings": {"udp": False}}],
+           "outbounds": [{"protocol": "vless", "settings": {"address": "127.0.0.1", "port": 443, "id": uid, "encryption": "none"},
+                          "streamSettings": {"network": "xhttp", "security": "tls",
+                                             "tlsSettings": {"serverName": domain, "fingerprint": "chrome", "alpn": ["h2"]},
+                                             "xhttpSettings": xh}}]}, open(out, "w"))
+print("XHTTP:", json.dumps(xh, ensure_ascii=False))
+PY
+/usr/local/bin/chain-status
+"$xray" run -c "$tmp/c.json" >"$tmp/x.log" 2>&1 </dev/null &
+PID=$!
+sleep 2
+P=socks5h://127.0.0.1:21482
+ip=$(curl -4 -s --max-time 25 -x "$P" https://api.ipify.org | tr -d '[:space:]')
+g=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 -x "$P" https://www.google.com/generate_204)
+echo "выходной IP цепочки: ${ip:-нет ответа} (должен быть IP BACKEND: $(get BACKEND_IP))"
+echo "google generate_204: HTTP ${g:-000} (ожидается 204)"
+if [ -n "$ip" ]; then echo "ИТОГ: цепочка RELAY → BACKEND работает; если в клиенте интернета нет — смотрите настройки/ссылку клиента"; else
+  echo "ИТОГ: цепочка не работает"; echo "--- лог тестового клиента ---"; tail -n 15 "$tmp/x.log"; exit 1; fi
+EOT9
+chmod +x /usr/local/bin/chain-test
 cat > /usr/local/bin/chain-site-refresh <<'EOT6'
 #!/usr/bin/env python3
 # Обновляет «живые» страницы сайта: /status/ и /api/v1/{health,status}.json (запускается таймером)
@@ -3292,7 +3328,7 @@ PYEOF
 
   # RELAY: инбаунды 3x-ui через API (пользователи + туннель с reverse) и маршрутизация «пользователи → туннель»
   cat > "$D/chain-inbounds.py" <<'PYEOF'
-import json, secrets, string, sys, urllib.parse, urllib.request, uuid
+import json, os, secrets, string, sys, urllib.parse, urllib.request, uuid
 
 base, token, domain, upath, tpath, uport, tport = sys.argv[1:8]
 uport, tport = int(uport), int(tport)
@@ -3311,9 +3347,20 @@ def api(path, body=None, form=None, method=None):
         return json.loads(r.read())
 
 
-def stream(path, ext=None):
-    s = {"network": "xhttp", "security": "none",
-         "xhttpSettings": {"path": "/" + path + "/", "host": domain, "mode": "auto", "xPaddingBytes": "100-1000"}}
+# CHAIN_XHTTP_OBFS=0 отключает обфускацию padding (если клиент не понимает расширенные параметры XHTTP)
+OBFS = os.environ.get("CHAIN_XHTTP_OBFS", "1") != "0"
+
+
+def stream(path, ext=None, obfs=False):
+    xh = {"path": "/" + path + "/", "host": domain, "mode": "auto", "xPaddingBytes": "100-1000"}
+    if obfs:
+        # padding-обфускация, ротация соединений (xmux) и keep-alive; в ссылку подписки попадает через extra
+        xh.update({
+            "xPaddingObfsMode": True, "xPaddingKey": "_dc", "xPaddingHeader": "X-Cache", "xPaddingMethod": "tokenish",
+            "scMaxBufferedPosts": 30, "scStreamUpServerSecs": "20-80",
+            "xmux": {"maxConnections": 3, "hMaxRequestTimes": "600-900", "hMaxReusableSecs": "1800-3000", "hKeepAlivePeriod": 20},
+        })
+    s = {"network": "xhttp", "security": "none", "xhttpSettings": xh}
     if ext:
         s["externalProxy"] = ext
     return json.dumps(s)
@@ -3354,7 +3401,7 @@ else:
             "fingerprint": "chrome", "alpn": ["h2"]}]
     r = api("/panel/api/inbounds/add", body={"remark": "chain-users", "enable": True, "listen": "127.0.0.1", "port": uport,
                                              "protocol": "vless", "settings": json.dumps(settings),
-                                             "streamSettings": stream(upath, ext), "sniffing": sniff, "tag": "chain-users"})
+                                             "streamSettings": stream(upath, ext, OBFS), "sniffing": sniff, "tag": "chain-users"})
     if not r.get("success"):
         sys.exit("не удалось создать инбаунд пользователей: %s" % r.get("msg"))
 
@@ -3928,7 +3975,7 @@ relay_uninstall() {  # relay_uninstall rm_xui rm_web
   systemctl disable --now chain-site-refresh.timer sync-sub-path.timer >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/chain-site-refresh.service /etc/systemd/system/chain-site-refresh.timer \
     /etc/systemd/system/sync-sub-path.service /etc/systemd/system/sync-sub-path.timer \
-    /usr/local/bin/chain-status /usr/local/bin/chain-set-backend /usr/local/bin/chain-site-refresh /usr/local/bin/sync-sub-path \
+    /usr/local/bin/chain-status /usr/local/bin/chain-test /usr/local/bin/chain-set-backend /usr/local/bin/chain-site-refresh /usr/local/bin/sync-sub-path \
     /etc/chain-site.domain
   if [ "$rm_web" = 1 ]; then
     rm -f /etc/nginx/sites-enabled/apex.conf /etc/nginx/sites-available/apex.conf \
@@ -3948,34 +3995,64 @@ relay_uninstall() {  # relay_uninstall rm_xui rm_web
   rm -f "$CONF_FILE" "$REPORT_FILE" "$MARKER_FILE"
 }
 
+# откат на самом BACKEND (запускается на BACKEND, доступ к RELAY не нужен)
+do_uninstall_backend() {
+  info "BACKEND (этот сервер): мост chain-bridge, chain-xray, команда chain-set-relay, сетевые твики"
+  info "RELAY этим откатом не затрагивается"
+  confirm "Удалить эти настройки?" || { echo "  Отменено."; return 1; }
+  LOCAL_BACKEND=1
+  make_scripts
+  STEP=0; TOTAL=1
+  section "BACKEND (этот сервер)"
+  step_run "Удаление моста, служебных команд и настроек" backend_uninstall || warn "часть действий не выполнена (см. лог)"
+  echo
+  ok "метка установки удалена"
+  info "firewall остался закрытым (только SSH); при необходимости: ufw allow <порт>/tcp"
+  return 0
+}
+
 do_uninstall() {
   STEP=0; TOTAL=2
   echo
   echo "${B}Откат установки${R}"
   thin
+  if [ "$(marker_get ROLE)" = backend ]; then do_uninstall_backend; return $?; fi
+  local scope
+  echo "  Что откатываем?"
+  echo "  ${B}1${R}. Только RELAY (доступ к BACKEND не нужен)"
+  echo "  ${B}2${R}. Оба сервера: RELAY и BACKEND"
+  while true; do
+    rd -r -p "${B}?${R} Выберите вариант: " scope
+    case "$scope" in 1 | 2) break ;; *) fail "введите 1 или 2" ;; esac
+  done
+  echo
   info "RELAY: сайт, служебные команды chain-*, sync-sub-path, сетевые твики"
-  info "BACKEND: мост chain-bridge, chain-xray, команда chain-set-relay, сетевые твики"
-  confirm "Удалить эти настройки?" n || { echo "  Отменено."; return 1; }
+  [ "$scope" = 2 ] && info "BACKEND: мост chain-bridge, chain-xray, команда chain-set-relay, сетевые твики"
+  confirm "Удалить эти настройки?" || { echo "  Отменено."; return 1; }
   local rm_xui=0 rm_web=0 reach=0
-  ask_backend
-  if [ "${LOCAL_BACKEND:-0}" = 1 ]; then
-    reach=1
-  else
-    ssh_opts
-    if ssh "${SSH_OPTS[@]}" -o BatchMode=yes "root@$BACKEND_IP" true >/dev/null 2>"$TMPD/ssh.err"; then
+  if [ "$scope" = 2 ]; then
+    ask_backend
+    if [ "${LOCAL_BACKEND:-0}" = 1 ]; then
       reach=1
-      ok "SSH: root@$BACKEND_IP:$BACKEND_PORT"
     else
-      fail "BACKEND недоступен: $(tail -n1 "$TMPD/ssh.err")"
-      confirm "Удалить только настройки RELAY (BACKEND останется как есть)?" n || { echo "  Отменено."; return 1; }
+      ssh_opts
+      if ssh "${SSH_OPTS[@]}" -o BatchMode=yes "root@$BACKEND_IP" true >/dev/null 2>"$TMPD/ssh.err"; then
+        reach=1
+        ok "SSH: root@$BACKEND_IP:$BACKEND_PORT"
+      else
+        fail "BACKEND недоступен: $(tail -n1 "$TMPD/ssh.err")"
+        confirm "Удалить только настройки RELAY (BACKEND останется как есть)?" || { echo "  Отменено."; return 1; }
+      fi
     fi
   fi
-  confirm "Удалить на RELAY также 3x-ui (панель, пользователи, инбаунды)?" n && rm_xui=1
-  confirm "Удалить на RELAY также конфиг nginx, сайт и сертификат домена ${DOMAIN:-$(marker_get DOMAIN)}?" n && rm_web=1
+  confirm "Удалить на RELAY также 3x-ui (панель, пользователи, инбаунды)?" && rm_xui=1
+  confirm "Удалить на RELAY также конфиг nginx, сайт и сертификат домена ${DOMAIN:-$(marker_get DOMAIN)}?" && rm_web=1
   make_scripts
   section "BACKEND"
   if [ $reach -eq 1 ]; then
     step_run "Удаление моста, служебных команд и настроек" backend_uninstall || warn "часть действий на BACKEND не выполнена (см. лог)"
+  elif [ "$scope" = 1 ]; then
+    info "пропущено: выбран откат только RELAY (мост и метка на BACKEND остались; очистить позже — запустить скрипт на BACKEND и выбрать «Откат»)"
   else
     warn "пропущено: BACKEND недоступен"
   fi
