@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-VERSION="3.3"
+VERSION="3.4"
 NAME="RatBurrow"
 
 set -u
@@ -8,11 +8,8 @@ set -o pipefail
 export LC_ALL=C.UTF-8   # одинаковая работа с кириллицей независимо от локали сервера
 
 # ───────────────────────── пути (переопределяются для тестов) ─────────────────────────
-UFW_BEFORE="${UFW_BEFORE:-/etc/ufw/before.rules}"
 UFW_SYSCTL="${UFW_SYSCTL:-/etc/ufw/sysctl.conf}"
 CONF_FILE="${CONF_FILE:-/root/.chain-setup.conf}"
-LEGACY_CONF="${LEGACY_CONF:-/root/.relay-setup.conf}"          # настройки прежней схемы (rathole): только для подсказок в вопросах
-LEGACY_MARKER="${LEGACY_MARKER:-/root/.relay-setup.installed}"  # метка прежней схемы
 REPORT_FILE="${REPORT_FILE:-/root/chain-setup-report.txt}"
 LOG="${LOG:-/var/log/chain-setup.log}"
 MARKER_FILE="${MARKER_FILE:-/root/.chain-setup.installed}"
@@ -403,11 +400,10 @@ ssh_connect() {
 
 
 # ───────────────────────── сохранение настроек ─────────────────────────
-# Читаем только известные ключи (файл не исполняем). Настройки прежней схемы (rathole) —
-# только как подсказки по умолчанию: IP/порт/домен/ключ.
+# Читаем только известные ключи (файл не исполняем): IP/порт/домен/ключ как подсказки по умолчанию.
 load_conf() {
   local f k v
-  for f in "$LEGACY_CONF" "$CONF_FILE"; do
+  for f in "$CONF_FILE"; do
     [ -f "$f" ] || continue
     for k in BACKEND_IP BACKEND_PORT DOMAIN KEY_PATH USER_PATH TUNNEL_PATH TUNNEL_UUID; do
       v=$(sed -n "s/^$k=//p" "$f" 2>/dev/null | head -n1)
@@ -429,6 +425,7 @@ KEY_PATH=${KEY_PATH:-}
 USER_PATH=${USER_PATH:-}
 TUNNEL_PATH=${TUNNEL_PATH:-}
 TUNNEL_UUID=${TUNNEL_UUID:-}
+HIDE_PANEL=${HIDE_PANEL:-}
 EOT
   chmod 600 "$CONF_FILE"
 }
@@ -947,6 +944,8 @@ show_marks() {
     st=$(marker_get STATUS)
     if [ "$st" = done ]; then
       ok "Настройка защищённого канала RELAY ← BACKEND: выполнена $(marker_get INSTALLED_AT)"
+    elif [ "$st" = check-failed ]; then
+      warn "Настройка защищённого канала RELAY ← BACKEND: выполнена $(marker_get INSTALLED_AT), но сквозная проверка не прошла (см. chain-test)"
     else
       warn "Настройка защищённого канала RELAY ← BACKEND: начата $(marker_get INSTALLED_AT), не завершена"
     fi
@@ -2868,6 +2867,10 @@ server {
     location / { try_files \$uri \$uri/ =404; }
 }
 EOT
+# панель скрыта: убираем её location из временного конфига (диапазон от location = /<путь> до закрывающей скобки)
+if [ "${3:-0}" = 1 ]; then
+  sed -i "/location = \/$XUI_PATH /,/^    }\$/d" /etc/nginx/sites-available/apex.conf
+fi
 ln -sf /etc/nginx/sites-available/apex.conf /etc/nginx/sites-enabled/apex.conf
 nginx -t
 systemctl enable --now nginx
@@ -3159,6 +3162,7 @@ import os, re, subprocess, sys
 
 domain, xui_path, upath, tpath, uport, tport, backend = sys.argv[1:8]
 xui_path = xui_path.strip("/")
+hide_panel = len(sys.argv) > 8 and sys.argv[8] == "1"   # 1 — панель не публикуется через nginx (только SSH-туннель)
 v6 = os.path.exists("/proc/net/if_inet6") and open("/proc/sys/net/ipv6/conf/all/disable_ipv6").read().strip() == "0"
 ver = subprocess.run(["nginx", "-v"], capture_output=True, text=True).stderr
 m = re.search(r"nginx/(\d+)\.(\d+)\.(\d+)", ver)
@@ -3309,6 +3313,9 @@ server {
 conf = (tpl.replace("@@LISTEN80@@", listen_80).replace("@@LISTENSSL@@", listen_ssl)
         .replace("@@DOMAIN@@", domain).replace("@@UPATH@@", upath).replace("@@TPATH@@", tpath)
         .replace("@@UPORT@@", uport).replace("@@TPORT@@", tport).replace("@@XUI@@", xui_path))
+if hide_panel:
+    conf = re.sub(r"    # Панель 3x-ui по отдельному пути\n.*?(?=    # «Живой» сайт)", "", conf, flags=re.S)
+    assert "proxy_pass http://127.0.0.1:999;" not in conf, "панель не удалена из конфига nginx"
 open("/etc/nginx/sites-available/apex.conf", "w").write(conf)
 if not os.path.islink("/etc/nginx/sites-enabled/apex.conf"):
     try:
@@ -3358,7 +3365,7 @@ def stream(path, ext=None, obfs=False):
         xh.update({
             "xPaddingObfsMode": True, "xPaddingKey": "_dc", "xPaddingHeader": "X-Cache", "xPaddingMethod": "tokenish",
             "scMaxBufferedPosts": 30, "scStreamUpServerSecs": "20-80",
-            "xmux": {"maxConnections": 3, "hMaxRequestTimes": "600-900", "hMaxReusableSecs": "1800-3000", "hKeepAlivePeriod": 20},
+            "xmux": {"maxConnections": 2, "hMaxRequestTimes": "600-900", "hMaxReusableSecs": "1800-3000", "hKeepAlivePeriod": 20},
         })
     s = {"network": "xhttp", "security": "none", "xhttpSettings": xh}
     if ext:
@@ -3480,7 +3487,14 @@ cfg = {
          "streamSettings": {"network": "xhttp", "security": "tls",
                             "tlsSettings": {"serverName": domain, "fingerprint": "chrome", "alpn": ["h2"]},
                             "xhttpSettings": {"host": domain, "path": "/" + tpath + "/", "mode": "auto", "xPaddingBytes": "100-1000"}}},
-        {"tag": "direct", "protocol": "freedom"},
+        # ВАЖНО: без явных finalRules Xray блокирует весь трафик reverse-моста (vless-reverse) на 30–90 с.
+        # geoip:private не используем — ему нужен geoip.dat, а на BACKEND ставится только бинарник xray.
+        {"tag": "direct", "protocol": "freedom",
+         "settings": {"finalRules": [
+             {"action": "block", "ip": ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+                                        "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15",
+                                        "224.0.0.0/4", "240.0.0.0/4", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"]},
+             {"action": "allow"}]}},
     ],
     "routing": {"rules": [{"type": "field", "inboundTag": ["r-in"], "outboundTag": "direct"}]},
 }
@@ -3542,14 +3556,6 @@ sleep 3
 systemctl is-active --quiet chain-bridge
 EOF
 
-  # BACKEND: старый rathole-client (прежняя схема) — стоп, чтобы не светил подключениями к RELAY:2333
-  cat > "$D/legacy-backend.sh" <<'EOF'
-systemctl disable --now rathole >/dev/null 2>&1 || true
-rm -f /etc/systemd/system/rathole.service
-systemctl daemon-reload
-exit 0
-EOF
-
   # BACKEND: firewall — только SSH (все остальные входящие закрыты)
   cat > "$D/ufw-backend.sh" <<'EOF'
 set -e
@@ -3584,30 +3590,6 @@ EOF
 
 # ───────────────────────── RELAY: локальные помощники ─────────────────────────
 lscript() { local f="$1"; shift; bash -s -- "$@" < "$f"; }   # запуск скрипта на ЭТОМ сервере
-
-# прежняя схема (rathole) на RELAY
-legacy_found() {
-  [ -f /etc/systemd/system/rathole.service ] || [ -d /etc/rathole ] || [ -f "$LEGACY_MARKER" ] ||
-    grep -q '^# BEGIN relay-setup-nat$' "$UFW_BEFORE" 2>/dev/null
-}
-
-relay_legacy_cleanup() {
-  local dest ip
-  dest=$(sed -n '/# BEGIN relay-setup-nat/,/# END relay-setup-nat/p' "$UFW_BEFORE" 2>/dev/null | grep -oP '(?<=--to-destination )[0-9.]+(?=:8443)' | head -n1)
-  systemctl disable --now rathole >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/rathole.service /usr/local/bin/rathole /usr/local/bin/switch-backend
-  rm -rf /etc/rathole
-  systemctl daemon-reload
-  for ip in $(ufw status 2>/dev/null | awk '/2333\/tcp/ { print $NF }' | grep -E '^[0-9.]+$'); do
-    ufw delete allow from "$ip" to any port 2333 proto tcp >/dev/null 2>&1 || true
-  done
-  for ip in 8443/tcp 8443/udp; do ufw delete allow "$ip" >/dev/null 2>&1 || true; done
-  [ -n "$dest" ] && { ufw route delete allow proto udp from any to "$dest" port 8443 >/dev/null 2>&1 || true; }
-  [ -f "$UFW_BEFORE" ] && sed -i '/^# BEGIN relay-setup-nat$/,/^# END relay-setup-nat$/d' "$UFW_BEFORE"
-  rm -f /etc/sysctl.d/99-relay-forward.conf "$LEGACY_MARKER" "$LEGACY_CONF"
-  ufw --force reload >/dev/null 2>&1 || true
-  return 0
-}
 
 # порты 80/443 не должны быть заняты чужими процессами (nginx свой — допустим)
 relay_port_conflicts() {
@@ -3717,6 +3699,14 @@ EOT
   [ -n "$exit_ip" ] && [ "$exit_ip" = "$be_ip" ]
 }
 
+# порт SSH этого сервера (для команды SSH-туннеля к панели)
+relay_ssh_port() {
+  local p
+  p=$(echo "${SSH_CONNECTION:-}" | awk '{ print $4 }')
+  [[ "$p" =~ ^[0-9]+$ ]] || p=$(ssh_ports | head -n1)
+  echo "${p:-22}"
+}
+
 # ссылка первого пользователя из подписки (для Incy)
 chain_client_link() {
   local port
@@ -3744,9 +3734,9 @@ check_reinstall() {
 # ───────────────────────── настройка цепочки ─────────────────────────
 run_install() {
   INSTALL_KIND="chain"
-  STEP=0; TOTAL=12
+  STEP=0; TOTAL=11
   check_reinstall
-  STEP=0; TOTAL=12
+  STEP=0; TOTAL=11
 
   # ── вопросы
   echo
@@ -3772,11 +3762,8 @@ run_install() {
     DOMAIN=""
   done
   EMAIL="admin@$DOMAIN"   # e-mail для Let's Encrypt: не спрашиваем
-  LEGACY=0
-  if legacy_found; then
-    warn "найдена прежняя схема (rathole): она занимает порты 80/443 и подключается к BACKEND:2333"
-    if confirm "Остановить rathole на RELAY и BACKEND и освободить порты?"; then LEGACY=1; fi
-  fi
+  HIDE_PANEL=0
+  if confirm "Скрыть веб-доступ к панели 3x-ui (открывать только через SSH-туннель)?"; then HIDE_PANEL=1; fi
 
   # ── скрытая проверка DNS: молчит, если всё в порядке
   echo
@@ -3794,12 +3781,15 @@ run_install() {
   kv "RELAY" "$RELAY_IP  (nginx, 3x-ui, Honeypot; ufw: SSH, 80, 443)"
   kv "BACKEND" "$BACKEND_IP  (SSH :$BACKEND_PORT; мост Xray сам подключается к RELAY)"
   kv "Domain" "$DOMAIN"
-  kv "Канал" "клиент → https://$DOMAIN:443 (VLESS + XHTTP, HTTP/2) → RELAY ⇄ обратный туннель ⇄ BACKEND → интернет"
+  kv "Channel" "клиент → https://$DOMAIN:443 (VLESS + XHTTP, HTTP/2) → RELAY ⇄ обратный туннель ⇄ BACKEND → интернет"
   kv "Honeypot" "https://$DOMAIN/ — сайт на RELAY; /status/, /api/v1/health; чужие пути — 404"
-  kv "3x-ui panel" "https://$DOMAIN/<WebBasePath> → RELAY 127.0.0.1:$PANEL_PORT; подписка для Incy там же"
+  if [ $HIDE_PANEL -eq 1 ]; then
+    kv "3x-ui panel" "скрыта из сети: только через SSH-туннель → RELAY 127.0.0.1:$PANEL_PORT; подписка для Incy доступна на https://$DOMAIN"
+  else
+    kv "3x-ui panel" "https://$DOMAIN/<WebBasePath> → RELAY 127.0.0.1:$PANEL_PORT; подписка для Incy там же"
+  fi
   kv "Tunnel" "BACKEND → RELAY:443, TLS 1.3, отпечаток Chrome; секретный путь принимает только IP BACKEND"
   kv "E-mail" "$EMAIL"
-  if [ $LEGACY -eq 1 ]; then kv "Прежняя схема" "rathole на RELAY и BACKEND останавливается и удаляется"; fi
   kv "BACKEND ports" "все входящие закрываются, остаётся только SSH"
   rule
   echo
@@ -3820,15 +3810,6 @@ run_install() {
   esac
   rscript "$TMPD/f2b-ignore.sh" "$RELAY_IP" >>"$LOG" 2>&1 || true
   write_marker_backend in-progress
-
-  # [2] прежняя схема
-  section "Прежняя схема (rathole)"
-  if [ $LEGACY -eq 1 ]; then
-    step_run "RELAY: остановка rathole-server, удаление правил ufw и NAT" relay_legacy_cleanup || warn "прежняя схема на RELAY удалена не полностью"
-    step_run "BACKEND: остановка rathole-client" rscript "$TMPD/legacy-backend.sh" || warn "rathole-client на BACKEND не остановлен"
-  else
-    info "не требуется"
-  fi
 
   # [3] сеть
   section "Сетевая оптимизация (RELAY и BACKEND)"
@@ -3856,7 +3837,7 @@ run_install() {
 
   # [7] nginx временный
   section "RELAY: nginx (временный конфиг)"
-  step_run "nginx: временный HTTP-конфиг для выпуска сертификата" lscript "$TMPD/nginx-temp.sh" "$DOMAIN" "$xw" || die "nginx не настроился"
+  step_run "nginx: временный HTTP-конфиг для выпуска сертификата" lscript "$TMPD/nginx-temp.sh" "$DOMAIN" "$xw" "$HIDE_PANEL" || die "nginx не настроился"
 
   # [8] сертификат
   section "Сертификат Let's Encrypt"
@@ -3879,7 +3860,7 @@ run_install() {
   step_run "3x-ui: инбаунд пользователей (VLESS+XHTTP), инбаунд туннеля (reverse), маршрутизация" chain_inbounds || die "не удалось настроить 3x-ui через API (см. лог)"
   chain_load || die "3x-ui не вернул идентификаторы инбаундов (см. лог)"
   save_conf
-  step_run "nginx: сертификат, секретные пути, панель, «живые» эндпоинты, автопродление" python3 "$TMPD/nginx-final.py" "$DOMAIN" "$xw" "$USER_PATH" "$TUNNEL_PATH" "$CHAIN_USER_PORT" "$CHAIN_TUNNEL_PORT" "$BACKEND_IP" || die "не удалось включить финальный конфиг nginx"
+  step_run "nginx: сертификат, секретные пути, «живые» эндпоинты, автопродление (панель: $([ $HIDE_PANEL -eq 1 ] && echo скрыта || echo опубликована))" python3 "$TMPD/nginx-final.py" "$DOMAIN" "$xw" "$USER_PATH" "$TUNNEL_PATH" "$CHAIN_USER_PORT" "$CHAIN_TUNNEL_PORT" "$BACKEND_IP" "$HIDE_PANEL" || die "не удалось включить финальный конфиг nginx"
   /usr/local/bin/sync-sub-path >>"$LOG" 2>&1 || true
   step_run "Перезапуск 3x-ui (применение маршрутизации)" bash -c 'systemctl restart x-ui && sleep 4 && systemctl is-active --quiet x-ui' || warn "x-ui не перезапустился"
 
@@ -3901,16 +3882,27 @@ run_install() {
     sleep 5
   done
   [ -n "$stout" ] && info "$stout"
-  if [ $st -eq 0 ]; then ok "поток через цепочку работает: выходной IP совпадает с BACKEND"; else warn "сквозная проверка не прошла (при общем IP/NAT у BACKEND IP может отличаться) — см. chain-status"; fi
+  CHECK_FAIL=0
+  if [ $st -eq 0 ]; then
+    ok "поток через цепочку работает: выходной IP совпадает с BACKEND"
+  elif [ -z "$stout" ] || [[ "$stout" == *"цепочки: нет ответа"* ]]; then
+    fail "трафик через цепочку не проходит (ответа нет). Диагностика: chain-test на RELAY; journalctl -u chain-bridge -n 50 на BACKEND"
+    CHECK_FAIL=1
+  else
+    warn "выходной IP цепочки отличается от внешнего IP BACKEND (общий NAT или несколько адресов); если у клиента интернет работает, это не ошибка"
+  fi
 
   # [12] firewall BACKEND и итог
   section "BACKEND: firewall и итог"
   step_run "ufw: SSH сохранён, все остальные входящие закрыты" rscript "$TMPD/ufw-backend.sh" || warn "firewall BACKEND не настроен (см. лог)"
-  write_marker "done"
+  if [ $CHECK_FAIL -eq 1 ]; then write_marker "check-failed"; else write_marker "done"; fi
   ok "настройки сохранены: $CONF_FILE, метка установки: $MARKER_FILE"
 
   local site_code panel_url link
-  panel_url="https://$DOMAIN/$xw"
+  if [ $HIDE_PANEL -eq 1 ]; then panel_url="скрыта (только SSH-туннель)"; else panel_url="https://$DOMAIN/$xw"; fi
+  local tun_port=8999 tun_cmd tun_url
+  tun_cmd="ssh -N -L $tun_port:127.0.0.1:$PANEL_PORT -p $(relay_ssh_port) root@$RELAY_IP"
+  tun_url="http://127.0.0.1:$tun_port/${xw#/}"
   site_code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" 2>/dev/null || true)
   link=$(chain_client_link)
   {
@@ -3920,6 +3912,8 @@ run_install() {
     echo "Domain:       $DOMAIN"
     echo "Honeypot URL: https://$DOMAIN/ (HTTP ${site_code:-000})"
     echo "Panel URL:    $panel_url"
+    echo "SSH-туннель:  $tun_cmd"
+    echo "Панель через туннель: $tun_url"
     echo "Username:     $xu"
     echo "Password:     $xp"
     echo "API Token:    ${xt:-—}"
@@ -3932,7 +3926,7 @@ run_install() {
 
   echo
   rule
-  printf '  %sУСТАНОВКА ЗАВЕРШЕНА%s\n' "$GRN" "$R"
+  if [ $CHECK_FAIL -eq 1 ]; then printf '  %sУСТАНОВКА ЗАВЕРШЕНА С ОШИБКОЙ: цепочка не пропускает трафик%s\n' "$YLW" "$R"; else printf '  %sУСТАНОВКА ЗАВЕРШЕНА%s\n' "$GRN" "$R"; fi
   rule
   printf '  %sСАЙТ HONEYPOT%s\n' "$B" "$R"
   printf '  URL:       %shttps://%s/%s\n' "$B" "$DOMAIN" "$R"
@@ -3940,7 +3934,7 @@ run_install() {
   if [ "$site_code" = "200" ]; then ok "Проверка сайта: HTTP 200"; else warn "Проверка сайта вернула HTTP ${site_code:-000}; проверьте DNS, nginx и лог"; fi
   echo
   printf '  %sПАНЕЛЬ 3X-UI%s\n' "$B" "$R"
-  printf '  URL:       %s%s%s\n' "$B" "$panel_url" "$R"
+  if [ $HIDE_PANEL -eq 1 ]; then printf '  Доступ:    %sтолько через SSH-туннель (из интернета панель недоступна)%s\n' "$B" "$R"; else printf '  URL:       %s%s%s\n' "$B" "$panel_url" "$R"; fi
   printf '  Username:  %s%s%s\n' "$GRN" "$xu" "$R"
   printf '  Password:  %s%s%s\n' "$GRN" "$xp" "$R"
   echo
@@ -3953,13 +3947,20 @@ run_install() {
   rule
   echo "  ${DIM}Отчёт: $REPORT_FILE (права 600)${R}"
   echo "  ${DIM}Лог:   $LOG${R}"
-  echo "  ${DIM}Служебные команды: chain-status, chain-set-backend (RELAY); chain-set-relay (BACKEND)${R}"
+  echo "  ${DIM}Служебные команды: chain-status, chain-test, chain-set-backend (RELAY); chain-set-relay (BACKEND)${R}"
+  echo
+  echo "  ${B}Открыть панель (выполните на СВОЁМ компьютере):${R}"
+  echo "   1) создать туннель (окно оставьте открытым; при входе по ключу добавьте -i путь_к_ключу):"
+  printf '      %s%s%s\n' "$GRN" "$tun_cmd" "$R"
+  echo "   2) открыть в браузере:"
+  printf '      %s%s%s\n' "$GRN" "$tun_url" "$R"
   echo
   echo "  ${B}Дальше:${R}"
   echo "   • В Incy добавьте подписку по ссылке выше; новых пользователей создавайте в панели в инбаунде chain-users"
   echo "   • Инбаунд chain-tunnel служебный (туннель) — не удаляйте и не меняйте"
   echo "   • Сменили IP BACKEND у провайдера: на RELAY выполните chain-set-backend НОВЫЙ_IP (мост подключится сам)"
   echo
+  return $CHECK_FAIL
 }
 
 # ───────────────────────── откат ─────────────────────────
