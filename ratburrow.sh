@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-VERSION="3.0.0"
+VERSION="3.1"
 NAME="RatBurrow"
 
 set -u
@@ -22,6 +22,7 @@ CHAIN_TUNNEL_PORT=21444   # 127.0.0.1: инбаунд туннеля, к кот�
 SELFTEST_PORT=21481       # 127.0.0.1: временный клиент для проверки цепочки
 TOTAL=12
 STEP=0
+CHAIN_USER_ID=""; CHAIN_SUB_ID=""; TUNNEL_UUID=""; SUB_PATHS=""
 
 # ───────────────────────── цвета ─────────────────────────
 if [ -t 1 ]; then
@@ -190,18 +191,30 @@ tune_network() {
 }
 
 # ───────────────────────── метка установки ─────────────────────────
-write_marker() {  # write_marker статус (in-progress | done)
-  : > "$MARKER_FILE"; chmod 600 "$MARKER_FILE"
-  cat > "$MARKER_FILE" <<EOF
+marker_text() {  # marker_text статус роль(relay|backend) — содержимое метки настройки канала
+  cat <<EOF
 STATUS=$1
+ROLE=$2
 INSTALLED_AT=$(date '+%F %T')
 VERSION=$VERSION
-KIND=${INSTALL_KIND:-relay}
+KIND=${INSTALL_KIND:-chain}
 RELAY_IP=${RELAY_IP:-}
 BACKEND_IP=${BACKEND_IP:-}
 BACKEND_PORT=${BACKEND_PORT:-}
 DOMAIN=${DOMAIN:-}
 EOF
+}
+# метка на BACKEND (по SSH); до подключения к BACKEND тихо пропускается
+write_marker_backend() {  # write_marker_backend статус
+  [ "${LOCAL_BACKEND:-0}" = 1 ] && return 0
+  [ -n "${SSH_OPTS+x}" ] || return 0
+  marker_text "$1" backend | ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" "umask 077; cat > '$MARKER_FILE'" >>"$LOG" 2>&1 ||
+    warn "не удалось записать метку на BACKEND (см. лог)"
+}
+write_marker() {  # write_marker статус (in-progress | done) — метки на RELAY (здесь) и на BACKEND
+  ( umask 077; marker_text "$1" relay > "$MARKER_FILE" )
+  chmod 600 "$MARKER_FILE"
+  write_marker_backend "$1"
 }
 marker_get() { sed -n "s/^$1=//p" "$MARKER_FILE" 2>/dev/null | head -n1; }
 
@@ -918,20 +931,39 @@ PROFEOF
   return 0
 }
 
+# метки работы со скриптом на ЭТОМ сервере: подготовка сервера и настройка защищённого канала
+show_marks() {
+  local pf=0 cf=0 role st
+  [ -f "$PREP_MARKER_FILE" ] && pf=1
+  [ -f "$MARKER_FILE" ] && cf=1
+  [ $pf -eq 1 ] || [ $cf -eq 1 ] || return 0
+  echo
+  echo "${B}Найдена метка работы со скриптом${R}"
+  thin
+  if [ $pf -eq 1 ]; then
+    ok "Подготовка сервера: выполнена $(awk -F= '/^ran_at=/{print $2}' "$PREP_MARKER_FILE"), SSH-порт $(awk -F= '/^ssh_port=/{print $2}' "$PREP_MARKER_FILE")"
+  fi
+  if [ $cf -eq 1 ]; then
+    role=$(marker_get ROLE); role=${role:-relay}
+    st=$(marker_get STATUS)
+    if [ "$st" = done ]; then
+      ok "Настройка защищённого канала RELAY ← BACKEND: выполнена $(marker_get INSTALLED_AT)"
+    else
+      warn "Настройка защищённого канала RELAY ← BACKEND: начата $(marker_get INSTALLED_AT), не завершена"
+    fi
+    info "роль этого сервера: ${role^^}; RELAY $(marker_get RELAY_IP), BACKEND $(marker_get BACKEND_IP), домен $(marker_get DOMAIN)"
+    [ "$role" = backend ] && info "откат настройки канала выполняется с сервера RELAY"
+  fi
+}
+
 menu() {
   local has=0 c
-  [ -f "$MARKER_FILE" ] && has=1
+  [ -f "$MARKER_FILE" ] && [ "$(marker_get ROLE)" != backend ] && has=1
   echo
   echo "${B}Что делаем?${R}"
   thin
-  if [ -f "$PREP_MARKER_FILE" ]; then
-    info "подготовка сервера уже выполнена: $(awk -F= '/^ran_at=/{print $2}' "$PREP_MARKER_FILE"), SSH-порт $(awk -F= '/^ssh_port=/{print $2}' "$PREP_MARKER_FILE") (повторный выбор пункта 1 предложит откат)"
-  fi
-  if [ $has -eq 1 ]; then
-    info "найдена метка установки: $(marker_get INSTALLED_AT), статус: $(marker_get STATUS), BACKEND $(marker_get BACKEND_IP), домен $(marker_get DOMAIN)"
-  fi
   echo "  ${B}1${R}. Подготовить сервер"
-  echo "  ${B}2${R}. Настроить"
+  echo "  ${B}2${R}. Настроить защищенный канал RELAY ← BACKEND"
   [ $has -eq 1 ] && echo "  ${B}3${R}. Откат"
   while true; do
     rd -r -p "${B}?${R} Выберите вариант: " c
@@ -2771,11 +2803,19 @@ timeout --foreground 1800 "${APT[@]}" update -qq
 timeout --foreground 1800 "${APT[@]}" install -y curl unzip nginx certbot ufw sqlite3 python3 openssl dnsutils ca-certificates gzip iproute2
 EOF
 
-  cat > "$D/xui.sh" <<'EOF'
+  # 3x-ui: три отдельных шага, чтобы у каждого был свой счётчик времени
+  cat > "$D/xui-fetch.sh" <<'EOF'
+set -e
+curl -fsSL --retry 3 https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o /tmp/3xui-install.sh
+test -s /tmp/3xui-install.sh
+EOF
+  cat > "$D/xui-install.sh" <<'EOF'
 set -e
 export XUI_NONINTERACTIVE=1 XUI_DB_TYPE=sqlite XUI_SSL_MODE=none XUI_PANEL_PORT="$1"
-curl -fsSL https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o /tmp/3xui-install.sh
 bash /tmp/3xui-install.sh </dev/null
+EOF
+  cat > "$D/xui-check.sh" <<'EOF'
+set -e
 /usr/local/x-ui/x-ui setting -listenIP 127.0.0.1 || true
 systemctl restart x-ui
 sleep 3
@@ -3550,7 +3590,9 @@ xui_stage() {
     warn "GitHub с RELAY недоступен напрямую: 3x-ui загрузится через BACKEND (SOCKS поверх SSH)"
     if ssh "${SSH_OPTS[@]}" -O forward -D 127.0.0.1:1080 "root@$BACKEND_IP" >>"$LOG" 2>&1; then proxy="socks5h://127.0.0.1:1080"; fi
   fi
-  step_run "Установка 3x-ui (SQLite, порт $PANEL_PORT, панель на 127.0.0.1)" env ALL_PROXY="$proxy" bash "$TMPD/xui.sh" "$PANEL_PORT" || rc=1
+  step_run "3x-ui: загрузка установщика" env ALL_PROXY="$proxy" bash "$TMPD/xui-fetch.sh" || rc=1
+  [ $rc -eq 0 ] && { step_run "3x-ui: установка (SQLite, порт $PANEL_PORT)" env ALL_PROXY="$proxy" bash "$TMPD/xui-install.sh" "$PANEL_PORT" || rc=1; }
+  [ $rc -eq 0 ] && { step_run "3x-ui: запуск, панель на 127.0.0.1:$PANEL_PORT" bash "$TMPD/xui-check.sh" "$PANEL_PORT" || rc=1; }
   [ -n "$proxy" ] && { ssh "${SSH_OPTS[@]}" -O cancel -D 127.0.0.1:1080 "root@$BACKEND_IP" >>"$LOG" 2>&1 || true; }
   [ $rc -eq 0 ] || die "3x-ui не установился"
   res=$(cat /etc/x-ui/install-result.env 2>>"$LOG")
@@ -3578,14 +3620,23 @@ xui_stage() {
 }
 
 # инбаунды и маршрутизация в 3x-ui; результат: CHAIN_USER_ID, CHAIN_SUB_ID, TUNNEL_UUID
+# ВАЖНО: step_run запускает команду в подоболочке, поэтому переменные оттуда не возвращаются —
+# результат передаётся через файл $TMPD/chain.env, который родительский процесс читает (chain_load)
 chain_inbounds() {
-  local out
+  local out cu sb tu
   [ -n "${xt:-}" ] || return 1
   out=$(python3 "$TMPD/chain-inbounds.py" "http://127.0.0.1:$PANEL_PORT/${xw#/}" "$xt" "$DOMAIN" "$USER_PATH" "$TUNNEL_PATH" "$CHAIN_USER_PORT" "$CHAIN_TUNNEL_PORT" 2>>"$LOG") || return 1
-  CHAIN_USER_ID=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["user_id"])') || return 1
-  CHAIN_SUB_ID=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sub_id"])') || return 1
-  TUNNEL_UUID=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tunnel_id"])') || return 1
-  [ -n "$CHAIN_USER_ID" ] && [ -n "$TUNNEL_UUID" ]
+  cu=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["user_id"])') || return 1
+  sb=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sub_id"])') || return 1
+  tu=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tunnel_id"])') || return 1
+  [ -n "$cu" ] && [ -n "$tu" ] || return 1
+  ( umask 077; printf 'CHAIN_USER_ID=%q\nCHAIN_SUB_ID=%q\nTUNNEL_UUID=%q\n' "$cu" "$sb" "$tu" > "$TMPD/chain.env" )
+}
+chain_load() {  # читает результат chain_inbounds в переменные родительского процесса
+  [ -s "$TMPD/chain.env" ] || return 1
+  # shellcheck disable=SC1091
+  . "$TMPD/chain.env"
+  [ -n "${CHAIN_USER_ID:-}" ] && [ -n "${TUNNEL_UUID:-}" ]
 }
 
 # мост BACKEND: установка и запуск
@@ -3633,7 +3684,10 @@ print(t.splitlines()[0] if t.strip() else "")' 2>/dev/null
 }
 
 check_reinstall() {
-  if [ -f "$MARKER_FILE" ]; then
+  if [ -f "$MARKER_FILE" ] && [ "$(marker_get ROLE)" = backend ]; then
+    warn "этот сервер — BACKEND уже настроенного канала (метка: $(marker_get INSTALLED_AT)); настройку нужно запускать на RELAY"
+    confirm "Всё равно продолжить настройку с этого сервера?" n || { echo "  Отменено."; exit 0; }
+  elif [ -f "$MARKER_FILE" ]; then
     warn "установка уже выполнялась (метка: $(marker_get INSTALLED_AT), статус: $(marker_get STATUS))"
     confirm "Удалить всё и установить заново?" n || { echo "  Отменено."; exit 0; }
     do_uninstall || exit 0
@@ -3677,8 +3731,6 @@ run_install() {
     warn "найдена прежняя схема (rathole): она занимает порты 80/443 и подключается к BACKEND:2333"
     if confirm "Остановить rathole на RELAY и BACKEND и освободить порты?"; then LEGACY=1; fi
   fi
-  LOCKDOWN=0
-  if confirm "Закрыть на BACKEND все входящие порты, кроме SSH?"; then LOCKDOWN=1; fi
 
   # ── скрытая проверка DNS: молчит, если всё в порядке
   echo
@@ -3702,7 +3754,7 @@ run_install() {
   kv "Tunnel" "BACKEND → RELAY:443, TLS 1.3, отпечаток Chrome; секретный путь принимает только IP BACKEND"
   kv "E-mail" "$EMAIL"
   if [ $LEGACY -eq 1 ]; then kv "Прежняя схема" "rathole на RELAY и BACKEND останавливается и удаляется"; fi
-  if [ $LOCKDOWN -eq 1 ]; then kv "BACKEND ports" "все входящие закрываются, остаётся только SSH"; else kv "BACKEND ports" "firewall не меняется"; fi
+  kv "BACKEND ports" "все входящие закрываются, остаётся только SSH"
   rule
   echo
   confirm "Всё верно, начать установку?" || { echo "  Отменено."; exit 0; }
@@ -3721,6 +3773,7 @@ run_install() {
     *) warn "ОС BACKEND не определена: ${bos:-?}" ;;
   esac
   rscript "$TMPD/f2b-ignore.sh" "$RELAY_IP" >>"$LOG" 2>&1 || true
+  write_marker_backend in-progress
 
   # [2] прежняя схема
   section "Прежняя схема (rathole)"
@@ -3778,6 +3831,7 @@ run_install() {
   SUB_PATHS=$(lscript "$TMPD/sub-setup.sh" "$DOMAIN" https 2>>"$LOG" | tail -n1)
   if [ -n "$SUB_PATHS" ]; then ok "подписка: путь из панели $SUB_PATHS (nginx подхватит за ~15 с)"; else warn "не удалось настроить подписку (см. лог)"; fi
   step_run "3x-ui: инбаунд пользователей (VLESS+XHTTP), инбаунд туннеля (reverse), маршрутизация" chain_inbounds || die "не удалось настроить 3x-ui через API (см. лог)"
+  chain_load || die "3x-ui не вернул идентификаторы инбаундов (см. лог)"
   save_conf
   step_run "nginx: сертификат, секретные пути, панель, «живые» эндпоинты, автопродление" python3 "$TMPD/nginx-final.py" "$DOMAIN" "$xw" "$USER_PATH" "$TUNNEL_PATH" "$CHAIN_USER_PORT" "$CHAIN_TUNNEL_PORT" "$BACKEND_IP" || die "не удалось включить финальный конфиг nginx"
   /usr/local/bin/sync-sub-path >>"$LOG" 2>&1 || true
@@ -3805,11 +3859,7 @@ run_install() {
 
   # [12] firewall BACKEND и итог
   section "BACKEND: firewall и итог"
-  if [ $LOCKDOWN -eq 1 ]; then
-    step_run "ufw: SSH сохранён, все остальные входящие закрыты" rscript "$TMPD/ufw-backend.sh" || warn "firewall BACKEND не настроен (см. лог)"
-  else
-    info "firewall BACKEND не менялся"
-  fi
+  step_run "ufw: SSH сохранён, все остальные входящие закрыты" rscript "$TMPD/ufw-backend.sh" || warn "firewall BACKEND не настроен (см. лог)"
   write_marker "done"
   ok "настройки сохранены: $CONF_FILE, метка установки: $MARKER_FILE"
 
@@ -3867,6 +3917,13 @@ run_install() {
 }
 
 # ───────────────────────── откат ─────────────────────────
+backend_uninstall() {
+  local rc=0
+  rscript "$TMPD/uninstall-backend.sh" || rc=$?
+  bk "rm -f '$MARKER_FILE'" || true
+  return $rc
+}
+
 relay_uninstall() {  # relay_uninstall rm_xui rm_web
   local rm_xui="$1" rm_web="$2" d="${DOMAIN:-$(marker_get DOMAIN)}"
   systemctl disable --now chain-site-refresh.timer sync-sub-path.timer >/dev/null 2>&1 || true
@@ -3919,7 +3976,7 @@ do_uninstall() {
   make_scripts
   section "BACKEND"
   if [ $reach -eq 1 ]; then
-    step_run "Удаление моста, служебных команд и настроек" rscript "$TMPD/uninstall-backend.sh" || warn "часть действий на BACKEND не выполнена (см. лог)"
+    step_run "Удаление моста, служебных команд и настроек" backend_uninstall || warn "часть действий на BACKEND не выполнена (см. лог)"
   else
     warn "пропущено: BACKEND недоступен"
   fi
@@ -3943,6 +4000,7 @@ main() {
   banner
 
   preflight
+  show_marks
   menu
   case "$MODE" in
     prepare) run_prepare ;;
