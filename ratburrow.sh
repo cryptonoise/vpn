@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-VERSION="3.1"
+VERSION="3.2"
 NAME="RatBurrow"
 
 set -u
@@ -99,9 +99,8 @@ drain_tty() {
   while IFS= read -r -t 0.05 -n 1 _j < /dev/tty; do :; done
 }
 
-confirm() {  # confirm "вопрос" [y|n] — что значит Enter (по умолчанию y; для опасных действий передавайте n)
-  local a def="${2:-y}" hint
-  if [ "$def" = n ]; then hint="Enter или n — нет / y — да"; else hint="Enter или y — да / n — нет"; fi
+confirm() {  # confirm "вопрос" — единый формат для всех вопросов да/нет: Enter = да
+  local a def=y hint="Enter или y — да / n — нет"
   drain_tty
   while true; do
     rd -r -p "${B}?${R} $1 ${DIM}[$hint]${R}: " a
